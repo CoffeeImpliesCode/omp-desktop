@@ -65,7 +65,15 @@ const localAddon = resolveLocalHostAddon({
 	arch: process.arch,
 	avx2: detectHostAvx2Support(),
 });
-const effectiveVariant = localAddon.x64Variant;
+// An x64 host only ever emits the variant matching its own AVX2 support, so
+// producing both variants from one machine needs an override. Unset keeps the
+// host-detected behaviour. This also has to agree with the RUSTFLAGS
+// target-cpu selection below.
+const forcedX64Variant = Bun.env.OMP_NATIVE_X64_VARIANT?.trim();
+if (forcedX64Variant !== undefined && forcedX64Variant !== "modern" && forcedX64Variant !== "baseline") {
+	throw new Error(`OMP_NATIVE_X64_VARIANT must be "modern" or "baseline" when set, got "${forcedX64Variant}"`);
+}
+const effectiveVariant = forcedX64Variant ?? localAddon.x64Variant;
 const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
 
 // Pin Rust target-cpu so x64 baseline/modern variants get a reproducible ISA floor
@@ -175,7 +183,13 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 	}
 }
 
-const canonicalAddonFilename = localAddon.filename;
+// Derive from effectiveVariant, not localAddon: a forced variant must emit
+// under its own name or the normalized file would claim the wrong ISA floor.
+const canonicalAddonFilename = resolveLocalHostAddon({
+	platform: process.platform,
+	arch: process.arch,
+	avx2: effectiveVariant === "modern",
+}).filename;
 const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
 
 console.log(`Building pi-natives bindings for ${process.platform}-${process.arch}${variantSuffix} (local)…`);
@@ -228,6 +242,11 @@ const napiArgs = [
 	buildOutputDir,
 	"--profile",
 	cargoProfile,
+	// Local builds enable the Wayland PipeWire capture path. The shipped Bazel
+	// addons build with `crate_features = []`, so `capture()` is compiled down to
+	// a hard error and desktop capture can never work on a Wayland session.
+	"--features",
+	"wayland-pipewire",
 ];
 
 // napi-rs / cargo route much failure detail to stdout (e.g. `cargo metadata`
