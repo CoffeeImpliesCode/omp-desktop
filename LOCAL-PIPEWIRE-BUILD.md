@@ -9,7 +9,7 @@ backend selection reads only `WAYLAND_DISPLAY` / `DISPLAY`
 (`crates/pi-natives/src/desktop/linux/mod.rs`).
 
 Fix: rebuild both addon variants with the opt-in feature and bake them into the
-binary. Verified on `main` @ 18.4.3 (commit `33f887a0`).
+binary. Verified on `main` @ 18.4.4 (commit `8ac1309bd`).
 
 ## Why the binary must be rebuilt
 
@@ -17,9 +17,9 @@ binary. Verified on `main` @ 18.4.3 (commit `33f887a0`).
 
 ```
 // packages/natives/native/embedded-addon.js
-{ platformTag: "linux-x64", version: "18.4.3",
-  files: [ { variant: "modern",  size: 222089992 },
-          { variant: "baseline", size: 221916088 } ] }
+{ platformTag: "linux-x64", version: "18.4.4",
+  files: [ { variant: "modern",  size: 222007736 },
+          { variant: "baseline", size: 221913840 } ] }
 ```
 
 `isEmbeddedAddonFileCurrent` (`packages/natives/native/loader-state.js`) is a
@@ -116,13 +116,13 @@ Compile with a newer bun than the one in `PATH`. Local copy:
 # The loader extracts the embedded addons on first native load.
 PI_DEBUG_STARTUP=1 ~/tools/omp-local/omp-linux-x64 read /etc/hostname 2>&1 \
   | grep startup
-stat -c '%n %s' ~/.omp/natives/18.4.3/*.node
+stat -c '%n %s' ~/.omp/natives/18.4.4/*.node
 
 # End to end. Approve the ScreenCast consent dialog on the desktop.
 node -e '
 const {createRequire}=require("module");
-const m=createRequire("/home/janis/.omp/natives/18.4.3/x.js")(
-  "/home/janis/.omp/natives/18.4.3/pi_natives.linux-x64-modern.node");
+const m=createRequire("/home/janis/.omp/natives/18.4.4/x.js")(
+  "/home/janis/.omp/natives/18.4.4/pi_natives.linux-x64-modern.node");
 console.log(m.__piNativesBuildVersion());
 new m.DesktopSession().capture("desktop")
   .then(f=>console.log(f.width+"x"+f.height, f.data.length));
