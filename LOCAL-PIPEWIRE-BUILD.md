@@ -10,19 +10,18 @@ backend selection reads only `WAYLAND_DISPLAY` / `DISPLAY`
 
 Rebuild both addon variants with the opt-in feature and embed them in the
 binary. This fork also retains all authorized monitor streams and adds exact
-niri window capture. The implementation is based on upstream `main` commit
-`f7055447f2021d20e718f76510ba1bda0da09287` (package version 18.4.9), in
-`/home/janis/.omp/wt/oh-my-pi-desktop-main`.
+niri window capture. The fork now integrates upstream release `v18.4.10`
+(package version 18.4.10), in `/home/janis/.omp/wt/oh-my-pi-desktop-main`.
 
 ## Why the binary must be rebuilt
 
-`~/.local/bin/omp` is a compiled standalone, and it embeds the addon:
+The generated 18.4.10 embedding descriptor includes both rebuilt addon variants:
 
 ```
 // packages/natives/native/embedded-addon.js
-{ platformTag: "linux-x64", version: "18.4.9",
-  files: [ { variant: "modern",  size: 222394280 },
-          { variant: "baseline", size: 222281768 } ] }
+{ platformTag: "linux-x64", version: "18.4.10",
+  files: [ { variant: "modern",  size: 222588456 },
+          { variant: "baseline", size: 222524512 } ] }
 ```
 
 `isEmbeddedAddonFileCurrent` (`packages/natives/native/loader-state.js`) is a
@@ -73,7 +72,7 @@ bun run gen:native
 cd ../..
 bun --cwd=packages/stats run gen:stats
 bun --cwd=packages/coding-agent run gen:tool-views
-OMP_LOCAL_OUTFILE=/home/janis/tools/omp-local/omp-linux-x64-18.4.9-test \
+OMP_LOCAL_OUTFILE=/home/janis/tools/omp-local/omp-linux-x64-18.4.10-test \
   bun compile-one.ts
 ```
 
@@ -119,8 +118,8 @@ Compile with a newer bun than the one in `PATH`. Local copy:
 ## Verify
 
 ```sh
-~/tools/omp-local/omp-linux-x64-18.4.9-test --version
-~/tools/omp-local/omp-linux-x64-18.4.9-test --smoke-test
+~/tools/omp-local/omp-linux-x64-18.4.10-test --version
+~/tools/omp-local/omp-linux-x64-18.4.10-test --smoke-test
 ```
 
 The standalone smoke checks worker startup and bundled assets. Exercise real
@@ -142,6 +141,31 @@ computer read approval still applies.
 On niri, `capabilities().displayCount` is populated from IPC before capture.
 Unknown window origins report `positionKnown: false`; exact capture does not
 depend on those origins, and unsafe global coordinate input is refused.
+
+### 18.4.10 checks
+
+The frozen dependency install, Rust formatting, natives package checks, and
+coding-agent type check passed. The computer and changelog suites passed
+44 tests with one skipped, using `bun test --timeout 120000`.
+The feature-enabled native nextest suite passed 466 tests with one skipped,
+using two test threads.
+
+The staged binary is `~/tools/omp-local/omp-linux-x64-18.4.10-test`. It reported
+`omp/18.4.10` and `smoke-test: ok`. Both extracted addon files matched the
+source builds byte-for-byte and by SHA-256. Embedding stubs were reset after
+the build; no generated native binaries are committed.
+
+Both 18.4.10 CPU variants captured the real 954×1044 Ghostty window as a
+457×500 PNG with 500×500 caps, without changing focus. PNG dimensions matched
+the frame metadata. The baseline addon also read a fresh GTK dialog's actual
+accessibility tree and textbox value. The owned dialog and capture images
+were removed after verification.
+
+The portal grant still authorizes one display; live dual-monitor composition
+was not repeated. This release update leaves the installed 18.4.9 launcher
+unchanged.
+
+### Previous 18.4.9 checks
 
 The native suites passed with the feature (466 tests, one skipped) and without
 it (459 tests, one skipped), using two test threads. The computer and changelog
@@ -179,6 +203,8 @@ still returned the authorized 1920×1080 portal frame, while a direct niri
 target failed closed. Window listing reached AT-SPI instead of failing at
 niri IPC; the live accessibility registry was unavailable and returned
 `AxFailed`. Its fallback regression passed in both feature configurations.
+
+### Installed 18.4.9 binary
 
 The installed binary is `~/tools/omp-local/omp-linux-x64`, reached through
 `~/.local/bin/omp`. The pre-rebase binary is retained at
