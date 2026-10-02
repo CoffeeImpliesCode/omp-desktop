@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added niri IPC display and window enumeration and exact native window capture, including windows without AT-SPI support.
+
+### Fixed
+
+- Fixed Wayland PipeWire desktop capture dropping all but the first authorized monitor stream. Capture now composes every stream using its logical placement and pixel dimensions and supports selecting an authorized display by ID.
+- Refused global coordinate mapping and AX coordinate clicks when a window's global origin is unknown or its AT-SPI bounds cannot be verified.
+- Fixed niri window screenshots rejecting valid buffers on fractional-scale outputs.
+- Kept Wayland desktop capture and window discovery working when optional niri IPC metadata is unavailable.
+
 ## [18.4.9] - 2026-10-01
 
 ### Added

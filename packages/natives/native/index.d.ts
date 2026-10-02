@@ -1167,13 +1167,15 @@ export interface DesktopSessionOptions {
   display?: string
 }
 
-/** One capturable top-level window in global logical desktop coordinates. */
+/**
+ * One capturable top-level window. Origins are global only when
+ * `position_known`.
+ */
 export interface DesktopWindow {
   /**
    * Backend-defined opaque window id, valid as a capture target while the
-   * window lives. Numeric on X11/Win32/macOS; a composite AT-SPI string on
-   * Wayland (e.g. `atspi::1.31:/org/a11y/atspi/accessible/1`). Never parse
-   * it.
+   * window lives. Numeric on X11/Win32/macOS; compositor or AT-SPI ids on
+   * Wayland. Never parse it.
    */
   id: string
   /** Window title; may be empty for untitled windows. */
@@ -1182,6 +1184,11 @@ export interface DesktopWindow {
   app: string
   /** Owning process id when the platform exposes it. */
   pid?: number
+  /**
+   * False when the compositor/toolkit cannot expose a global screen origin.
+   * In that case x/y must not be used for global input or desktop cropping.
+   */
+  positionKnown?: boolean
   x: number
   y: number
   width: number

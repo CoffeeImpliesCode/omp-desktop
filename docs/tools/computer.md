@@ -81,7 +81,7 @@ The same surface is reachable as `computer.*` directly and as `desktop.*` inside
 - `desktop.displays()` returns `DesktopDisplay[]`.
 - `desktop.capabilities()` returns capture/input/AX availability, `backgroundWindowInput` and `takeover` support, permission states, display server, backend, and display count.
 
-A window facade exposes immutable `id`, `app`, `title`, optional `pid`, `bounds`, and `focused` fields.
+A window facade exposes immutable `id`, `app`, `title`, optional `pid`, `bounds`, `positionKnown`, and `focused` fields.
 
 ### Screenshots and input
 
@@ -97,6 +97,8 @@ Both a selected window and `desktop` expose:
 - `press(chord | string[], { takeover? })`
 
 A window also exposes `raise()`, `ax(...)`, `find(...)`, and `ref(...)`. Window input defaults to background delivery without deliberate activation or pointer movement. `takeover: true` briefly activates the target and posts real input; use it only after that call reports `BackgroundUnavailable` or a screenshot proves a no-op, and AX cannot perform the action. Never replay uncertain input blindly. Desktop-root pointer helpers drive the user's real pointer, so prefer window handles. Pixel coordinates belong to the most recent screenshot of the same target. Coordinate input before capture, after target/layout changes, or with another target's frame throws.
+
+Window metadata and handles expose `positionKnown`. If it is false, `bounds.x` and `bounds.y` are not global coordinates. Exact native window capture can still succeed. Input that needs the window's global origin fails with `InvalidCoordinateFrame`; an AT-SPI window-relative position is not a safe replacement. AX actions do not require that coordinate mapping.
 
 Screenshots are PNGs written under the OS temp directory. Native capture is resized to the effective capture caps before both saving and displaying; the saved PNG and model-visible image share the same pixel frame. Unless `silent: true`, each capture emits a status text block and an image block. Details record captured dimensions, original source dimensions, and target.
 
@@ -161,6 +163,8 @@ Recover by refreshing the exact target screenshot after coordinate-frame errors,
 ## Platform constraints
 
 Current native backends support macOS, Linux X11, Linux Wayland portal capture/input where available, and Windows; other targets depend on native-addon support. Capabilities and permission state are runtime facts—inspect `desktop.capabilities()` rather than assuming them. Wayland compositors do not permit omp to activate arbitrary windows, so per-window native input and `raise()` are unavailable; use AX actions, or desktop input after focusing the target yourself. See [Scriptable computer use: Platforms](../computer-use.md#platforms) for prerequisites and permission details.
+
+Builds with `wayland-pipewire` capture all authorized monitor streams and map screenshot pixels through their logical display bounds. On niri, IPC supplies connector display IDs, window IDs, and metadata before capture. Exact `niri:<id>` window capture uses the compositor's native ScreenCast service without focus or clipboard changes and without a portal selection dialog. Normal computer read approval remains in force. Missing global window positions remain unknown; they do not prevent exact capture or make per-window native input available.
 
 ## Critical constraints
 

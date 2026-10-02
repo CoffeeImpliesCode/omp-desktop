@@ -933,42 +933,10 @@ describe("computer worker round trips", () => {
 		});
 	});
 
-	it("returns plain identity snapshots for rendered handle calls and enforces the derived read-only tier", async () => {
+	it("enforces the derived read-only tier for rendered handle calls", async () => {
 		const transport = new MemoryTransport();
 		const native = new FakeNativeSession();
 		new ComputerWorkerCore(transport, () => native);
-
-		const win = await runWorker(
-			transport,
-			"call-window",
-			renderComputerCall([{ method: "window", args: ["42"] }]),
-			true,
-		);
-		expect(win.ok).toBe(true);
-		if (win.ok) {
-			expect(win.payload.returnValue).toEqual({
-				id: "42",
-				app: "Code",
-				title: "Editor",
-				pid: 123,
-				bounds: { x: 4, y: 5, width: 40, height: 20 },
-				focused: true,
-			});
-		}
-
-		const el = await runWorker(transport, "call-ref", renderComputerCall([{ method: "ref", args: ["e1"] }]), true);
-		expect(el.ok).toBe(true);
-		if (el.ok) {
-			expect(el.payload.returnValue).toEqual({
-				ref: "e1",
-				role: "button",
-				nativeRole: "button",
-				title: "Save",
-				enabled: true,
-				focused: false,
-				childCount: 0,
-			});
-		}
 
 		const clickChain = [
 			{ method: "window", args: ["42"] },

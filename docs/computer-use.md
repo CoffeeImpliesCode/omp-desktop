@@ -23,7 +23,7 @@ tools:
 | Key                  | Default | Meaning                                                                                                           |
 | -------------------- | ------: | ----------------------------------------------------------------------------------------------------------------- |
 | `computer.enabled`   | `false` | Expose the `computer` Eval prelude.                                                                               |
-| `computer.display`   |   `all` | Composite every display, or select one native display ID. On Wayland the portal display ID is `wayland-portal-0`. |
+| `computer.display`   |   `all` | Composite every authorized display, or select an ID returned by `computer.displays()`. Niri uses connector names such as `eDP-1`; other Wayland portals use `wayland-portal-N`. |
 | `computer.maxWidth`  |  `3840` | Maximum screenshot width. Some model transports impose an effective coordinate-safe cap of 1280.                  |
 | `computer.maxHeight` |  `2400` | Maximum screenshot height. Some model transports impose an effective coordinate-safe cap of 896.                  |
 
@@ -58,7 +58,9 @@ await (await win.ref("e12")).press()
 await win.click(120, 48, button="right")
 ```
 
-`await computer.window(idOrFilter)` returns a `ComputerWindow` handle carrying `id`, `app`, `title`, `pid`, `bounds`, and `focused` as captured at resolution; `await win.ref("e5")`, `win.find(...)`, `computer.elementAt(x, y)`, `computer.focusedElement()`, and `computer.ref("e5")` return `ComputerElement` handles carrying `ref`, `role`, `nativeRole`, `title`, `description`, `enabled`, `focused`, and `childCount`. Every method on a handle re-resolves it by id or ref, so a closed window or expired ref fails on the call, not on the handle.
+`await computer.window(idOrFilter)` returns a `ComputerWindow` handle carrying `id`, `app`, `title`, `pid`, `bounds`, `focused`, and `positionKnown` as captured at resolution; `await win.ref("e5")`, `win.find(...)`, `computer.elementAt(x, y)`, `computer.focusedElement()`, and `computer.ref("e5")` return `ComputerElement` handles carrying `ref`, `role`, `nativeRole`, `title`, `description`, `enabled`, `focused`, and `childCount`. Every method on a handle re-resolves it by id or ref, so a closed window or expired ref fails on the call, not on the handle.
+
+When `positionKnown` is false, `bounds.x` and `bounds.y` are not global desktop coordinates. Window capture can still work, but coordinate input that needs the missing origin fails with `InvalidCoordinateFrame`. Do not substitute AT-SPI window-relative coordinates for a global origin.
 
 For multi-step sequences, `computer.run(fnOrCode, { args?, read_only?, timeout? })` runs a function or JavaScript string inside the same session. The function receives `{ desktop, wait, assert }`, where `desktop` has the same helpers as `computer`; it is serialized, so it cannot capture Eval-cell closures. Pass plain data, functions, or `RegExp` values through `{ args: [...] }`. Python `computer.run(code, read_only=..., timeout=...)` accepts a JavaScript string only. The run returns the code's real structured value; nonempty text emitted by inner `display(...)` calls prints in the outer Eval cell, while screenshots surface as Eval images. Code runs with top-level `await` in a persistent, full-host-access Bun session. Window handles, screenshot frames, and recent AX references survive between calls. Ordinary Eval helpers such as `display`, `print`, `read`, `write`, and `tool.*` remain available.
 
@@ -155,6 +157,10 @@ Inside `computer.run`, `wait(milliseconds)` sleeps and `wait(predicate, { timeou
 X11 background input uses an independent XI2 pointer/keyboard and requires writable `/dev/uinput`, working udev/libinput hotplug, and a compatible toolkit/window manager. Core-only clients and popup grabs may require AX or takeover. Windows uses physical screen coordinates throughout capture, AX and input, converting only at the target window's DPI-aware message boundary; mixed-DPI monitor origins are never divided by individual display scales.
 
 Inspect `computer.capabilities()` rather than assuming capture, input, AX, or permission state. On Wayland, input reports `prompt-or-granted` before first native input without opening a RemoteDesktop session. Released builds are compiled without the `wayland-pipewire` feature, so `capabilities()` reports `capture: false`; where the feature is present, a missing portal/PipeWire feature or denied RemoteDesktop portal is reported as a capture/input/permission failure rather than falling back to X11.
+
+With `wayland-pipewire`, desktop capture retains every monitor stream authorized by the ScreenCast portal. Display bounds use the portal's logical geometry and each stream's pixel size; capture refuses ambiguous multi-monitor placement rather than inventing offsets. A display selector chooses an authorized stream, not whichever stream the portal returns first.
+
+On niri, display and window metadata come from its IPC socket, so `displayCount` is available before capture. Window IDs are opaque `niri:<id>` values. Exact window capture uses niri's native Mutter ScreenCast service, including for windows without AT-SPI support. It does not focus the window or change the clipboard. Normal computer read approval still applies, but this path does not open a portal selection dialog. Tiled windows whose global origin niri does not publish report `positionKnown: false`. AX coordinate clicks also refuse unverified global bounds; semantic AX actions remain available where supported. A stream whose dimensions include unlocatable popup or shadow margins fails with `CaptureFailed` instead of producing a misaligned window frame.
 
 ## Safety and troubleshooting
 

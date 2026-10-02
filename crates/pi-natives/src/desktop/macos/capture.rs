@@ -147,6 +147,7 @@ impl MacCapture {
 				title,
 				app,
 				pid,
+				position_known: Some(true),
 				x,
 				y,
 				width,

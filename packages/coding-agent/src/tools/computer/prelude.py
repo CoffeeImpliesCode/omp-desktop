@@ -106,7 +106,7 @@ def _make_computer():
             return [_Element(snapshot) for snapshot in await self._method("children", (), {})]
 
     class _Window:
-        __slots__ = ("id", "app", "title", "pid", "bounds", "focused")
+        __slots__ = ("id", "app", "title", "pid", "bounds", "positionKnown", "focused")
 
         def __init__(self, snapshot):
             for field in self.__slots__:

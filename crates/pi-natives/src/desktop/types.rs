@@ -20,27 +20,30 @@ pub struct DesktopDisplay {
 	pub is_primary:   bool,
 }
 
-/// One capturable top-level window in global logical desktop coordinates.
+/// One capturable top-level window. Origins are global only when
+/// `position_known`.
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct DesktopWindow {
 	/// Backend-defined opaque window id, valid as a capture target while the
-	/// window lives. Numeric on X11/Win32/macOS; a composite AT-SPI string on
-	/// Wayland (e.g. `atspi::1.31:/org/a11y/atspi/accessible/1`). Never parse
-	/// it.
-	pub id:      String,
+	/// window lives. Numeric on X11/Win32/macOS; compositor or AT-SPI ids on
+	/// Wayland. Never parse it.
+	pub id:             String,
 	/// Window title; may be empty for untitled windows.
-	pub title:   String,
+	pub title:          String,
 	/// Owning application name.
-	pub app:     String,
+	pub app:            String,
 	/// Owning process id when the platform exposes it.
-	pub pid:     Option<u32>,
-	pub x:       i32,
-	pub y:       i32,
-	pub width:   u32,
-	pub height:  u32,
+	pub pid:            Option<u32>,
+	/// False when the compositor/toolkit cannot expose a global screen origin.
+	/// In that case x/y must not be used for global input or desktop cropping.
+	pub position_known: Option<bool>,
+	pub x:              i32,
+	pub y:              i32,
+	pub width:          u32,
+	pub height:         u32,
 	/// Whether the window currently holds input focus.
-	pub focused: bool,
+	pub focused:        bool,
 }
 
 #[napi(object)]

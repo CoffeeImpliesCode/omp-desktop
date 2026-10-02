@@ -601,15 +601,16 @@ mod tests {
 	}
 	fn window() -> DesktopWindow {
 		DesktopWindow {
-			id:      "7".into(),
-			title:   "Title".into(),
-			app:     "Safari".into(),
-			pid:     None,
-			x:       0,
-			y:       0,
-			width:   100,
-			height:  100,
-			focused: true,
+			id:             "7".into(),
+			title:          "Title".into(),
+			app:            "Safari".into(),
+			pid:            None,
+			position_known: Some(true),
+			x:              0,
+			y:              0,
+			width:          100,
+			height:         100,
+			focused:        true,
 		}
 	}
 	#[test]

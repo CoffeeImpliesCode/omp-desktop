@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `positionKnown` to computer window metadata and handles. Exact niri window screenshots work even when the compositor does not publish a global window origin.
+
 ### Fixed
 
 - Fixed test suite failures on non-FHS hosts and under ambient terminal and Git configuration ([#12358](https://github.com/can1357/oh-my-pi/pull/12358) by [@olegpulatov](https://github.com/olegpulatov)).

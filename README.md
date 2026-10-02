@@ -1,3 +1,23 @@
+# omp-desktop
+
+This fork of [oh-my-pi](https://github.com/can1357/oh-my-pi) improves desktop computer use specifically for **Linux Wayland**.
+
+## Linux Wayland improvements
+
+- Capture exact niri windows, including unfocused windows, without raising the window or changing focus.
+- Compose desktop screenshots from all portal-authorized monitor streams, with mixed scales and negative origins.
+- Save and display the same capped PNG in the JavaScript and Python computer helpers.
+- Expose `positionKnown` so unknown window origins do not block exact screenshots or permit unsafe global pointer mapping.
+
+Native capture requires a Linux build with the `wayland-pipewire` feature and system PipeWire libraries.
+See the [local build and verification notes](LOCAL-PIPEWIRE-BUILD.md).
+The local compile helper accepts `OMP_LOCAL_OUTFILE` to select the output path.
+Per-window Wayland input remains unavailable, and AX access depends on each application's AT-SPI registration.
+
+**The upstream packages and installers below do not include these fork changes.**
+
+---
+
 <p align="center">
   <img src="https://github.com/can1357/oh-my-pi/blob/main/assets/hero.png?raw=true" alt="omp">
 </p>
@@ -32,7 +52,7 @@ The most capable agent surface that ships. Continuously tuned by real-world use 
 > while we evaluate how open contributions go. Depending on the results, the
 > vouch system may return.
 
-## Install
+## Install upstream omp
 
 **macOS · Linux**
 

@@ -109,6 +109,7 @@ impl AtSpiAx {
 							title,
 							app: app_name.clone(),
 							pid,
+							position_known: Some(position_known),
 							x,
 							y,
 							width: width as u32,
@@ -172,8 +173,9 @@ impl AtSpiAx {
 				if dbus
 					.get_connection_unix_process_id(bus_name.clone().into())
 					.await
-					.ok() == Some(pid)
-				{
+					.is_ok_and(|owner| {
+						owner == pid || (win.id.starts_with("niri:") && process_owns_window(owner, pid))
+					}) {
 					matches.push(app);
 				}
 			}
@@ -282,9 +284,41 @@ fn atspi_window_id(frame: &ObjectRefOwned) -> String {
 	format!("atspi:{name}:{}", frame.path())
 }
 
+fn process_owns_window(owner: u32, mut client: u32) -> bool {
+	// Browser Wayland connections can belong to a child process while AT-SPI
+	// belongs to its parent. Only ancestry, never shared titles/apps, proves it.
+	for _ in 0..32 {
+		if owner == client {
+			return true;
+		}
+		let Ok(stat) = std::fs::read_to_string(format!("/proc/{client}/stat")) else {
+			return false;
+		};
+		let Some(fields) = stat.rsplit_once(')').map(|(_, fields)| fields) else {
+			return false;
+		};
+		let Some(parent) = fields
+			.split_whitespace()
+			.nth(1)
+			.and_then(|pid| pid.parse::<u32>().ok())
+		else {
+			return false;
+		};
+		if parent == client || parent <= 1 {
+			return false;
+		}
+		client = parent;
+	}
+	false
+}
+
 fn native_window_for_frame(windows: &[DesktopWindow], pid: u32, title: &str) -> CoreResult<String> {
 	let mut matches = windows.iter().filter(|window| {
-		!window.id.starts_with("atspi:") && window.pid == Some(pid) && window.title == title
+		!window.id.starts_with("atspi:")
+			&& window.title == title
+			&& window.pid.is_some_and(|client| {
+				client == pid || (window.id.starts_with("niri:") && process_owns_window(pid, client))
+			})
 	});
 	let first = matches.next().ok_or_else(|| {
 		DesktopError::window_not_found("AT-SPI frame has no matching native window")
@@ -396,7 +430,39 @@ impl AxBackend for AtSpiAx {
 						.name()
 						.await
 						.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window title: {err}")))?;
-					return native_window_for_frame(windows, pid, &title);
+					let id = native_window_for_frame(windows, pid, &title)?;
+					if id.starts_with("niri:") {
+						let window = windows
+							.iter()
+							.find(|window| window.id == id)
+							.ok_or_else(|| DesktopError::window_not_found("AT-SPI owner is gone"))?;
+						if window.position_known == Some(false) {
+							return Err(DesktopError::invalid_coordinate_frame(
+								"window has no known global origin; use an accessibility action or \
+								 desktop screenshot coordinates",
+							));
+						}
+						let component =
+							Self::component(&self.connection, &object)
+								.await
+								.map_err(|err| {
+									DesktopError::ax_failed(format!("AT-SPI window component: {err}"))
+								})?;
+						let (x, y, ..) =
+							component
+								.get_extents(CoordType::Screen)
+								.await
+								.map_err(|err| {
+									DesktopError::ax_failed(format!("AT-SPI window origin: {err}"))
+								})?;
+						if (x, y) != (window.x, window.y) {
+							return Err(DesktopError::invalid_coordinate_frame(
+								"AT-SPI coordinates do not match the compositor's window origin; use an \
+								 accessibility action or window screenshot coordinates",
+							));
+						}
+					}
+					return Ok(id);
 				}
 				let parent = proxy
 					.parent()
@@ -792,15 +858,16 @@ mod tests {
 	#[test]
 	fn frame_ownership_requires_unique_process_and_title() {
 		let window = |id: &str, pid: u32| DesktopWindow {
-			id:      id.to_owned(),
-			pid:     Some(pid),
-			title:   "Document".into(),
-			app:     "Editor".into(),
-			x:       0,
-			y:       0,
-			width:   100,
-			height:  100,
-			focused: false,
+			id:             id.to_owned(),
+			pid:            Some(pid),
+			position_known: Some(true),
+			title:          "Document".into(),
+			app:            "Editor".into(),
+			x:              0,
+			y:              0,
+			width:          100,
+			height:         100,
+			focused:        false,
 		};
 		let mut windows = vec![window("1", 10), window("2", 20)];
 		assert_eq!(native_window_for_frame(&windows, 20, "Document").unwrap(), "2");

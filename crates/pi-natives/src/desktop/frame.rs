@@ -138,6 +138,12 @@ impl FrameGeometry {
 				let current = current_window.ok_or_else(|| {
 					DesktopError::window_not_found("target window is no longer available")
 				})?;
+				if current.position_known == Some(false) {
+					return Err(DesktopError::invalid_coordinate_frame(
+						"target window has no known global position; use desktop coordinates or an \
+						 accessibility action",
+					));
+				}
 				if current.width != captured_width || current.height != captured_height {
 					return Err(DesktopError::invalid_coordinate_frame(
 						"target window was resized since capture; capture it again before coordinate \
@@ -254,6 +260,7 @@ mod tests {
 			title: "T".into(),
 			app: "A".into(),
 			pid: None,
+			position_known: Some(true),
 			x,
 			y,
 			width: 400,
@@ -273,6 +280,14 @@ mod tests {
 	fn moved_window_is_reanchored() {
 		let f = FrameGeometry::for_window(&window(10, 20), 800, 600);
 		assert_eq!(f.map_point(400.0, 300.0, Some(&window(110, 220))).unwrap(), (310.0, 370.0));
+	}
+	#[test]
+	fn unknown_window_origin_refuses_global_coordinate_mapping() {
+		let mut window = window(0, 0);
+		window.position_known = Some(false);
+		let frame = FrameGeometry::for_window(&window, 800, 600);
+		let err = frame.map_point(400.0, 300.0, Some(&window)).unwrap_err();
+		assert_eq!(err.code.as_str(), "InvalidCoordinateFrame");
 	}
 	#[test]
 	fn cap_scaling_adjusts_geometry() {

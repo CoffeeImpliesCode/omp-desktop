@@ -57,13 +57,15 @@ interface ComputerBounds {
 	height: number;
 }
 
-/** One capturable top-level window in global desktop coordinates. */
+/** One capturable top-level window; x/y are global only when positionKnown. */
 interface ComputerWindowInfo extends ComputerBounds {
 	/** Opaque backend-defined id; never parse it. */
 	id: string;
 	app: string;
 	title: string;
 	pid?: number;
+	/** False when no trustworthy global screen origin is exposed. */
+	positionKnown?: boolean;
 	focused: boolean;
 }
 
@@ -153,6 +155,8 @@ interface ComputerWindow extends ComputerInputTarget {
 	readonly app: string;
 	readonly title: string;
 	readonly pid?: number;
+	/** False when bounds.x/bounds.y cannot be used as global coordinates. */
+	readonly positionKnown: boolean;
 	readonly bounds: ComputerBounds;
 	readonly focused: boolean;
 	raise(): Promise<void>;

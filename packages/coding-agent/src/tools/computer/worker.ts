@@ -318,6 +318,7 @@ class Win {
 	readonly app: string;
 	readonly title: string;
 	readonly pid?: number;
+	readonly positionKnown: boolean;
 	readonly bounds: { x: number; y: number; width: number; height: number };
 	readonly focused: boolean;
 	readonly #session: NativeDesktopSession;
@@ -330,6 +331,7 @@ class Win {
 		this.app = window.app;
 		this.title = window.title;
 		this.pid = window.pid;
+		this.positionKnown = window.positionKnown !== false;
 		this.bounds = { x: window.x, y: window.y, width: window.width, height: window.height };
 		this.focused = window.focused;
 	}

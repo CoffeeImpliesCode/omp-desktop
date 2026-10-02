@@ -156,6 +156,7 @@ pub(super) fn windows() -> CoreResult<Vec<DesktopWindow>> {
 			title,
 			app,
 			pid: process_id(id),
+			position_known: Some(true),
 			x: physical_x,
 			y: physical_y,
 			width: physical_width,
