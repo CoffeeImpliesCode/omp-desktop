@@ -12,7 +12,7 @@ const transformers = tf as { readonly version: string };
 await compileCodingAgent({
 	repoRoot: import.meta.dir,
 	entrypoint: `${import.meta.dir}/packages/coding-agent/src/cli.ts`,
-	outfile: Bun.env.OMP_LOCAL_OUTFILE || "/home/janis/tools/omp-local/omp-linux-x64",
+	outfile: Bun.env.OMP_LOCAL_OUTFILE || `${import.meta.dir}/packages/coding-agent/dist/omp-linux-x64`,
 	target: "bun-linux-x64-baseline",
 	minifyIdentifiers: true,
 	transformersVersion: transformers.version,

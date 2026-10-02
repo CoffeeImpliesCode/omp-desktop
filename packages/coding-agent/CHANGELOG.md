@@ -13,6 +13,7 @@
 - **Breaking:** Replaced `win.raise()` and Python `win.raise_()` with `win.focus()`. Window handle fields remain resolution-time snapshots; use `state()` for current geometry and state.
 - Kept `win.move(x, y)` as pointer movement. Use `moveTo({ x, y })` and `moveBy({ dx, dy })` to move the window.
 - Clarified computer control guidance: focus can warp the pointer, `Timeout` can leave applied effects, and screenshot frames expire before native dispatch.
+- Local standalone builds now write to `packages/coding-agent/dist/omp-linux-x64` by default. `OMP_LOCAL_OUTFILE` still selects another destination.
 
 ## [18.4.10] - 2026-10-02
 

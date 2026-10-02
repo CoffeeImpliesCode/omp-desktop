@@ -11,7 +11,7 @@ backend selection reads only `WAYLAND_DISPLAY` / `DISPLAY`
 Rebuild both addon variants with the opt-in feature and embed them in the
 binary. This fork also retains all authorized monitor streams and adds exact
 niri window capture. The fork now integrates upstream release `v18.4.10`
-(package version 18.4.10), in `/home/janis/.omp/wt/oh-my-pi-desktop-main`.
+(package version 18.4.10).
 
 ## Why the binary must be rebuilt
 
@@ -37,47 +37,46 @@ to decide whether the binary embeds an addon is wrong.
 
 ## Steps
 
+Run these commands from the checkout root. On NixOS, first run
+`nix develop path:.` to load the pinned tools and native libraries.
+On other Linux systems, install Bun, the Rust toolchain from
+`rust-toolchain.toml`, pkg-config, Clang, and the PipeWire development libraries.
+
 ```sh
-cd /home/janis/.omp/wt/oh-my-pi-desktop-main
-export PATH="$HOME/tools/bun-1.3.14:$HOME/.local/share/rustup/toolchains/nightly-2026-08-12-x86_64-unknown-linux-gnu/bin:$PATH"
-export RUSTUP_TOOLCHAIN=nightly-2026-08-12
-export RUSTC="$HOME/.local/share/rustup/toolchains/nightly-2026-08-12-x86_64-unknown-linux-gnu/bin/rustc"
-export RUSTDOC="$HOME/.local/share/rustup/toolchains/nightly-2026-08-12-x86_64-unknown-linux-gnu/bin/rustdoc"
-export CARGO_TARGET_DIR=/home/janis/projects/oh-my-pi/target
+export CARGO_TARGET_DIR="$PWD/target"
 export CARGO_BUILD_JOBS=2
 
-# 1. Feature flag. crates/pi-natives/Cargo.toml has default = [] on purpose:
-#    the pipewire crate hard-links system libpipewire-0.3 via pkg-config,
-#    which no CI/cross triple can satisfy.
-#    packages/natives/scripts/build-bindings.ts, napiArgs:
-#      "--features", "wayland-pipewire",
+# 1. Check that pkg-config can find PipeWire.
+# The local build script enables the wayland-pipewire feature.
+pkg-config --modversion libpipewire-0.3
+RP="$(pkg-config --variable=libdir libpipewire-0.3)"
 
-# 2. NixOS: no sudo, resolve dev + runtime libs from the store.
-export PKG_CONFIG_PATH=/nix/store/jrmk7s69c1ydqqsq0a751m57621rm6v6-pipewire-1.6.8-dev/lib/pkgconfig
-export LIBCLANG_PATH=/nix/store/a3kjvvlm7f8abcmxh6f8dndiwc4vp726-clang-21.1.8-lib/lib
-RP=/nix/store/rvgcqlnpq9lv4vbq85zvv51bkk4izpbl-pipewire-1.6.8/lib
-export LIBRARY_PATH=$RP
-
+# 2. Build BOTH variants. Explicit RUSTFLAGS must include the ISA floor.
 cd packages/natives
-
-# 3. Build BOTH variants. See the target-cpu note below — pass RUSTFLAGS
-#    yourself, including the ISA floor, or the pinning is skipped.
 RUSTFLAGS="-C target-cpu=x86-64-v2 -C link-arg=-Wl,-rpath,$RP" \
   OMP_NATIVE_X64_VARIANT=baseline bun scripts/build-bindings.ts
 RUSTFLAGS="-C target-cpu=x86-64-v3 -C link-arg=-Wl,-rpath,$RP" \
   OMP_NATIVE_X64_VARIANT=modern bun scripts/build-bindings.ts
 
-# 4. Prepare all binary assets, then compile to a staging path.
+# 3. Prepare all binary assets, then compile inside the checkout.
 bun run gen:native
 cd ../..
 bun --cwd=packages/stats run gen:stats
 bun --cwd=packages/coding-agent run gen:tool-views
-OMP_LOCAL_OUTFILE=/home/janis/tools/omp-local/omp-linux-x64-18.4.10-controls-test \
-  bun compile-one.ts
+bun compile-one.ts
 ```
 
-`bun run gen:native:reset` restores the `embeddedAddon = null` stub afterwards.
-Only do that when not about to compile — a compile without a preceding
+The default output is `packages/coding-agent/dist/omp-linux-x64`.
+Set `OMP_LOCAL_OUTFILE` to an explicit path if a different destination is needed.
+
+After compilation, restore the generated embedding stubs:
+
+```sh
+bun --cwd=packages/natives run gen:native:reset
+bun --cwd=packages/stats run gen:stats:reset
+```
+
+Do not reset the native stub before compilation. A compile without a preceding
 `gen:native` produces a binary that reverts the addon.
 
 ### Why `RUSTFLAGS` is set explicitly
@@ -112,14 +111,14 @@ binary compiled with 1.3.13 refuses to start:
 error: Bun runtime must be >= 1.3.14 (found v1.3.13). Please upgrade: bun upgrade
 ```
 
-Compile with a newer bun than the one in `PATH`. Local copy:
-`~/tools/bun-1.3.14/bun` (sha256-verified against the release `SHASUMS256.txt`).
+Run `bun --version` before compilation. Use Bun 1.3.14 or newer.
+The Nix development shell supplies the pinned Bun version.
 
 ## Verify
 
 ```sh
-~/tools/omp-local/omp-linux-x64-18.4.10-test --version
-~/tools/omp-local/omp-linux-x64-18.4.10-test --smoke-test
+packages/coding-agent/dist/omp-linux-x64 --version
+packages/coding-agent/dist/omp-linux-x64 --smoke-test
 ```
 
 The standalone smoke checks worker startup and bundled assets. Exercise real
@@ -177,8 +176,7 @@ resize, per-monitor centering, and the active workspace's panel reservations.
 Fresh PNGs matched the capture dimensions and showed the owned applications.
 All owned clients and private servers exited; no test accessibility bus ran.
 
-The staged binary is
-`~/tools/omp-local/omp-linux-x64-18.4.10-controls-test`. It reported
+The staged controls binary reported
 `omp/18.4.10` and passed `--smoke-test` with both `PI_NATIVE_VARIANT=modern`
 and `baseline`, using an isolated `XDG_DATA_HOME`. Both extracted addons matched
 the exercised source builds byte-for-byte and by SHA-256:
@@ -228,13 +226,12 @@ remain absent rather than using input fallbacks. See
 
 ### Installed 18.4.10 desktop-control build
 
-`~/.local/bin/omp` resolves to `~/tools/omp-local/omp-linux-x64`.
-That executable is byte-identical to the verified controls build above.
+The installed `omp` executable was byte-identical to the verified controls
+build above.
 It reports `omp/18.4.10` and passed `--smoke-test` with both CPU variants.
 Both installed-cache addons match the source-build sizes and hashes above.
 
-The previous 18.4.9 executable is retained at
-`~/tools/omp-local/omp-linux-x64.before-desktop-controls-18.4.10`.
+The previous 18.4.9 executable was retained as a local rollback copy.
 Restart existing OMP sessions to load the new computer helpers.
 
 Two launched `openai-codex/gpt-5.5` agents completed five live tasks each.
@@ -260,8 +257,8 @@ coding-agent type check passed. The computer and changelog suites passed
 The feature-enabled native nextest suite passed 466 tests with one skipped,
 using two test threads.
 
-The staged binary is `~/tools/omp-local/omp-linux-x64-18.4.10-test`. It reported
-`omp/18.4.10` and `smoke-test: ok`. Both extracted addon files matched the
+The staged capture binary reported `omp/18.4.10` and `smoke-test: ok`.
+Both extracted addon files matched the
 source builds byte-for-byte and by SHA-256. Embedding stubs were reset after
 the build; no generated native binaries are committed.
 
@@ -316,11 +313,8 @@ niri IPC; the live accessibility registry was unavailable and returned
 
 ### Previous 18.4.9 installation
 
-The previous installation used `~/tools/omp-local/omp-linux-x64`, reached through
-`~/.local/bin/omp`. The pre-rebase binary is retained at
-`~/tools/omp-local/omp-linux-x64.before-18.4.9-f7055447f2`.
-The binary from before the native review corrections is also retained at
-`~/tools/omp-local/omp-linux-x64.before-direct-window-corrections-18.4.9`.
+The previous 18.4.9 installation used a locally built standalone executable.
+Rollback copies were retained before the rebase and native review corrections.
 An older running omp of the same version can replace the shared native cache
 with its own embedded addons. Restart existing sessions after installing.
 
