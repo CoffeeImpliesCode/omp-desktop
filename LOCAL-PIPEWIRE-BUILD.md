@@ -20,8 +20,8 @@ The generated 18.4.10 embedding descriptor includes both rebuilt addon variants:
 ```
 // packages/natives/native/embedded-addon.js
 { platformTag: "linux-x64", version: "18.4.10",
-  files: [ { variant: "modern",  size: 222588456 },
-          { variant: "baseline", size: 222524512 } ] }
+  files: [ { variant: "modern",  size: 222897736 },
+          { variant: "baseline", size: 222720136 } ] }
 ```
 
 `isEmbeddedAddonFileCurrent` (`packages/natives/native/loader-state.js`) is a
@@ -72,7 +72,7 @@ bun run gen:native
 cd ../..
 bun --cwd=packages/stats run gen:stats
 bun --cwd=packages/coding-agent run gen:tool-views
-OMP_LOCAL_OUTFILE=/home/janis/tools/omp-local/omp-linux-x64-18.4.10-test \
+OMP_LOCAL_OUTFILE=/home/janis/tools/omp-local/omp-linux-x64-18.4.10-controls-test \
   bun compile-one.ts
 ```
 
@@ -142,7 +142,117 @@ On niri, `capabilities().displayCount` is populated from IPC before capture.
 Unknown window origins report `positionKnown: false`; exact capture does not
 depend on those origins, and unsafe global coordinate input is refused.
 
-### 18.4.10 checks
+### Desktop control expansion: 18.4.10
+
+The control build adds native window, workspace, and display operations to the
+JavaScript and Python computer helpers. It replaces the public `raise` helpers
+with `focus`. The verified build is now the default local OMP launcher.
+
+Final source gates:
+
+- Rust formatting and native Clippy passed with and without `wayland-pipewire`.
+- Native nextest passed 507 tests without the feature and 514 with it, with one
+  skipped in each configuration and two test threads.
+- The focused computer, call-policy, desktop-adapter, and changelog suites passed
+  75 tests, with one skipped and 380 assertions across four files.
+- Root tool lint/format checks, natives package checks, coding-agent type checks,
+  and the Python prelude runtime-name/syntax checks passed.
+
+Both optimized CPU variants passed 33-step owned-window runs on niri and
+33-step private Xvfb/Openbox runs. The X11 run also exercised Python keyword
+arguments against real clients: focus, resize, exact absolute/relative movement,
+maximize, minimize, restore, fullscreen, workspace movement/focus, and close.
+Snapshot bounds stayed unchanged while fresh state reflected mutations, and
+window close left the desktop session usable.
+
+The niri runs verified window movement from HDMI-A-1 to eDP-1, movement of an
+owned workspace back to HDMI-A-1, and monitor focus. They also verified floating
+and tiling setters, tiled-movement refusal, width resize, centering, maximize
+and fullscreen toggles, and targeted close. Niri's original window focus was
+restored. Windowed-fullscreen requests were accepted while the owned client
+remained 500x340; niri exposes no authoritative fullscreen flag, so the helper
+does not invent one. The X11 runs used two active 640x800 virtual monitors and
+verified cross-monitor movement, exact decorated client origins, size-only
+resize, per-monitor centering, and the active workspace's panel reservations.
+Fresh PNGs matched the capture dimensions and showed the owned applications.
+All owned clients and private servers exited; no test accessibility bus ran.
+
+The staged binary is
+`~/tools/omp-local/omp-linux-x64-18.4.10-controls-test`. It reported
+`omp/18.4.10` and passed `--smoke-test` with both `PI_NATIVE_VARIANT=modern`
+and `baseline`, using an isolated `XDG_DATA_HOME`. Both extracted addons matched
+the exercised source builds byte-for-byte and by SHA-256:
+
+- Modern: `547ff5c10cc26332bc191b3d177e178f87afc6ebe29d62c7cf93d6777dd2b958`
+- Baseline: `24b89826d4c6065f888b6b28120c827b7f0cdc5d455e4ddea4c168f139932652`
+
+Embedding stubs were reset after compilation. During staging, the installed
+18.4.9 binary remained unchanged.
+
+The final audit corrected control guidance for compositor pointer warps,
+`Timeout` recovery, and frame invalidation before native dispatch. Rust
+formatting and Clippy passed again in both feature configurations. Native
+nextest again passed 507 and 514 tests, with one skipped per configuration.
+The 75 focused consumer tests passed, with one skipped. Native package and
+coding-agent type checks passed. Root lint/format checks and the 17 changelog
+tests passed again after the asset generators were reset.
+
+Both CPU variants passed fresh owned-window runs on niri and private X11.
+The runs verified focus, exact X11 movement, resize, minimize/restore on X11,
+and targeted close with the session still alive. After the Openbox animation
+settled, restored X11 geometry remained 430x310 at the requested 120,140 origin.
+Fresh PNGs showed the restored application. Original niri focus and workspace
+were restored. All owned clients and private servers exited, and 34 audit PNGs
+were removed.
+
+The rebuilt staged CLI again reported `omp/18.4.10` and passed both CPU-variant
+smoke tests. Its SHA-256 is
+`ec45e0951a2de3729442f1be9f0f3634079d420ee6b62f8b21005bbca71701e5`.
+Both extracted addons matched the source builds and the hashes above.
+
+The first audit smoke used `~/.omp/natives/18.4.10` and refreshed its two addon
+entries because the new `$XDG_DATA_HOME/omp` directory did not exist. The native
+loader requires that directory before it uses an XDG cache. Final smoke and
+identity checks used a prepared isolated cache, which was removed afterward.
+
+The broader Rust workspace gate was not green. Its initial run had five
+desktop-test failures, fixed and rechecked in the focused native suites, and
+six unrelated shell/builtin fixture failures involving unavailable `/bin` or
+`/usr/bin` programs and stopped-job expectations. That broader run was not
+repeated; its doctest step was not reached.
+
+Niri does not offer minimize or idempotent maximize/fullscreen/restore, and
+X11 has no monitor-focus or workspace-to-monitor binding. Those capabilities
+remain absent rather than using input fallbacks. See
+[`docs/computer-use.md`](docs/computer-use.md#window-workspace-and-display-control).
+
+### Installed 18.4.10 desktop-control build
+
+`~/.local/bin/omp` resolves to `~/tools/omp-local/omp-linux-x64`.
+That executable is byte-identical to the verified controls build above.
+It reports `omp/18.4.10` and passed `--smoke-test` with both CPU variants.
+Both installed-cache addons match the source-build sizes and hashes above.
+
+The previous 18.4.9 executable is retained at
+`~/tools/omp-local/omp-linux-x64.before-desktop-controls-18.4.10`.
+Restart existing OMP sessions to load the new computer helpers.
+
+Two launched `openai-codex/gpt-5.5` agents completed five live tasks each.
+The modern-addon run used JavaScript on niri.
+The baseline-addon run used Python controls and JavaScript read-only checks
+on a private Xvfb/Openbox display.
+Tool results confirmed idempotent state setters, geometry preservation,
+workspace/display movement, read-only refusal, and targeted close.
+Parent checks confirmed primary-window removal, guard survival, and session
+usability. All test clients, private servers, and temporary artifacts were removed.
+
+The X11 agent recovered from a guard capture refusal on an inactive workspace.
+Workspace metadata retained the closed primary's `activeWindowId`.
+Use fresh window discovery to establish whether that window still exists.
+Unsupported operations refused without state changes.
+Niri movement coordinates remain relative to its working area.
+
+### Previous 18.4.10 capture checks
 
 The frozen dependency install, Rust formatting, natives package checks, and
 coding-agent type check passed. The computer and changelog suites passed
@@ -204,9 +314,9 @@ target failed closed. Window listing reached AT-SPI instead of failing at
 niri IPC; the live accessibility registry was unavailable and returned
 `AxFailed`. Its fallback regression passed in both feature configurations.
 
-### Installed 18.4.9 binary
+### Previous 18.4.9 installation
 
-The installed binary is `~/tools/omp-local/omp-linux-x64`, reached through
+The previous installation used `~/tools/omp-local/omp-linux-x64`, reached through
 `~/.local/bin/omp`. The pre-rebase binary is retained at
 `~/tools/omp-local/omp-linux-x64.before-18.4.9-f7055447f2`.
 The binary from before the native review corrections is also retained at
@@ -239,7 +349,8 @@ The installed launcher reported `omp/18.4.9` and passed its smoke test.
 - Upstream keeps `wayland-pipewire` off by default and Bazel addons at
   `crate_features = []`. Until that changes upstream, every build must redo
   this.
-- Native Wayland window input and `raise()` remain unavailable. Use supported
-  semantic AX actions or desktop input after focusing the target yourself.
+- Native Wayland window input remains unavailable. Niri window focus is available
+  through `win.focus()` in the desktop-control build; use supported semantic AX
+  actions or desktop input only after fresh state confirms the intended focus.
 - Window streams with popup or shadow margins whose origin cannot be verified
   fail with `CaptureFailed` instead of silently misaligning the image.

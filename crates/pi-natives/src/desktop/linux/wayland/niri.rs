@@ -1,10 +1,19 @@
-//! Read-only niri compositor state and native per-window capture.
+//! niri compositor state, window control and native per-window capture.
 //!
-//! niri answers window identity, focus and geometry on the `$NIRI_SOCKET` Unix
-//! socket. That IPC is the only source on this platform that knows where the
-//! compositor actually put a window — AT-SPI clients answer with
+//! niri answers window identity, focus, geometry, workspace and monitor layout
+//! on the `$NIRI_SOCKET` Unix socket, and accepts one action per line on that
+//! same socket. That IPC is the only source on this platform that knows where
+//! the compositor actually put a window — AT-SPI clients answer with
 //! window-relative coordinates — so window targets are addressed by `niri:<id>`
-//! and never by a toolkit object.
+//! and never by a toolkit object. It is also the only way to focus, move,
+//! resize or close a window here: Wayland itself grants a client no way to do
+//! that to another client's surface.
+//!
+//! Control resolves every target against fresh compositor state before a byte
+//! goes out, because niri answers `Handled` to an action it could not apply —
+//! an id it does not know included. A precondition this module cannot satisfy
+//! is refused before the wire instead of being sent as a no-op that reports
+//! success.
 //!
 //! Capture goes through niri's own `org.gnome.Mutter.ScreenCast` service:
 //! `CreateSession`, `Session.RecordWindow`, `Session.Start`, then the
@@ -17,7 +26,8 @@
 use std::os::fd::AsRawFd;
 use std::{
 	collections::{HashMap, HashSet},
-	io::{Read, Write},
+	fmt,
+	io::{self, Read, Write},
 	os::unix::net::UnixStream,
 	path::PathBuf,
 	time::Duration,
@@ -26,6 +36,7 @@ use std::{
 #[cfg(feature = "wayland-pipewire")]
 use image::RgbaImage;
 use serde::{Deserialize, de::DeserializeOwned};
+use smallvec::{SmallVec, smallvec};
 #[cfg(feature = "wayland-pipewire")]
 use {
 	futures::StreamExt,
@@ -39,15 +50,22 @@ use {
 };
 
 use crate::desktop::{
-	error::{CoreResult, DesktopError},
-	types::{DesktopDisplay, DesktopWindow},
+	control::ControlAction,
+	error::{CoreResult, DesktopError, ErrorCode},
+	types::{
+		DesktopControlCapabilities, DesktopDisplay, DesktopWindow, DesktopWindowState,
+		DesktopWorkspace,
+	},
 };
+
+/// Prefix of the workspace ids this module mints.
+const WORKSPACE_PREFIX: &str = "niri-workspace:";
 
 /// Environment variable niri publishes its IPC socket path in.
 const SOCKET_ENV: &str = "NIRI_SOCKET";
 
 /// Prefix of the window ids this module mints.
-const ID_PREFIX: &str = "niri:";
+pub(super) const ID_PREFIX: &str = "niri:";
 
 /// Largest IPC reply that is buffered, in bytes.
 ///
@@ -68,6 +86,48 @@ const CAST_TIMEOUT: Duration = Duration::from_secs(5);
 /// `capture.rs` negotiates at most 16384 per edge, so nothing the compositor
 /// can legitimately render is refused here.
 const MAX_FRAME_EDGE: u32 = 16384;
+
+/// Oldest niri whose action protocol this module has been verified against.
+///
+/// The compositor answers `Handled` to an action it parsed but could not
+/// apply, so an older niri is refused outright instead of being addressed in a
+/// dialect whose shapes it does not parse.
+const MINIMUM_NIRI: (u32, u32) = (26, 4);
+
+/// Operations a probed niri really performs.
+///
+/// niri has no minimize, and no idempotent maximize, fullscreen setter or
+/// restore: it exposes explicit toggles only. Those four operations stay out
+/// of this list and `control` refuses them, because emulating them would mean
+/// guessing state the compositor never publishes.
+///
+/// `moveWindow` and `moveWindowBy` are refused for a tiled window, and
+/// `toggleMaximized` for a floating one, because niri answers those with
+/// `Handled` and no change. `resizeWindow` does reach a tiled window: niri
+/// applies it to the tile, which may resize the whole column, and the window
+/// stays in the tiling layout.
+const OPERATIONS: &[&str] = &[
+	"focusWindow",
+	"closeWindow",
+	"moveWindow",
+	"moveWindowBy",
+	"resizeWindow",
+	"toggleMaximized",
+	"toggleFullscreen",
+	"toggleWindowedFullscreen",
+	"setFloating",
+	"centerWindow",
+	"moveWindowToWorkspace",
+	"moveWindowToDisplay",
+	"focusWorkspace",
+	"focusDisplay",
+	"moveWorkspaceToDisplay",
+];
+
+/// Why control and state reads are refused outright.
+const NO_CONTROL: &str = "this Wayland session has no compatible niri IPC: either it does not run \
+                          under niri, its socket is unreachable, or it is older than the verified \
+                          protocol";
 
 /// `$NIRI_SOCKET`, absent when this session does not run under niri.
 fn socket_path() -> Option<PathBuf> {
@@ -120,28 +180,115 @@ impl Ipc {
 	/// bare JSON string (`"Windows"`), not as an object.
 	fn request<T: DeserializeOwned>(&mut self, request: &str) -> CoreResult<T> {
 		let variant = request.trim();
+		let body = self
+			.exchange(request)
+			.map_err(|fault| reply_error(variant, &fault))?;
+		decode(&body).map_err(|detail| reply_error(variant, &ReplyFault::malformed(detail)))
+	}
+
+	/// Write one newline-terminated request and read its reply bytes.
+	///
+	/// Transport faults are returned rather than raised so each caller reports
+	/// its own kind of failure: a stale listing is a capture problem, while a
+	/// silent compositor during a mutation leaves the change in doubt.
+	fn exchange(&mut self, request: &str) -> Result<Vec<u8>, ReplyFault> {
 		self
 			.stream
 			.write_all(request.as_bytes())
-			.map_err(|err| DesktopError::capture_failed(format!("niri IPC {variant} write: {err}")))?;
-		let body =
-			read_reply(&mut self.stream, REPLY_LIMIT).map_err(|err| reply_error(variant, &err))?;
-		decode(&body).map_err(|err| reply_error(variant, &err))
+			.map_err(|err| ReplyFault::transport("write", &err))?;
+		read_reply(&mut self.stream, REPLY_LIMIT)
+	}
+
+	/// The version string the running compositor reports.
+	fn version(&mut self) -> CoreResult<String> {
+		Ok(self.request::<VersionPayload>("\"Version\"\n")?.version)
+	}
+
+	/// Send one action and require the compositor's handled reply.
+	///
+	/// A fault here is reported as a change that may already have happened:
+	/// niri applies each action as it arrives, so neither a half-written
+	/// request nor a reply that never came can be retried without risking
+	/// applying the same change twice.
+	fn act(&mut self, action: &serde_json::Value) -> CoreResult<()> {
+		let request = action_line(action).map_err(|detail| {
+			uncertain(ReplyFault::malformed(format!("encoding the action: {detail}")))
+		})?;
+		let body = self.exchange(&request).map_err(uncertain)?;
+		decode::<Handled>(&body).map_err(|detail| {
+			uncertain(ReplyFault::malformed(format!("handling the action: {detail}")))
+		})?;
+		Ok(())
 	}
 }
 
-fn reply_error(variant: &str, err: &str) -> DesktopError {
-	DesktopError::capture_failed(format!("niri IPC {variant}: {err}"))
+/// The exact request line one action puts on the wire.
+///
+/// niri wraps every action in the `Action` request variant, and takes exactly
+/// one per line; the shape here is the compositor's, not a convenience of this
+/// module's.
+fn action_line(action: &serde_json::Value) -> Result<String, String> {
+	let request = serde_json::json!({ "Action": action });
+	let mut line = serde_json::to_string(&request).map_err(|err| err.to_string())?;
+	line.push('\n');
+	Ok(line)
+}
+
+fn reply_error(variant: &str, fault: &ReplyFault) -> DesktopError {
+	DesktopError::capture_failed(format!("niri IPC {variant}: {fault}"))
+}
+
+/// A mutation fault, once its request is on the wire.
+fn uncertain(fault: ReplyFault) -> DesktopError {
+	let detail = format!("niri IPC Action: {fault}; the change may already have been applied");
+	if fault.timed_out {
+		DesktopError::timeout(detail)
+	} else {
+		DesktopError::control_failed(detail)
+	}
+}
+
+/// Why one reply did not arrive whole.
+///
+/// Either fault can follow an applied action. An unusable reply never proves
+/// that the compositor left the target unchanged.
+#[derive(Debug)]
+struct ReplyFault {
+	timed_out: bool,
+	detail:    String,
+}
+
+impl ReplyFault {
+	/// A socket that answered with nothing usable in time.
+	fn transport(operation: &str, err: &io::Error) -> Self {
+		Self {
+			timed_out: matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
+			detail:    format!("{operation}: {err}"),
+		}
+	}
+
+	/// A reply or request that could not be encoded or decoded.
+	fn malformed(detail: impl Into<String>) -> Self {
+		Self { timed_out: false, detail: detail.into() }
+	}
+}
+
+impl fmt::Display for ReplyFault {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str(&self.detail)
+	}
 }
 
 /// Read one newline-terminated reply, refusing to buffer past `limit`.
-fn read_reply(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, String> {
+fn read_reply(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, ReplyFault> {
 	let mut reply = Vec::new();
 	let mut chunk = [0_u8; 8192];
 	loop {
-		let read = reader.read(&mut chunk).map_err(|err| err.to_string())?;
+		let read = reader
+			.read(&mut chunk)
+			.map_err(|err| ReplyFault::transport("read", &err))?;
 		if read == 0 {
-			return Err("closed the connection mid-reply".to_string());
+			return Err(ReplyFault::malformed("closed the connection mid-reply"));
 		}
 		let end = chunk[..read].iter().position(|byte| *byte == b'\n');
 		let length = end.unwrap_or(read);
@@ -150,7 +297,7 @@ fn read_reply(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, String> {
 			.checked_add(length)
 			.is_none_or(|size| size > limit)
 		{
-			return Err(format!("sent more than the {limit} byte reply limit"));
+			return Err(ReplyFault::malformed(format!("sent more than the {limit} byte reply limit")));
 		}
 		reply.extend_from_slice(&chunk[..length]);
 		if end.is_some() {
@@ -166,6 +313,46 @@ enum Reply<T> {
 	Err(String),
 }
 
+/// The only successful answer to an action.
+///
+/// `Response::Handled` is a unit variant, so the compositor sends the bare
+/// string `"Handled"`. A nested or null payload is a protocol this module does
+/// not speak, and reading it as success would report a mutation that never
+/// ran.
+#[derive(Debug)]
+struct Handled;
+
+impl<'de> Deserialize<'de> for Handled {
+	fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+		struct HandledVisitor;
+
+		impl serde::de::Visitor<'_> for HandledVisitor {
+			type Value = Handled;
+
+			fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+				formatter.write_str("the string \"Handled\"")
+			}
+
+			fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+				if value == "Handled" {
+					Ok(Handled)
+				} else {
+					Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+				}
+			}
+		}
+
+		deserializer.deserialize_str(HandledVisitor)
+	}
+}
+
+/// The payload of a `Version` request.
+#[derive(Debug, Deserialize)]
+struct VersionPayload {
+	#[serde(rename = "Version")]
+	version: String,
+}
+
 fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, String> {
 	let reply: Reply<T> =
 		serde_json::from_slice(body).map_err(|err| format!("sent an unreadable reply: {err}"))?;
@@ -176,6 +363,10 @@ fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, String> {
 }
 
 /// A toplevel window as niri lays it out.
+///
+/// `is_floating` is the compositor's own split between the tiling layout and
+/// floating tiles, and `is_urgent` its own attention request; neither is
+/// inferred from geometry.
 #[derive(Debug, Deserialize)]
 struct IpcWindow {
 	id:           u64,
@@ -184,6 +375,8 @@ struct IpcWindow {
 	pid:          Option<i32>,
 	workspace_id: Option<u64>,
 	is_focused:   bool,
+	is_floating:  bool,
+	is_urgent:    bool,
 	layout:       IpcLayout,
 }
 
@@ -198,12 +391,21 @@ struct IpcLayout {
 	window_offset_in_tile:      (f64, f64),
 }
 
+/// A workspace as niri lays it out.
+///
+/// `idx` is the position on its own monitor and changes when workspaces move,
+/// so it is reported as a display value only; `id` stays constant and is the
+/// only thing callers mutate.
 #[derive(Debug, Deserialize)]
 struct IpcWorkspace {
-	id:         u64,
-	output:     Option<String>,
-	is_active:  bool,
-	is_focused: bool,
+	id:               u64,
+	idx:              u8,
+	name:             Option<String>,
+	output:           Option<String>,
+	is_urgent:        bool,
+	is_active:        bool,
+	is_focused:       bool,
+	active_window_id: Option<u64>,
 }
 
 /// An output's logical placement; `logical` is absent while it is disabled.
@@ -241,7 +443,7 @@ struct OutputsPayload {
 	outputs: HashMap<String, IpcOutput>,
 }
 
-/// State needed to resolve window capture geometry.
+/// Compositor state a window control request resolves its targets against.
 struct State {
 	windows:    Vec<IpcWindow>,
 	workspaces: Vec<IpcWorkspace>,
@@ -261,7 +463,6 @@ impl State {
 		})
 	}
 
-	#[cfg(any(feature = "wayland-pipewire", test))]
 	fn window(&self, id: u64) -> CoreResult<&IpcWindow> {
 		self
 			.windows
@@ -278,6 +479,48 @@ impl State {
 
 	fn output(&self, name: Option<&str>) -> Option<&IpcLogicalOutput> {
 		self.outputs.get(name?)?.logical.as_ref()
+	}
+
+	/// A window with the state the compositor really publishes about it.
+	///
+	/// niri exposes floating and urgent but no maximized, minimized or
+	/// fullscreen bit, so those stay absent: the toggles that would imply them
+	/// have no state to read back and are not guessed from geometry.
+	fn window_state(&self, window: &IpcWindow) -> CoreResult<DesktopWindowState> {
+		let workspace = window.workspace_id.and_then(|id| self.workspace(id));
+		Ok(DesktopWindowState {
+			window:       self.descriptor(window).ok_or_else(|| {
+				DesktopError::control_failed(format!(
+					"niri window {ID_PREFIX}{} reports a size no window can have",
+					window.id
+				))
+			})?,
+			workspace_id: window.workspace_id.map(workspace_id_string),
+			display_id:   workspace.and_then(|workspace| workspace.output.clone()),
+			floating:     Some(window.is_floating),
+			urgent:       Some(window.is_urgent),
+			maximized:    None,
+			minimized:    None,
+			fullscreen:   None,
+		})
+	}
+
+	/// Every workspace, in the order the compositor lists them.
+	fn workspaces(&self) -> Vec<DesktopWorkspace> {
+		self
+			.workspaces
+			.iter()
+			.map(|workspace| DesktopWorkspace {
+				id:               workspace_id_string(workspace.id),
+				index:            u32::from(workspace.idx),
+				name:             workspace.name.clone(),
+				display_id:       workspace.output.clone(),
+				active:           workspace.is_active,
+				focused:          workspace.is_focused,
+				urgent:           workspace.is_urgent,
+				active_window_id: workspace.active_window_id.map(window_id_string),
+			})
+			.collect()
 	}
 
 	/// Every window the compositor knows, focused one included.
@@ -319,7 +562,7 @@ impl State {
 		let origin = self.origin(window);
 		let (x, y) = origin.unwrap_or((0, 0));
 		Some(DesktopWindow {
-			id: format!("{ID_PREFIX}{}", window.id),
+			id: window_id_string(window.id),
 			title: window.title.clone().unwrap_or_default(),
 			app: window.app_id.clone().unwrap_or_default(),
 			pid: window.pid.filter(|pid| *pid > 0).map(|pid| pid as u32),
@@ -404,6 +647,336 @@ pub(super) fn displays() -> CoreResult<Option<Vec<DesktopDisplay>>> {
 	Ok(Some(State::fetch()?.displays()))
 }
 
+/// The window-control surface of the live niri behind this session.
+///
+/// Nothing is advertised before a version handshake succeeds on the socket: a
+/// `$NIRI_SOCKET` left behind by a compositor that exited still names a path,
+/// and every operation below would fail against it.
+pub(super) fn control_capabilities() -> DesktopControlCapabilities {
+	if !compatible() {
+		return DesktopControlCapabilities {
+			backend:                "wayland".to_string(),
+			operations:             Vec::new(),
+			coordinate_space:       None,
+			focus_may_warp_pointer: false,
+		};
+	}
+	DesktopControlCapabilities {
+		backend:                "wayland".to_string(),
+		operations:             OPERATIONS.iter().map(|name| (*name).to_string()).collect(),
+		// niri places and measures a floating window in the working area of
+		// its output, in logical pixels.
+		coordinate_space:       Some("working-area".to_string()),
+		// Focusing warps the pointer to the newly focused window under
+		// niri's own cursor-warp policy.
+		focus_may_warp_pointer: true,
+	}
+}
+
+/// Apply one control action through the compositor.
+///
+/// Every target is resolved against fresh compositor state first: niri answers
+/// `Handled` for an id it does not know, so a request sent at a stale target
+/// would report success for a mutation that never ran. The resolve and the
+/// send are two separate exchanges, not one atomic step.
+pub(super) fn control(action: &ControlAction) -> CoreResult<()> {
+	let requests = plan(&live_state()?, action)?;
+	let mut ipc = Ipc::connect().map_err(control_failure)?;
+	for (step, request) in requests.iter().enumerate() {
+		if let Err(err) = ipc.act(request) {
+			return Err(if step == 0 {
+				err
+			} else {
+				// The compositor applies each action as it arrives, so the
+				// axis that got through is already applied and nothing here
+				// can tell which half of a resize the user is looking at.
+				DesktopError::control_failed(format!(
+					"{err}; the earlier part of this request was applied and is not retried"
+				))
+			});
+		}
+	}
+	Ok(())
+}
+
+/// Every workspace the compositor has, addressed by its stable id.
+pub(super) fn workspaces() -> CoreResult<Vec<DesktopWorkspace>> {
+	Ok(live_state()?.workspaces())
+}
+
+/// A fresh read of one window and the state the compositor publishes.
+pub(super) fn window_state(id: &str) -> CoreResult<DesktopWindowState> {
+	let state = live_state()?;
+	let window = window_id(id)?;
+	state.window_state(state.window(window)?)
+}
+
+/// Focus one window, the native activation primitive behind `raise_window`.
+///
+/// niri is the one compositor on this platform that will be told to activate
+/// a window; a generic Wayland session still cannot move focus at all.
+pub(super) fn focus(id: &str) -> CoreResult<()> {
+	control(&ControlAction::FocusWindow(id.to_string()))
+}
+
+/// Whether a compatible niri is answering this session's socket.
+pub(super) fn compatible() -> bool {
+	if socket_path().is_none() {
+		return false;
+	}
+	Ipc::connect()
+		.and_then(|mut ipc| ipc.version())
+		.is_ok_and(|version| supported_version(&version))
+}
+
+/// Fresh compositor state, refusing when no compatible niri serves it.
+///
+/// Control and state reads never fall back to a toolkit or another compositor:
+/// an answer from anything else would be about different windows than the ids
+/// the caller holds.
+fn live_state() -> CoreResult<State> {
+	if !compatible() {
+		return Err(DesktopError::control_unsupported(NO_CONTROL));
+	}
+	State::fetch().map_err(control_failure)
+}
+
+/// A compositor failure raised on a control path.
+///
+/// Timeouts keep their own code because "the compositor was slow" is a
+/// different answer from "the compositor refused".
+fn control_failure(err: DesktopError) -> DesktopError {
+	match err.code {
+		ErrorCode::Timeout => err,
+		_ => DesktopError::control_failed(err.message),
+	}
+}
+
+/// Whether a version string speaks the protocol this module implements.
+///
+/// niri reports `26.04 (commit)` for a release and `26.04.1 (commit)` for a
+/// point release. Parsing stops at the build metadata and requires two whole
+/// leading numbers, so a string this module does not recognize fails closed
+/// rather than guessing that an unknown compositor understands these actions.
+fn supported_version(raw: &str) -> bool {
+	let head = raw.split([' ', '(']).next().unwrap_or_default();
+	let mut parts = head.split('.');
+	let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+		return false;
+	};
+	let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+		return false;
+	};
+	(major, minor) >= MINIMUM_NIRI
+}
+
+/// Resolve a window target against fresh compositor state.
+fn window_target(state: &State, id: &str) -> CoreResult<u64> {
+	let window = window_id(id)?;
+	state.window(window)?;
+	Ok(window)
+}
+
+/// Resolve a floating-window movement target.
+///
+/// niri positions only floating windows; `MoveFloatingWindow` aimed at a tiled
+/// window does nothing and still answers `Handled`. The request is refused
+/// before the wire instead, and the window is not turned floating behind the
+/// caller's back to make the coordinates mean something.
+fn floating_target(state: &State, id: &str) -> CoreResult<u64> {
+	let window = window_target(state, id)?;
+	if !state.window(window)?.is_floating {
+		return Err(DesktopError::invalid_target(format!(
+			"niri window {ID_PREFIX}{window} is tiled and niri positions only floating windows; call \
+			 setFloating first"
+		)));
+	}
+	Ok(window)
+}
+
+/// Resolve a workspace target against fresh compositor state.
+fn workspace_target(state: &State, id: &str) -> CoreResult<u64> {
+	let workspace = workspace_id(id)?;
+	if state.workspace(workspace).is_none() {
+		return Err(DesktopError::invalid_target(format!(
+			"niri workspace {WORKSPACE_PREFIX}{workspace} is gone; read the workspaces again"
+		)));
+	}
+	Ok(workspace)
+}
+
+/// Resolve a display target against the fresh enabled outputs.
+///
+/// Only ids `listDisplays` returned are accepted, so a name that is connected
+/// but switched off cannot be chosen: niri would refuse the action while
+/// reporting success.
+fn display_target<'a>(state: &State, id: &'a str) -> CoreResult<&'a str> {
+	if id.is_empty() || state.output(Some(id)).is_none() {
+		return Err(DesktopError::invalid_target(format!(
+			"'{id}' is not an enabled niri output; read the displays again"
+		)));
+	}
+	Ok(id)
+}
+
+/// A coordinate the wire can carry.
+///
+/// JSON has no spelling for a non-finite number, so the encoder would fail on
+/// a value that reached it; the request is refused before that happens.
+fn coordinate(value: f64, axis: &str) -> CoreResult<f64> {
+	if value.is_finite() {
+		return Ok(value);
+	}
+	Err(DesktopError::invalid_target(format!("{axis} must be a finite number")))
+}
+
+/// An extent niri's `SetFixed` size change can carry.
+fn extent(value: u32, axis: &str) -> CoreResult<i32> {
+	i32::try_from(value).map_err(|_| {
+		DesktopError::invalid_target(format!("{axis} {value} is larger than a window can be"))
+	})
+}
+
+/// The exact compositor actions one control request sends, in order.
+///
+/// The whole plan is built against fresh state before the first byte goes out,
+/// so a refused precondition cannot leave half of a multi-axis resize applied.
+///
+/// Only a two-axis resize has more than one action, so the inline capacity is
+/// exactly that and no request pays for a heap vector.
+fn plan(state: &State, action: &ControlAction) -> CoreResult<SmallVec<[serde_json::Value; 2]>> {
+	let plan = match action {
+		ControlAction::FocusWindow(id) => {
+			smallvec![serde_json::json!({ "FocusWindow": { "id": window_target(state, id)? } })]
+		},
+		ControlAction::CloseWindow(id) => {
+			smallvec![serde_json::json!({ "CloseWindow": { "id": window_target(state, id)? } })]
+		},
+		ControlAction::MoveWindow { id, x, y } => {
+			let window = floating_target(state, id)?;
+			smallvec![serde_json::json!({
+				"MoveFloatingWindow": {
+					"id": window,
+					"x": {"SetFixed": coordinate(*x, "x")?},
+					"y": {"SetFixed": coordinate(*y, "y")?},
+				}
+			})]
+		},
+		ControlAction::MoveWindowBy { id, dx, dy } => {
+			let window = floating_target(state, id)?;
+			smallvec![serde_json::json!({
+				"MoveFloatingWindow": {
+					"id": window,
+					"x": {"AdjustFixed": coordinate(*dx, "dx")?},
+					"y": {"AdjustFixed": coordinate(*dy, "dy")?},
+				}
+			})]
+		},
+		ControlAction::ResizeWindow { id, width, height } => {
+			// niri has no combined resize action, so a two-axis resize is two
+			// independent requests. Each axis reaches the compositor exactly
+			// as given; a tiled window keeps its tiling and its column may
+			// resize with it.
+			let window = window_target(state, id)?;
+			let mut axes = SmallVec::new();
+			if let Some(width) = width {
+				axes.push(serde_json::json!({
+					"SetWindowWidth": {"id": window, "change": {"SetFixed": extent(*width, "width")?}}
+				}));
+			}
+			if let Some(height) = height {
+				axes.push(serde_json::json!({
+					"SetWindowHeight": {"id": window, "change": {"SetFixed": extent(*height, "height")?}}
+				}));
+			}
+			axes
+		},
+		ControlAction::ToggleMaximized(id) => {
+			let window = window_target(state, id)?;
+			// MaximizeWindowToEdges only has meaning for a tile; aimed at a
+			// floating window it is a no-op the compositor still reports as
+			// handled.
+			if state.window(window)?.is_floating {
+				return Err(DesktopError::invalid_target(format!(
+					"niri window {ID_PREFIX}{window} is floating; maximized-to-edges applies to tiled \
+					 windows only"
+				)));
+			}
+			smallvec![serde_json::json!({ "MaximizeWindowToEdges": { "id": window } })]
+		},
+		ControlAction::ToggleFullscreen(id) => {
+			smallvec![serde_json::json!({ "FullscreenWindow": { "id": window_target(state, id)? } })]
+		},
+		ControlAction::ToggleWindowedFullscreen(id) => {
+			smallvec![serde_json::json!({
+				"ToggleWindowedFullscreen": {"id": window_target(state, id)?}
+			})]
+		},
+		ControlAction::SetFloating { id, enabled } => {
+			let window = window_target(state, id)?;
+			// A real setter, not a toggle: the end state is what was asked
+			// for, whether or not the window was already floating.
+			if *enabled {
+				smallvec![serde_json::json!({ "MoveWindowToFloating": { "id": window } })]
+			} else {
+				smallvec![serde_json::json!({ "MoveWindowToTiling": { "id": window } })]
+			}
+		},
+		ControlAction::CenterWindow(id) => {
+			smallvec![serde_json::json!({ "CenterWindow": { "id": window_target(state, id)? } })]
+		},
+		ControlAction::MoveWindowToWorkspace { id, workspace, focus } => {
+			smallvec![serde_json::json!({
+				"MoveWindowToWorkspace": {
+					"window_id": window_target(state, id)?,
+					"reference": {"Id": workspace_target(state, workspace)?},
+					"focus": focus,
+				}
+			})]
+		},
+		ControlAction::MoveWindowToDisplay { id, display } => {
+			smallvec![serde_json::json!({
+				"MoveWindowToMonitor": {
+					"id": window_target(state, id)?,
+					"output": display_target(state, display)?,
+				}
+			})]
+		},
+		ControlAction::FocusWorkspace(workspace) => {
+			smallvec![serde_json::json!({
+				"FocusWorkspace": {"reference": {"Id": workspace_target(state, workspace)?}}
+			})]
+		},
+		ControlAction::FocusDisplay(display) => {
+			smallvec![
+				serde_json::json!({ "FocusMonitor": {"output": display_target(state, display)?} })
+			]
+		},
+		ControlAction::MoveWorkspaceToDisplay { workspace, display } => {
+			smallvec![serde_json::json!({
+				"MoveWorkspaceToMonitor": {
+					"output": display_target(state, display)?,
+					"reference": {"Id": workspace_target(state, workspace)?},
+				}
+			})]
+		},
+		ControlAction::MaximizeWindow(_)
+		| ControlAction::MinimizeWindow(_)
+		| ControlAction::RestoreWindow(_)
+		| ControlAction::SetFullscreen { .. } => {
+			return Err(DesktopError::control_unsupported(
+				"niri has no minimize, no idempotent maximize, fullscreen setter or restore; it \
+				 exposes the explicit toggleMaximized, toggleFullscreen and toggleWindowedFullscreen \
+				 actions instead",
+			));
+		},
+	};
+	if plan.is_empty() {
+		return Err(DesktopError::invalid_target("resizeWindow needs a width, a height or both"));
+	}
+	Ok(plan)
+}
+
 /// Capture one window through niri's own screen cast service.
 ///
 /// The compositor renders the window itself, so the frame is that window's
@@ -431,16 +1004,29 @@ pub(super) fn capture_window(id: &str) -> CoreResult<(RgbaImage, DesktopWindow)>
 	Ok((image, current))
 }
 
-/// Decode a `niri:<id>` target.
+/// The `niri:<id>` handle of a compositor window id.
+fn window_id_string(id: u64) -> String {
+	format!("{ID_PREFIX}{id}")
+}
+
+/// The `niri-workspace:<id>` handle of a compositor workspace id.
 ///
-/// The id is the compositor's own window id, so anything else — an AT-SPI
-/// object path, a bare number, a truncated prefix — is refused instead of being
-/// coerced into a window that may not exist.
-#[cfg(any(feature = "wayland-pipewire", test))]
-fn window_id(id: &str) -> CoreResult<u64> {
-	let raw = id.strip_prefix(ID_PREFIX).ok_or_else(|| {
+/// Workspace ids stay constant while a workspace moves between monitors and
+/// reorders, which is why callers address workspaces by this handle and never
+/// by the index niri also publishes.
+fn workspace_id_string(id: u64) -> String {
+	format!("{WORKSPACE_PREFIX}{id}")
+}
+
+/// Decode an opaque id this module minted.
+///
+/// The digits after the prefix are the compositor's own id, so a bare number, a
+/// padded one, or another backend's handle is refused instead of being coerced
+/// into an id that may name something else.
+fn decode_id(id: &str, prefix: &str, kind: &str) -> CoreResult<u64> {
+	let raw = id.strip_prefix(prefix).ok_or_else(|| {
 		DesktopError::invalid_target(format!(
-			"'{id}' is not a niri window target; niri windows are addressed as {ID_PREFIX}<id>"
+			"'{id}' is not a niri {kind} target; niri {kind}s are addressed as {prefix}<id>"
 		))
 	})?;
 	if raw.is_empty()
@@ -448,12 +1034,22 @@ fn window_id(id: &str) -> CoreResult<u64> {
 		|| !raw.bytes().all(|byte| byte.is_ascii_digit())
 	{
 		return Err(DesktopError::invalid_target(format!(
-			"'{id}' does not name a niri window; expected {ID_PREFIX} followed by the compositor's \
-			 window id"
+			"'{id}' does not name a niri {kind}; expected {prefix} followed by the compositor's \
+			 {kind} id"
 		)));
 	}
 	raw.parse::<u64>()
-		.map_err(|_| DesktopError::invalid_target(format!("niri window id '{raw}' is out of range")))
+		.map_err(|_| DesktopError::invalid_target(format!("niri {kind} id '{raw}' is out of range")))
+}
+
+/// Decode a `niri:<id>` target.
+fn window_id(id: &str) -> CoreResult<u64> {
+	decode_id(id, ID_PREFIX, "window")
+}
+
+/// Decode a `niri-workspace:<id>` target.
+fn workspace_id(id: &str) -> CoreResult<u64> {
+	decode_id(id, WORKSPACE_PREFIX, "workspace")
 }
 
 /// Reject a reply that names the same window twice.
@@ -810,6 +1406,13 @@ fn stop(runtime: &Runtime, session: &SessionProxy<'_>) {
 
 #[cfg(test)]
 mod tests {
+	use std::{
+		io::{BufRead as _, BufReader},
+		os::unix::net::UnixListener,
+		panic::{AssertUnwindSafe, catch_unwind},
+		thread,
+	};
+
 	use super::*;
 
 	/// eDP-1 is enabled at 1920,0; HDMI-A-1 is connected but disabled, which is
@@ -1137,6 +1740,563 @@ mod tests {
 				},
 				None => Ok(0),
 			}
+		}
+	}
+
+	/// Window 47 is tiled and window 69 floats, both on enabled workspaces of
+	/// the single enabled output.
+	fn control_state() -> State {
+		state(&[TILED, FLOATING])
+	}
+
+	/// The exact wire line one control request sends.
+	fn request_line(action: &ControlAction) -> String {
+		let plan = plan(&control_state(), action).expect("the action resolves");
+		assert_eq!(plan.len(), 1, "this action is one compositor request");
+		action_line(&plan[0]).expect("the action encodes")
+	}
+
+	/// Every targeted action carries the compositor's own id, and the
+	/// compositor is told nothing about which window is focused first.
+	#[test]
+	fn targeted_actions_name_their_window_explicitly() {
+		assert_eq!(
+			request_line(&ControlAction::FocusWindow("niri:69".to_string())),
+			"{\"Action\":{\"FocusWindow\":{\"id\":69}}}\n"
+		);
+		assert_eq!(
+			request_line(&ControlAction::CloseWindow("niri:47".to_string())),
+			"{\"Action\":{\"CloseWindow\":{\"id\":47}}}\n"
+		);
+		assert_eq!(
+			request_line(&ControlAction::CenterWindow("niri:69".to_string())),
+			"{\"Action\":{\"CenterWindow\":{\"id\":69}}}\n"
+		);
+		assert_eq!(
+			request_line(&ControlAction::ToggleFullscreen("niri:47".to_string())),
+			"{\"Action\":{\"FullscreenWindow\":{\"id\":47}}}\n"
+		);
+		assert_eq!(
+			request_line(&ControlAction::ToggleWindowedFullscreen("niri:47".to_string())),
+			"{\"Action\":{\"ToggleWindowedFullscreen\":{\"id\":47}}}\n"
+		);
+	}
+
+	/// A window that no longer exists is answered with `Handled` and no
+	/// mutation, so it has to be refused while resolving, and the same goes
+	/// for a workspace or output the fresh state does not contain.
+	#[test]
+	fn dead_targets_are_refused_before_any_request_is_built() {
+		let state = control_state();
+		let err = plan(&state, &ControlAction::FocusWindow("niri:999".to_string()))
+			.expect_err("a closed window cannot be focused");
+		assert_eq!(err.code.as_str(), "WindowNotFound");
+		let err = plan(&state, &ControlAction::FocusWorkspace("niri-workspace:9".to_string()))
+			.expect_err("a removed workspace cannot be focused");
+		assert_eq!(err.code.as_str(), "InvalidTarget");
+		let err = plan(&state, &ControlAction::FocusDisplay("HDMI-A-1".to_string()))
+			.expect_err("a disabled output is not a display");
+		assert_eq!(err.code.as_str(), "InvalidTarget");
+		// A handle this module never minted is not a niri target at all.
+		let err = plan(&state, &ControlAction::FocusWindow("47".to_string()))
+			.expect_err("a bare number names no niri window");
+		assert_eq!(err.code.as_str(), "InvalidTarget");
+	}
+
+	/// A workspace target is the compositor's own id behind this module's
+	/// handle, never the index niri also publishes for it.
+	#[test]
+	fn workspace_moves_carry_the_workspace_id_not_its_index() {
+		assert_eq!(
+			request_line(&ControlAction::FocusWorkspace("niri-workspace:3".to_string())),
+			"{\"Action\":{\"FocusWorkspace\":{\"reference\":{\"Id\":3}}}}\n"
+		);
+		assert_eq!(
+			request_line(&ControlAction::MoveWindowToWorkspace {
+				id:        "niri:69".to_string(),
+				workspace: "niri-workspace:3".to_string(),
+				focus:     false,
+			}),
+			"{\"Action\":{\"MoveWindowToWorkspace\":{\"window_id\":69,\"reference\":{\"Id\":3},\"\
+			 focus\":false}}}\n"
+		);
+		assert_eq!(
+			request_line(&ControlAction::MoveWorkspaceToDisplay {
+				workspace: "niri-workspace:3".to_string(),
+				display:   "eDP-1".to_string(),
+			}),
+			"{\"Action\":{\"MoveWorkspaceToMonitor\":{\"output\":\"eDP-1\",\"reference\":{\"Id\":\
+			 3}}}}\n"
+		);
+	}
+
+	/// Display moves address an output by name and take no focus option: niri
+	/// has no way to move focus along with a window.
+	#[test]
+	fn display_targets_name_the_output_the_compositor_published() {
+		assert_eq!(
+			request_line(&ControlAction::FocusDisplay("eDP-1".to_string())),
+			"{\"Action\":{\"FocusMonitor\":{\"output\":\"eDP-1\"}}}\n"
+		);
+		assert_eq!(
+			request_line(&ControlAction::MoveWindowToDisplay {
+				id:      "niri:69".to_string(),
+				display: "eDP-1".to_string(),
+			}),
+			"{\"Action\":{\"MoveWindowToMonitor\":{\"id\":69,\"output\":\"eDP-1\"}}}\n"
+		);
+	}
+
+	/// Absolute placement is a working-area position and relative placement is
+	/// a logical delta; niri spells them with different position changes.
+	#[test]
+	fn floating_movement_uses_position_changes() {
+		assert_eq!(
+			request_line(&ControlAction::MoveWindow {
+				id: "niri:69".to_string(),
+				x:  120.5,
+				y:  -8.0,
+			}),
+			"{\"Action\":{\"MoveFloatingWindow\":{\"id\":69,\"x\":{\"SetFixed\":120.5},\"y\":{\"\
+			 SetFixed\":-8.0}}}}\n"
+		);
+		assert_eq!(
+			request_line(&ControlAction::MoveWindowBy {
+				id: "niri:69".to_string(),
+				dx: 0.0,
+				dy: 40.0,
+			}),
+			"{\"Action\":{\"MoveFloatingWindow\":{\"id\":69,\"x\":{\"AdjustFixed\":0.0},\"y\":{\"\
+			 AdjustFixed\":40.0}}}}\n"
+		);
+	}
+
+	/// niri positions only floating windows. Aiming a move at a tiled window
+	/// would be answered with `Handled` and no movement, so it is refused —
+	/// and the window is not turned floating to make the coordinates mean
+	/// something.
+	#[test]
+	fn tiled_windows_cannot_be_positioned() {
+		let state = control_state();
+		for action in [
+			ControlAction::MoveWindow { id: "niri:47".to_string(), x: 10.0, y: 10.0 },
+			ControlAction::MoveWindowBy { id: "niri:47".to_string(), dx: 10.0, dy: 0.0 },
+		] {
+			let err = plan(&state, &action).expect_err("a tile has no position to set");
+			assert_eq!(err.code.as_str(), "InvalidTarget");
+		}
+	}
+
+	/// A coordinate JSON cannot spell must not reach the encoder, which would
+	/// fail on a value that is already on its way to the compositor.
+	#[test]
+	fn non_finite_coordinates_are_refused() {
+		let state = control_state();
+		for (x, y) in [(f64::NAN, 0.0), (0.0, f64::NEG_INFINITY)] {
+			let err = plan(&state, &ControlAction::MoveWindow { id: "niri:69".to_string(), x, y })
+				.expect_err("a non-finite coordinate cannot be encoded");
+			assert_eq!(err.code.as_str(), "InvalidTarget");
+		}
+	}
+
+	/// `MaximizeWindowToEdges` only has meaning for a tile; on a floating
+	/// window it changes nothing while still being reported as handled.
+	#[test]
+	fn maximizing_a_floating_window_is_refused() {
+		let state = control_state();
+		let err = plan(&state, &ControlAction::ToggleMaximized("niri:69".to_string()))
+			.expect_err("a floating window has no edges to grow into");
+		assert_eq!(err.code.as_str(), "InvalidTarget");
+		assert_eq!(
+			request_line(&ControlAction::ToggleMaximized("niri:47".to_string())),
+			"{\"Action\":{\"MaximizeWindowToEdges\":{\"id\":47}}}\n"
+		);
+	}
+
+	/// niri has no minimize and no idempotent setter for maximized,
+	/// fullscreen or a restored state. Emulating one would mean reading state
+	/// the compositor never publishes, so the four operations are refused.
+	#[test]
+	fn operations_niri_cannot_perform_are_refused() {
+		let state = control_state();
+		for action in [
+			ControlAction::MaximizeWindow("niri:47".to_string()),
+			ControlAction::MinimizeWindow("niri:47".to_string()),
+			ControlAction::RestoreWindow("niri:47".to_string()),
+			ControlAction::SetFullscreen { id: "niri:47".to_string(), enabled: true },
+		] {
+			let err = plan(&state, &action).expect_err("niri has no such primitive");
+			assert_eq!(err.code.as_str(), "ControlUnsupported");
+		}
+		// An advertised operation is a promise, so none of these may appear
+		// in the surface handed to callers.
+		for absent in ["maximizeWindow", "minimizeWindow", "restoreWindow", "setFullscreen"] {
+			assert!(!OPERATIONS.contains(&absent), "{absent} is advertised but refused");
+		}
+	}
+
+	/// A floating setter is not a toggle: the end state is what was asked for
+	/// whether or not the window was already floating.
+	#[test]
+	fn floating_setters_name_the_end_state() {
+		assert_eq!(
+			request_line(&ControlAction::SetFloating {
+				id:      "niri:47".to_string(),
+				enabled: true,
+			}),
+			"{\"Action\":{\"MoveWindowToFloating\":{\"id\":47}}}\n"
+		);
+		assert_eq!(
+			request_line(&ControlAction::SetFloating {
+				id:      "niri:69".to_string(),
+				enabled: false,
+			}),
+			"{\"Action\":{\"MoveWindowToTiling\":{\"id\":69}}}\n"
+		);
+	}
+
+	/// A resize is one compositor request per axis, in a fixed order, so the
+	/// caller can tell which half landed when the second one fails.
+	#[test]
+	fn resize_is_one_request_per_axis() {
+		let state = control_state();
+		let both = plan(&state, &ControlAction::ResizeWindow {
+			id:     "niri:69".to_string(),
+			width:  Some(800),
+			height: Some(600),
+		})
+		.expect("resize plan");
+		assert_eq!(
+			both
+				.iter()
+				.map(|action| action_line(action).expect("encode"))
+				.collect::<Vec<_>>(),
+			[
+				"{\"Action\":{\"SetWindowWidth\":{\"id\":69,\"change\":{\"SetFixed\":800}}}}\n",
+				"{\"Action\":{\"SetWindowHeight\":{\"id\":69,\"change\":{\"SetFixed\":600}}}}\n",
+			]
+		);
+		// One axis alone is one request; the untouched axis is not guessed.
+		let width_only = plan(&state, &ControlAction::ResizeWindow {
+			id:     "niri:69".to_string(),
+			width:  Some(800),
+			height: None,
+		})
+		.expect("width-only resize plan");
+		assert_eq!(width_only.len(), 1);
+		// Neither axis names no change at all, which must not report success.
+		let err = plan(&state, &ControlAction::ResizeWindow {
+			id:     "niri:69".to_string(),
+			width:  None,
+			height: None,
+		})
+		.expect_err("an empty resize changes nothing");
+		assert_eq!(err.code.as_str(), "InvalidTarget");
+	}
+
+	/// `Response::Handled` is a unit variant, so success is the bare string.
+	/// A nested or null payload means the protocol changed, and reading it as
+	/// success would report a mutation that never ran.
+	#[test]
+	fn only_the_handled_string_is_success() {
+		assert!(decode::<Handled>(br#"{"Ok":"Handled"}"#).is_ok());
+		for wrong in [
+			&br#"{"Ok":{"Handled":null}}"#[..],
+			&br#"{"Ok":null}"#[..],
+			&br#"{"Ok":"Handled "}"#[..],
+			&br#"{"Ok":"Ignored"}"#[..],
+			&br#"{"Err":"unknown action"}"#[..],
+		] {
+			assert!(decode::<Handled>(wrong).is_err(), "{:?}", String::from_utf8_lossy(wrong));
+		}
+	}
+
+	/// Only a version this module has been verified against may be talked to.
+	/// An older or unrecognized build answers `Handled` to actions it did not
+	/// apply, so it is refused instead of being advertised as controllable.
+	#[test]
+	fn only_a_version_this_module_speaks_passes_the_probe() {
+		assert!(supported_version("26.04 (1f03391)"));
+		assert!(supported_version("26.04.2 (abc1234)"));
+		assert!(supported_version("26.4"));
+		assert!(supported_version("27.01 (deadbee)"));
+		for unverified in ["26.03 (1f03391)", "25.11 (1f03391)", "26.04-rc1", "", "unknown", "26"] {
+			assert!(!supported_version(unverified), "{unverified}");
+		}
+	}
+
+	/// Workspaces are addressed by the id that survives moving between
+	/// monitors, and their index is reported as the position it currently
+	/// holds rather than as a target.
+	#[test]
+	fn workspaces_report_stable_ids_and_own_flags() {
+		let workspaces = control_state().workspaces();
+		assert_eq!(workspaces.len(), 3);
+		assert_eq!(workspaces[2].id, "niri-workspace:3");
+		assert_eq!(workspaces[2].index, 2, "the index is its current position");
+		assert_eq!(workspaces[2].display_id.as_deref(), Some("eDP-1"));
+		assert!(!workspaces[2].active, "a workspace that is not on screen");
+		assert_eq!(workspaces[2].active_window_id, None);
+		assert!(workspaces[1].focused, "one workspace holds focus");
+		assert_eq!(workspaces[1].active_window_id.as_deref(), Some("niri:69"));
+		assert_eq!(workspaces[0].id, "niri-workspace:1");
+		assert_eq!(workspaces[0].index, 1, "two monitors can share an index");
+	}
+
+	/// A window's state carries what niri publishes and nothing more: it has
+	/// no maximized, minimized or fullscreen bit to report, so those stay
+	/// absent instead of being read off geometry.
+	#[test]
+	fn window_state_publishes_only_what_niri_knows() {
+		let state = control_state();
+		let floating = state
+			.window_state(state.window(69).expect("window 69"))
+			.expect("floating window state");
+		assert_eq!(floating.floating, Some(true));
+		assert_eq!(floating.urgent, Some(false));
+		assert_eq!(floating.workspace_id.as_deref(), Some("niri-workspace:2"));
+		assert_eq!(floating.display_id.as_deref(), Some("eDP-1"));
+		assert_eq!(floating.maximized, None);
+		assert_eq!(floating.minimized, None);
+		assert_eq!(floating.fullscreen, None);
+		let tiled = state
+			.window_state(state.window(47).expect("window 47"))
+			.expect("tiled window state");
+		assert_eq!(tiled.floating, Some(false));
+		assert_eq!(tiled.workspace_id.as_deref(), Some("niri-workspace:1"));
+	}
+
+	/// One answer to a compositor.
+	enum Scripted {
+		/// Written back after the newline.
+		Answer(String),
+		/// The request was taken and never answered.
+		Silent,
+	}
+
+	/// A compositor socket that answers one scripted reply per request line and
+	/// records everything it was sent.
+	struct FakeNiri {
+		path:     std::path::PathBuf,
+		requests: std::sync::mpsc::Receiver<String>,
+		previous: Option<std::ffi::OsString>,
+		_worker:  thread::JoinHandle<()>,
+	}
+
+	impl FakeNiri {
+		fn start(replies: Vec<Scripted>) -> Self {
+			static SOCKETS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+			let path = std::env::temp_dir().join(format!(
+				"omp-niri-test-{}-{}",
+				std::process::id(),
+				SOCKETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+			));
+			let _ = std::fs::remove_file(&path);
+			let listener = UnixListener::bind(&path).expect("bind fake niri socket");
+			let (seen, requests) = std::sync::mpsc::channel();
+			let mut script = replies
+				.into_iter()
+				.collect::<std::collections::VecDeque<_>>();
+			let worker = thread::spawn(move || {
+				for stream in listener.incoming() {
+					let mut stream = stream.expect("accept fake niri connection");
+					let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+					let mut line = String::new();
+					while reader.read_line(&mut line).unwrap_or(0) > 0 {
+						let _ = seen.send(std::mem::take(&mut line));
+						match script.pop_front() {
+							Some(Scripted::Answer(body)) => {
+								let json: serde_json::Value =
+									serde_json::from_str(&body).expect("valid fake compositor reply");
+								let _ = serde_json::to_writer(&mut stream, &json);
+								let _ = stream.write_all(b"\n");
+								let _ = stream.flush();
+							},
+							Some(Scripted::Silent) | None => {},
+						}
+					}
+				}
+			});
+			let previous = std::env::var_os(SOCKET_ENV);
+			unsafe { std::env::set_var(SOCKET_ENV, &path) };
+			Self { path, requests, previous, _worker: worker }
+		}
+
+		/// Every request line the compositor was sent so far.
+		fn sent(&self) -> Vec<String> {
+			self.requests.try_iter().collect()
+		}
+	}
+
+	impl Drop for FakeNiri {
+		fn drop(&mut self) {
+			match self.previous.take() {
+				Some(previous) => unsafe { std::env::set_var(SOCKET_ENV, previous) },
+				None => unsafe { std::env::remove_var(SOCKET_ENV) },
+			}
+			let _ = std::fs::remove_file(&self.path);
+		}
+	}
+
+	/// The one answer to a version probe.
+	fn version() -> Scripted {
+		Scripted::Answer(r#"{"Ok":{"Version":"26.04 (1f03391)"}}"#.to_string())
+	}
+
+	fn handles() -> Scripted {
+		Scripted::Answer(r#"{"Ok":"Handled"}"#.to_string())
+	}
+
+	/// The two windows the fake compositor lists, as one reply body.
+	fn windows_reply() -> String {
+		format!(r#"{{"Ok":{{"Windows":[{TILED},{FLOATING}]}}}}"#)
+	}
+
+	/// The state a control call reads before it resolves its targets.
+	fn state_replies() -> Vec<Scripted> {
+		vec![
+			Scripted::Answer(windows_reply()),
+			Scripted::Answer(WORKSPACES.to_string()),
+			Scripted::Answer(OUTPUTS.to_string()),
+		]
+	}
+
+	/// The whole handshake a control call performs: one version probe, then
+	/// the state its targets resolve against, then one answer per action.
+	fn control_script(actions: Vec<Scripted>) -> Vec<Scripted> {
+		let mut script = vec![version()];
+		script.extend(state_replies());
+		script.extend(actions);
+		script
+	}
+
+	/// The same handshake, with the caller's own probe ahead of it.
+	fn probed_control_script(actions: Vec<Scripted>) -> Vec<Scripted> {
+		let mut script = vec![version()];
+		script.extend(control_script(actions));
+		script
+	}
+
+	/// A control call reaches the compositor as the exact request line, behind
+	/// the probe that decides whether this compositor may be spoken to at all.
+	#[test]
+	fn a_focus_reaches_the_compositor_as_one_action_request() {
+		let _guard = super::super::tests::ENV_LOCK
+			.lock()
+			.expect("lock the compositor environment");
+		// The test's own probe consumes a handshake of its own, ahead of the
+		// one `control` performs before it resolves any target.
+		let compositor = FakeNiri::start(probed_control_script(vec![handles()]));
+		assert!(compatible(), "the probe accepts a 26.04 compositor");
+		control(&ControlAction::FocusWindow("niri:69".to_string())).expect("focus is handled");
+		let sent = compositor.sent();
+		assert_eq!(sent.len(), 6, "two probes, three state reads, one action");
+		assert_eq!(sent[0], "\"Version\"\n");
+		assert_eq!(sent[2], "\"Windows\"\n");
+		assert_eq!(
+			sent.last().map(String::as_str),
+			Some("{\"Action\":{\"FocusWindow\":{\"id\":69}}}\n")
+		);
+	}
+
+	/// A compositor that takes an action and never answers leaves the change
+	/// in doubt: it may already have applied it, so the failure says so and
+	/// keeps its own timeout code instead of inviting a retry.
+	#[test]
+	fn a_silent_compositor_leaves_the_change_in_doubt() {
+		let _guard = super::super::tests::ENV_LOCK
+			.lock()
+			.expect("lock the compositor environment");
+		let compositor = FakeNiri::start(control_script(vec![Scripted::Silent]));
+		let err = control(&ControlAction::FocusWindow("niri:69".to_string()))
+			.expect_err("a silent compositor does not confirm the action");
+		assert_eq!(err.code.as_str(), "Timeout");
+		assert!(err.message.contains("may already have been applied"), "{}", err.message);
+		assert_eq!(compositor.sent().len(), 5, "one request per exchange, none retried");
+	}
+
+	/// A reply this module does not recognize is a protocol change, not a
+	/// handled action.
+	#[test]
+	fn an_unrecognized_handled_reply_is_refused() {
+		let _guard = super::super::tests::ENV_LOCK
+			.lock()
+			.expect("lock the compositor environment");
+		let _compositor = FakeNiri::start(control_script(vec![Scripted::Answer(
+			r#"{"Ok":{"Handled":null}}"#.to_string(),
+		)]));
+		let err = control(&ControlAction::FocusWindow("niri:69".to_string()))
+			.expect_err("a nested payload is not this protocol's handled reply");
+		assert_eq!(err.code.as_str(), "ControlFailed");
+	}
+
+	/// A resize that gets its width through and loses its height leaves the
+	/// window half resized, and the failure has to say which half that was.
+	#[test]
+	fn a_second_resize_axis_failing_reports_the_partial_change() {
+		let _guard = super::super::tests::ENV_LOCK
+			.lock()
+			.expect("lock the compositor environment");
+		let compositor = FakeNiri::start(control_script(vec![handles(), Scripted::Silent]));
+		let err = control(&ControlAction::ResizeWindow {
+			id:     "niri:69".to_string(),
+			width:  Some(800),
+			height: Some(600),
+		})
+		.expect_err("the height request never comes back");
+		assert_eq!(err.code.as_str(), "ControlFailed");
+		assert!(err.message.contains("earlier part"), "{}", err.message);
+		let sent = compositor.sent();
+		assert_eq!(sent.len(), 6, "the width request was applied before the height failed");
+		assert!(sent[4].contains("SetWindowWidth"), "{}", sent[4]);
+	}
+
+	/// A `$NIRI_SOCKET` that no compositor answers must not advertise a
+	/// control surface, and every control read has to refuse instead of
+	/// falling back to something that is not this compositor.
+	#[test]
+	fn a_dead_socket_advertises_nothing_and_refuses_every_control_read() {
+		let _guard = super::super::tests::ENV_LOCK
+			.lock()
+			.expect("lock the compositor environment");
+		let previous = std::env::var_os(SOCKET_ENV);
+		unsafe {
+			std::env::set_var(SOCKET_ENV, "/nonexistent-omp-test-niri.sock");
+		}
+		let outcome = catch_unwind(AssertUnwindSafe(|| {
+			assert!(!compatible(), "an unreachable socket cannot advertise control");
+			let capabilities = control_capabilities();
+			assert!(capabilities.operations.is_empty());
+			assert_eq!(capabilities.coordinate_space, None);
+			assert!(!capabilities.focus_may_warp_pointer);
+			assert_eq!(
+				control(&ControlAction::FocusWindow("niri:1".to_string()))
+					.expect_err("focus needs a live compositor")
+					.code
+					.as_str(),
+				"ControlUnsupported"
+			);
+			assert_eq!(
+				workspaces()
+					.expect_err("workspaces need a live compositor")
+					.code
+					.as_str(),
+				"ControlUnsupported"
+			);
+			assert_eq!(
+				window_state("niri:1")
+					.expect_err("state needs a live compositor")
+					.code
+					.as_str(),
+				"ControlUnsupported"
+			);
+		}));
+		match previous {
+			Some(previous) => unsafe { std::env::set_var(SOCKET_ENV, previous) },
+			None => unsafe { std::env::remove_var(SOCKET_ENV) },
+		}
+		if let Err(payload) = outcome {
+			std::panic::resume_unwind(payload);
 		}
 	}
 }

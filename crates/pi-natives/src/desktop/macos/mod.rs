@@ -68,6 +68,8 @@ impl Backend for MacosBackend {
 			input_permission: permission_label(input_permission),
 			ax_permission: permission_label(input_permission),
 			display_count,
+			// Control capabilities are filled in by the core worker.
+			window_control: None,
 		}
 	}
 

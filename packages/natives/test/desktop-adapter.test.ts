@@ -157,4 +157,29 @@ describe("legacy DesktopSession adapter", () => {
 		await session.click("desktop", 1, 1);
 		await session.click("desktop", 1, 1);
 	});
+
+	it("refuses control, workspace and state calls with a coded error", async () => {
+		const DesktopSession = adaptDesktopSession(LegacyDesktopSession);
+		const session = new DesktopSession({ display: "all" });
+
+		// A resolved promise or a raw TypeError here would let callers believe a
+		// window was closed, moved or inspected, so every refusal carries the
+		// control code and never reaches the addon.
+		await expect(session.control({ operation: "closeWindow", windowId: "42" })).rejects.toThrow(
+			/^ControlUnsupported: /,
+		);
+		await expect(session.listWorkspaces()).rejects.toThrow(/^ControlUnsupported: /);
+		await expect(session.windowState("42")).rejects.toThrow(/^ControlUnsupported: /);
+		expect(LegacyDesktopSession.instances.at(-1)?.actions).toEqual([]);
+	});
+
+	it("reports a closed session ahead of the unsupported control refusal", async () => {
+		const DesktopSession = adaptDesktopSession(LegacyDesktopSession);
+		const session = new DesktopSession({ display: "all" });
+		await session.close();
+
+		// Run scope ends on `Closed`; a retained handle must not be told the
+		// control surface is merely unavailable.
+		await expect(session.control({ operation: "focusWindow", windowId: "42" })).rejects.toThrow(/^Closed: /);
+	});
 });

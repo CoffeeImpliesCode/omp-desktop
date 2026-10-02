@@ -7,10 +7,13 @@ import type {
 	AxQuery,
 	AxSnapshotOptions,
 	DesktopCapabilities,
+	DesktopControlAction,
 	DesktopDisplay,
 	DesktopPoint,
 	DesktopSessionOptions,
 	DesktopWindow,
+	DesktopWindowState,
+	DesktopWorkspace,
 	PointerOptions,
 } from "@oh-my-pi/pi-natives";
 import * as postmortem from "@oh-my-pi/pi-utils/postmortem";
@@ -57,7 +60,9 @@ export interface NativeDesktopSession {
 	scroll(target: string, x: number, y: number, dx: number, dy: number, opts?: PointerOptions | null): Promise<void>;
 	typeText(target: string, text: string, opts?: PointerOptions | null): Promise<void>;
 	keyChord(target: string, keys: string[], opts?: PointerOptions | null): Promise<void>;
-	raiseWindow(windowId: string): Promise<void>;
+	control(action: DesktopControlAction): Promise<void>;
+	listWorkspaces(): Promise<DesktopWorkspace[]>;
+	windowState(windowId: string): Promise<DesktopWindowState>;
 	axSnapshot(target: string, opts?: AxSnapshotOptions | null): Promise<{ text: string }>;
 	axQuery(target: string, query: AxQuery): Promise<AxNode[]>;
 	axElementAt(target: string, x: number, y: number): Promise<AxNode | null | undefined>;
@@ -85,6 +90,14 @@ type ClickOptions = InputOptions & { button?: string; count?: number; modifiers?
 type DragOptions = InputOptions & { modifiers?: string[] };
 type ScrollOptions = InputOptions & { dx?: number; dy?: number };
 type AxOptions = Pick<AxSnapshotOptions, "all" | "maxDepth">;
+
+type MoveOptions = { x: number; y: number };
+type MoveByOptions = { dx: number; dy: number };
+type ResizeOptions = { width?: number; height?: number };
+type EnabledOptions = { enabled: boolean };
+type WorkspaceOptions = { workspaceId: string; focus?: boolean };
+type DisplayOptions = { displayId: string };
+type WorkspaceDisplayOptions = { workspaceId: string; displayId: string };
 
 type PendingTool = { resolve(value: unknown): void; reject(reason?: unknown): void };
 interface ActiveRun {
@@ -179,6 +192,78 @@ function matchesFilter(window: DesktopWindow, filter?: WindowFilter): boolean {
 function guardRun(context: ComputerRunContext, method: string): void {
 	if (context.readOnly) throw new ToolError(`read-only run: '${method}' requires read_only: false`);
 	throwIfAborted(context.signal);
+}
+
+function readCapabilities(session: NativeDesktopSession): DesktopCapabilities {
+	try {
+		return session.capabilities;
+	} catch (error) {
+		throw nativeError(error);
+	}
+}
+
+function controlNumber(method: string, label: string, value: number | undefined): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) throw new ToolError(`${method} requires ${label}`);
+	return value;
+}
+
+function controlSize(method: string, label: string, value: number | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isInteger(value) || value <= 0)
+		throw new ToolError(`${method} requires ${label} to be a positive whole number`);
+	return value;
+}
+
+function controlId(method: string, label: string, value: string | undefined): string {
+	if (typeof value !== "string" || value === "") throw new ToolError(`${method} requires ${label}`);
+	return value;
+}
+
+function controlEnabled(method: string, value: boolean | undefined): boolean {
+	if (typeof value !== "boolean") throw new ToolError(`${method} requires enabled: true or enabled: false`);
+	return value;
+}
+
+/**
+ * Optional focus flag for `moveToWorkspace`. An absent key is the documented
+ * false default; a present non-boolean is a caller typo, not a request to skip
+ * focusing, so it fails instead of silently moving the window unfocused.
+ */
+function controlFocus(method: string, value: boolean | undefined): boolean {
+	if (value === undefined) return false;
+	if (typeof value !== "boolean") throw new ToolError(`${method} requires focus: true or focus: false`);
+	return value;
+}
+
+/**
+ * Refuses a read that needs the native control surface before touching it, so
+ * an addon without window control fails with its capability code instead of
+ * an undefined-method crash.
+ */
+function requireWindowControl(session: NativeDesktopSession, subject: string): void {
+	const { backend, windowControl } = readCapabilities(session);
+	if (!windowControl)
+		throw new ToolError(`ControlUnsupported: ${subject} is unavailable on the ${backend} desktop backend`);
+}
+
+/**
+ * Sends one window/workspace mutation. Capabilities are validated before the
+ * call, so an operation the backend never advertised never reaches native code.
+ */
+async function sendControl(
+	session: NativeDesktopSession,
+	context: ComputerRunContext,
+	action: DesktopControlAction,
+): Promise<void> {
+	const { backend, windowControl } = readCapabilities(session);
+	if (!windowControl || !windowControl.operations.includes(action.operation)) {
+		const supported = windowControl?.operations ?? [];
+		throw new ToolError(
+			`ControlUnsupported: ${action.operation} is unavailable on the ${backend} desktop backend` +
+				(supported.length > 0 ? ` (supported: ${supported.join(", ")})` : ""),
+		);
+	}
+	await nativeCall(context.signal, () => session.control(action));
 }
 
 async function captureScreenshot(
@@ -340,6 +425,13 @@ class Win {
 		return captureScreenshot(this.#session, this.#getContext, this.id, options);
 	}
 
+	async state(): Promise<DesktopWindowState> {
+		const { signal } = this.#getContext();
+		throwIfAborted(signal);
+		requireWindowControl(this.#session, "window state");
+		return await nativeCall(signal, () => this.#session.windowState(this.id));
+	}
+
 	async click(x: number, y: number, options?: ClickOptions): Promise<void> {
 		const context = this.#getContext();
 		guardRun(context, "click");
@@ -394,10 +486,133 @@ class Win {
 		);
 	}
 
-	async raise(): Promise<void> {
+	async focus(): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "raise");
-		await nativeCall(context.signal, () => this.#session.raiseWindow(this.id));
+		guardRun(context, "focus");
+		await sendControl(this.#session, context, { operation: "focusWindow", windowId: this.id });
+	}
+
+	async close(): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "close");
+		await sendControl(this.#session, context, { operation: "closeWindow", windowId: this.id });
+	}
+
+	async moveTo(options: MoveOptions): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "moveTo");
+		await sendControl(this.#session, context, {
+			operation: "moveWindow",
+			windowId: this.id,
+			x: controlNumber("moveTo", "x", options?.x),
+			y: controlNumber("moveTo", "y", options?.y),
+		});
+	}
+
+	async moveBy(options: MoveByOptions): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "moveBy");
+		await sendControl(this.#session, context, {
+			operation: "moveWindowBy",
+			windowId: this.id,
+			dx: controlNumber("moveBy", "dx", options?.dx),
+			dy: controlNumber("moveBy", "dy", options?.dy),
+		});
+	}
+
+	async resize(options: ResizeOptions): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "resize");
+		const width = controlSize("resize", "width", options?.width);
+		const height = controlSize("resize", "height", options?.height);
+		if (width === undefined && height === undefined) throw new ToolError("resize requires width, height, or both");
+		const action: DesktopControlAction = { operation: "resizeWindow", windowId: this.id };
+		if (width !== undefined) action.width = width;
+		if (height !== undefined) action.height = height;
+		await sendControl(this.#session, context, action);
+	}
+
+	async maximize(): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "maximize");
+		await sendControl(this.#session, context, { operation: "maximizeWindow", windowId: this.id });
+	}
+
+	async minimize(): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "minimize");
+		await sendControl(this.#session, context, { operation: "minimizeWindow", windowId: this.id });
+	}
+
+	async restore(): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "restore");
+		await sendControl(this.#session, context, { operation: "restoreWindow", windowId: this.id });
+	}
+
+	async toggleMaximized(): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "toggleMaximized");
+		await sendControl(this.#session, context, { operation: "toggleMaximized", windowId: this.id });
+	}
+
+	async toggleFullscreen(): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "toggleFullscreen");
+		await sendControl(this.#session, context, { operation: "toggleFullscreen", windowId: this.id });
+	}
+
+	async toggleWindowedFullscreen(): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "toggleWindowedFullscreen");
+		await sendControl(this.#session, context, { operation: "toggleWindowedFullscreen", windowId: this.id });
+	}
+
+	async setFullscreen(options: EnabledOptions): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "setFullscreen");
+		await sendControl(this.#session, context, {
+			operation: "setFullscreen",
+			windowId: this.id,
+			enabled: controlEnabled("setFullscreen", options?.enabled),
+		});
+	}
+
+	async setFloating(options: EnabledOptions): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "setFloating");
+		await sendControl(this.#session, context, {
+			operation: "setFloating",
+			windowId: this.id,
+			enabled: controlEnabled("setFloating", options?.enabled),
+		});
+	}
+
+	async center(): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "center");
+		await sendControl(this.#session, context, { operation: "centerWindow", windowId: this.id });
+	}
+
+	async moveToWorkspace(options: WorkspaceOptions): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "moveToWorkspace");
+		await sendControl(this.#session, context, {
+			operation: "moveWindowToWorkspace",
+			windowId: this.id,
+			workspaceId: controlId("moveToWorkspace", "workspaceId", options?.workspaceId),
+			focus: controlFocus("moveToWorkspace", options?.focus),
+		});
+	}
+
+	async moveToDisplay(options: DisplayOptions): Promise<void> {
+		const context = this.#getContext();
+		guardRun(context, "moveToDisplay");
+		await sendControl(this.#session, context, {
+			operation: "moveWindowToDisplay",
+			windowId: this.id,
+			displayId: controlId("moveToDisplay", "displayId", options?.displayId),
+		});
 	}
 
 	async ax(options?: AxOptions): Promise<string> {
@@ -707,11 +922,7 @@ export class ComputerWorkerCore {
 			capabilities: (): DesktopCapabilities => {
 				const { signal } = getContext();
 				throwIfAborted(signal);
-				try {
-					return session.capabilities;
-				} catch (error) {
-					throw nativeError(error);
-				}
+				return readCapabilities(session);
 			},
 			displays: async (): Promise<DesktopDisplay[]> => {
 				const { signal } = getContext();
@@ -743,6 +954,37 @@ export class ComputerWorkerCore {
 				const { signal } = getContext();
 				const window = (await nativeCall(signal, () => session.listWindows())).find(candidate => candidate.focused);
 				return window ? makeWin(window) : null;
+			},
+			workspaces: async (): Promise<DesktopWorkspace[]> => {
+				const { signal } = getContext();
+				throwIfAborted(signal);
+				requireWindowControl(session, "workspace listing");
+				return await nativeCall(signal, () => session.listWorkspaces());
+			},
+			focusWorkspace: async (options: WorkspaceOptions): Promise<void> => {
+				const context = getContext();
+				guardRun(context, "focusWorkspace");
+				await sendControl(session, context, {
+					operation: "focusWorkspace",
+					workspaceId: controlId("focusWorkspace", "workspaceId", options?.workspaceId),
+				});
+			},
+			focusDisplay: async (options: DisplayOptions): Promise<void> => {
+				const context = getContext();
+				guardRun(context, "focusDisplay");
+				await sendControl(session, context, {
+					operation: "focusDisplay",
+					displayId: controlId("focusDisplay", "displayId", options?.displayId),
+				});
+			},
+			moveWorkspaceToDisplay: async (options: WorkspaceDisplayOptions): Promise<void> => {
+				const context = getContext();
+				guardRun(context, "moveWorkspaceToDisplay");
+				await sendControl(session, context, {
+					operation: "moveWorkspaceToDisplay",
+					workspaceId: controlId("moveWorkspaceToDisplay", "workspaceId", options?.workspaceId),
+					displayId: controlId("moveWorkspaceToDisplay", "displayId", options?.displayId),
+				});
 			},
 			screenshot: (options?: ScreenshotOptions) => captureScreenshot(session, getContext, "desktop", options),
 			click: desktopTarget.click.bind(desktopTarget),

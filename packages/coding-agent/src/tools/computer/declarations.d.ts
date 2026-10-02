@@ -49,6 +49,62 @@ interface ComputerWindowFilter {
 	title?: string;
 }
 
+/** Options for `moveTo`: absolute window position in the backend's window coordinate space. */
+interface ComputerMoveToOptions {
+	x: number;
+	y: number;
+}
+
+/** Options for `moveBy`: relative window offset in the backend's window coordinate space. */
+interface ComputerMoveByOptions {
+	dx: number;
+	dy: number;
+}
+
+/** Options for `resize`; at least one axis is required and the other axis keeps its current size. */
+interface ComputerResizeOptions {
+	width?: number;
+	height?: number;
+}
+
+/** Options for `setFullscreen`, an idempotent setter unlike the toggle helpers. */
+interface ComputerSetFullscreenOptions {
+	enabled: boolean;
+}
+
+/** Options for `setFloating`, an idempotent compositor setter. */
+interface ComputerSetFloatingOptions {
+	enabled: boolean;
+}
+
+/** Options for `moveToWorkspace`; `workspaceId` is an exact `workspaces()` id. */
+interface ComputerMoveToWorkspaceOptions {
+	workspaceId: string;
+	/** Move focus to the target workspace too; absent or false leaves focus alone, a non-boolean throws. */
+	focus?: boolean;
+}
+
+/** Options for `moveToDisplay`; `displayId` is an exact enabled `displays()` id and there is no focus option. */
+interface ComputerMoveToDisplayOptions {
+	displayId: string;
+}
+
+/** Options for `focusWorkspace`; `workspaceId` is an exact `workspaces()` id. */
+interface ComputerFocusWorkspaceOptions {
+	workspaceId: string;
+}
+
+/** Options for `focusDisplay`; `displayId` is an exact enabled `displays()` id. */
+interface ComputerFocusDisplayOptions {
+	displayId: string;
+}
+
+/** Options for `moveWorkspaceToDisplay`; both ids are exact ids from `workspaces()` and `displays()`. */
+interface ComputerMoveWorkspaceToDisplayOptions {
+	workspaceId: string;
+	displayId: string;
+}
+
 /** Rectangle in platform-native global coordinates: physical desktop pixels on Windows, logical points on macOS. */
 interface ComputerBounds {
 	x: number;
@@ -57,7 +113,7 @@ interface ComputerBounds {
 	height: number;
 }
 
-/** One capturable top-level window; x/y are global only when positionKnown. */
+/** One top-level window; x/y are global only when positionKnown. Backends that track minimized clients list them so a handle can restore them. */
 interface ComputerWindowInfo extends ComputerBounds {
 	/** Opaque backend-defined id; never parse it. */
 	id: string;
@@ -80,6 +136,46 @@ interface ComputerDisplay extends ComputerBounds {
 	pixelWidth: number;
 	pixelHeight: number;
 	isPrimary: boolean;
+}
+
+/** Window-control support of the active backend; the field is absent when the backend exposes no window control. */
+interface ComputerWindowControlCapabilities {
+	/** Backend implementing window control, for example the active compositor. */
+	backend: string;
+	/** Window-control operations this backend currently accepts, for example `"focusWindow"`. */
+	operations: string[];
+	/** Coordinate space of `moveTo`/`moveBy`: `"working-area"` on niri, `"desktop"` on X11. */
+	coordinateSpace?: string;
+	/** True when focusing a window may also move the physical cursor, per compositor policy. */
+	focusMayWarpPointer: boolean;
+}
+
+/** Window state from `state()`. A field the backend cannot report is absent, never false. */
+interface ComputerWindowState {
+	/** The window as of this read; newer than the handle fields, which stay a resolution-time snapshot. */
+	window: ComputerWindowInfo;
+	/** Exact ids from `workspaces()` and `displays()` when the backend reports them. */
+	workspaceId?: string;
+	displayId?: string;
+	floating?: boolean;
+	urgent?: boolean;
+	maximized?: boolean;
+	minimized?: boolean;
+	fullscreen?: boolean;
+}
+
+/** One workspace; `id` is the opaque, stable id that every workspace and window move target must use. */
+interface ComputerWorkspace {
+	/** Opaque backend id such as `niri-workspace:2`; never parse it and never substitute an index. */
+	id: string;
+	index: number;
+	name?: string;
+	/** Exact `displays()` id when the backend reports one. */
+	displayId?: string;
+	active: boolean;
+	focused: boolean;
+	urgent: boolean;
+	activeWindowId?: string;
 }
 
 /** Saved screenshot frame; `width`/`height` are the emitted image size. */
@@ -107,6 +203,8 @@ interface ComputerCapabilities {
 	inputPermission: string;
 	axPermission: string;
 	displayCount: number;
+	/** Window-control support; absent means the backend cannot focus, close, move, resize or place windows. */
+	windowControl?: ComputerWindowControlCapabilities;
 }
 
 /** Live accessibility element resolved from a snapshot ref; expired refs throw `StaleRef`. */
@@ -149,7 +247,7 @@ interface ComputerInputTarget {
 	press(chord: string | string[], options?: ComputerInputOptions): Promise<void>;
 }
 
-/** Window handle resolved by `window`/`focusedWindow`; identity fields are a snapshot taken at resolution. */
+/** Window handle resolved by `window`/`focusedWindow`; its fields are the snapshot taken at resolution and never refresh. `state()` is the only fresh read, and current geometry lives in `state().window.x/y/width/height` — there is no nested `state().window.bounds`. Control helpers work only for operations the backend advertises in `capabilities().windowControl.operations`, and an unsupported one throws instead of pretending. */
 interface ComputerWindow extends ComputerInputTarget {
 	readonly id: string;
 	readonly app: string;
@@ -159,7 +257,29 @@ interface ComputerWindow extends ComputerInputTarget {
 	readonly positionKnown: boolean;
 	readonly bounds: ComputerBounds;
 	readonly focused: boolean;
-	raise(): Promise<void>;
+	/** Fresh window state; this read is the only way to learn state the handle fields do not carry. */
+	state(): Promise<ComputerWindowState>;
+	/** Activate this window; the only activation helper. */
+	focus(): Promise<void>;
+	/** Request close of exactly this window; the desktop session stays alive, unlike `computer.close()`. */
+	close(): Promise<void>;
+	/** Move the window itself to absolute coordinates; `move` still moves the pointer. */
+	moveTo(options: ComputerMoveToOptions): Promise<void>;
+	moveBy(options: ComputerMoveByOptions): Promise<void>;
+	resize(options: ComputerResizeOptions): Promise<void>;
+	maximize(): Promise<void>;
+	minimize(): Promise<void>;
+	restore(): Promise<void>;
+	/** Explicit non-idempotent toggles: never retry them, and re-read `state()` for the result. */
+	toggleMaximized(): Promise<void>;
+	toggleFullscreen(): Promise<void>;
+	toggleWindowedFullscreen(): Promise<void>;
+	/** Idempotent setters, unlike the toggles above. */
+	setFullscreen(options: ComputerSetFullscreenOptions): Promise<void>;
+	setFloating(options: ComputerSetFloatingOptions): Promise<void>;
+	center(): Promise<void>;
+	moveToWorkspace(options: ComputerMoveToWorkspaceOptions): Promise<void>;
+	moveToDisplay(options: ComputerMoveToDisplayOptions): Promise<void>;
 	/** Formatted accessibility tree as one string, one node per line with `[ref=eN]` tags. */
 	ax(options?: ComputerAxOptions): Promise<string>;
 	find(query: ComputerAxQuery): Promise<ComputerElement[]>;
@@ -170,9 +290,16 @@ interface ComputerWindow extends ComputerInputTarget {
 interface ComputerDesktop extends ComputerInputTarget {
 	displays(): Promise<ComputerDisplay[]>;
 	windows(filter?: ComputerWindowFilter): Promise<ComputerWindowInfo[]>;
+	/** List workspaces; their exact ids are the only accepted focus and move targets. */
+	workspaces(): Promise<ComputerWorkspace[]>;
 	/** Resolve exactly one window by id (`"74"` or `74`) or filter; ambiguous filters throw listing candidates. */
 	window(selector: string | number | ComputerWindowFilter): Promise<ComputerWindow>;
 	focusedWindow(): Promise<ComputerWindow | null>;
+	/** Focus an exact `workspaces()` id; a backend without workspace focus refuses it. */
+	focusWorkspace(options: ComputerFocusWorkspaceOptions): Promise<void>;
+	/** Focus an exact enabled `displays()` id; backends without monitor focus refuse it. */
+	focusDisplay(options: ComputerFocusDisplayOptions): Promise<void>;
+	moveWorkspaceToDisplay(options: ComputerMoveWorkspaceToDisplayOptions): Promise<void>;
 	/** Element under a global desktop coordinate. */
 	elementAt(x: number, y: number): Promise<ComputerElement | null>;
 	focusedElement(): Promise<ComputerElement | null>;
@@ -220,8 +347,8 @@ declare const computer: ComputerDesktop & {
 	): Promise<Awaited<R>>;
 	/** Run a JavaScript function body in the persistent computer runtime. */
 	run<R = unknown>(code: string, options?: ComputerRunOptions): Promise<R>;
-	/** Return native backend capabilities and permission state. */
+	/** Return native backend capabilities and permission state, including which window-control operations exist. */
 	capabilities(): Promise<ComputerCapabilities | undefined>;
-	/** End the persistent desktop session; later calls fail. */
+	/** End the persistent desktop session; later calls fail. A window's `close()` closes one window and does not. */
 	close(): Promise<void>;
 };

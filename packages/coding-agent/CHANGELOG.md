@@ -5,6 +5,14 @@
 ### Added
 
 - Added `positionKnown` to computer window metadata and handles. Exact niri window screenshots work even when the compositor does not publish a global window origin.
+- Added matching JavaScript and Python computer helpers for window focus, close, movement, resize, state setters and toggles, centering, workspace/display moves, and workspace/display focus.
+- Added fresh `win.state()` and `computer.workspaces()` reads, exact workspace IDs, capability checks, and read-only/cancellation guards for every control mutation.
+
+### Changed
+
+- **Breaking:** Replaced `win.raise()` and Python `win.raise_()` with `win.focus()`. Window handle fields remain resolution-time snapshots; use `state()` for current geometry and state.
+- Kept `win.move(x, y)` as pointer movement. Use `moveTo({ x, y })` and `moveBy({ dx, dy })` to move the window.
+- Clarified computer control guidance: focus can warp the pointer, `Timeout` can leave applied effects, and screenshot frames expire before native dispatch.
 
 ## [18.4.10] - 2026-10-02
 

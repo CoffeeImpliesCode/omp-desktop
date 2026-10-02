@@ -51,7 +51,7 @@ await computer.capabilities();
 await computer.close();
 ```
 
-Python uses the same helper names; keyword arguments become the trailing options object, and `win.raise_()` stands in for the keyword `raise`:
+Python uses the same helper names; keyword arguments become the trailing options object, so `win.moveTo(x=120, y=80)` and `win.setFullscreen(enabled=True)` take the same options as JavaScript:
 
 ```python
 win = await computer.window(app="Code")
@@ -65,7 +65,7 @@ Handles are frozen snapshots plus proxy methods. `computer.window(...)` and `com
 
 `computer.run(fnOrCode, { args?, read_only?, timeout? })` runs a multi-step function or JavaScript string in the same session and returns the real structured value. JavaScript functions receive `{ desktop, wait, assert }` — `desktop` has the desktop helpers plus synchronous `capabilities()`, but not `run()` or `close()` — and cannot capture Eval-cell closures; `{ args: [...] }` passes plain data, functions, and regular expressions after the scope object. Python `computer.run(code, read_only=..., timeout=...)` accepts a JavaScript string only. Nonempty inner `display` text prints in the outer Eval cell; screenshots surface as Eval images. `read_only` defaults to `false`; `timeout` defaults to 120 seconds, is capped by a positive `tools.maxTimeout`, then clamped to 1–300 seconds. The host invocation schema rejects unknown fields; the JavaScript facade forwards only recognized run options. `computer.capabilities()` reports the native backend and permission state (`action: "capabilities"`); `computer.close()` ends the persistent desktop session.
 
-Approval: a direct call is `read` when its terminal method is inspection-only (`displays`, `windows`, `window`, `focusedWindow`, `screenshot`, `elementAt`, `focusedElement`, `ref`, `clipboard.read`, `ax`, `find`, `value`, `bounds`, `attributes`, `actions`, `parent`, `children`) and `exec` for input, `raise`, `setValue`, `perform`, `press`, `click`, `focus`, and `clipboard.write`; read calls also run with the worker's read-only guard. `computer.run` is `read` only when `read_only === true`; malformed input, an omitted flag, or `false` is `exec`.
+Approval: a direct call is `read` when its terminal method is inspection-only (`displays`, `windows`, `window`, `focusedWindow`, `workspaces`, `screenshot`, `state`, `elementAt`, `focusedElement`, `ref`, `clipboard.read`, `ax`, `find`, `value`, `bounds`, `attributes`, `actions`, `parent`, `children`) and `exec` for input and mutation (window `click`, `doubleClick`, `move`, `drag`, `scroll`, `type`, `press`, `focus`, `close`, `moveTo`, `moveBy`, `resize`, `maximize`, `minimize`, `restore`, `toggleMaximized`, `toggleFullscreen`, `toggleWindowedFullscreen`, `setFullscreen`, `setFloating`, `center`, `moveToWorkspace`, `moveToDisplay`; root `focusWorkspace`, `focusDisplay`, `moveWorkspaceToDisplay`; element `setValue`, `perform`, `focus`; `clipboard.write`); read calls also run with the worker's read-only guard. `computer.close()` is not a call-chain method: it ends the session. `computer.run` is `read` only when `read_only === true`; malformed input, an omitted flag, or `false` is `exec`.
 
 Runs have full host access and are not sandboxed. The persistent `JsRuntime` supplies `desktop`, `wait`, and `assert`, plus ordinary helpers such as `display`, `print`, `read`, `write`, `env`, and `tool`. Full Bun/Node files, processes, modules, and network APIs remain available. `wait(ms)` sleeps; `wait(predicate, { timeout?, interval? })` polls until truthy.
 
@@ -79,7 +79,8 @@ The same surface is reachable as `computer.*` directly and as `desktop.*` inside
 - `desktop.window(id | { id?, app?, title? })` returns one persistent window facade. An id may be a string or a number (`74` is the id `"74"`, never matched against app or title). Zero matches throw; multiple matches throw with the candidates.
 - `desktop.focusedWindow()` returns a window facade or `null`.
 - `desktop.displays()` returns `DesktopDisplay[]`.
-- `desktop.capabilities()` returns capture/input/AX availability, `backgroundWindowInput` and `takeover` support, permission states, display server, backend, and display count.
+- `desktop.workspaces()` returns `DesktopWorkspace[]` entries with `{ id, index, name, displayId, active, focused, urgent, activeWindowId }`. Workspace IDs are opaque and stable (`niri-workspace:<n>` on niri, `x11-workspace:<n>` on X11).
+- `desktop.capabilities()` returns capture/input/AX availability, `backgroundWindowInput` and `takeover` support, permission states, display server, backend, display count, and the optional `windowControl` block `{ backend, operations, coordinateSpace, focusMayWarpPointer }`. A missing block means the session has no window control.
 
 A window facade exposes immutable `id`, `app`, `title`, optional `pid`, `bounds`, `positionKnown`, and `focused` fields.
 
@@ -96,11 +97,39 @@ Both a selected window and `desktop` expose:
 - `type(text, { takeover? })`
 - `press(chord | string[], { takeover? })`
 
-A window also exposes `raise()`, `ax(...)`, `find(...)`, and `ref(...)`. Window input defaults to background delivery without deliberate activation or pointer movement. `takeover: true` briefly activates the target and posts real input; use it only after that call reports `BackgroundUnavailable` or a screenshot proves a no-op, and AX cannot perform the action. Never replay uncertain input blindly. Desktop-root pointer helpers drive the user's real pointer, so prefer window handles. Pixel coordinates belong to the most recent screenshot of the same target. Coordinate input before capture, after target/layout changes, or with another target's frame throws.
+A window also exposes `focus()`, the control helpers below, `ax(...)`, `find(...)`, and `ref(...)`. Window input defaults to background delivery without deliberate activation or pointer movement. `takeover: true` briefly activates the target and posts real input; use it only after that call reports `BackgroundUnavailable` or a screenshot proves a no-op, and AX cannot perform the action. Never replay uncertain input blindly. Desktop-root pointer helpers drive the user's real pointer, so prefer window handles. Pixel coordinates belong to the most recent screenshot of the same target. Coordinate input before capture, after target/layout changes, or with another target's frame throws.
 
 Window metadata and handles expose `positionKnown`. If it is false, `bounds.x` and `bounds.y` are not global coordinates. Exact native window capture can still succeed. Input that needs the window's global origin fails with `InvalidCoordinateFrame`; an AT-SPI window-relative position is not a safe replacement. AX actions do not require that coordinate mapping.
 
 Screenshots are PNGs written under the OS temp directory. Native capture is resized to the effective capture caps before both saving and displaying; the saved PNG and model-visible image share the same pixel frame. Unless `silent: true`, each capture emits a status text block and an image block. Details record captured dimensions, original source dimensions, and target.
+
+### Window and workspace control
+
+Control helpers call the platform compositor or window manager directly. They do not use pointer input or synthetic keys. Compositor focus policy can still move the pointer.
+
+- `win.state() -> { window, workspaceId, displayId, floating, urgent, maximized, minimized, fullscreen }` is an explicit fresh read. A flag the backend cannot report stays absent instead of `false`.
+- `win.focus()`, `win.close()`
+- `win.moveTo({ x, y })`, `win.moveBy({ dx, dy })`, `win.resize({ width?, height? })`
+- `win.maximize()`, `win.minimize()`, `win.restore()`
+- `win.toggleMaximized()`, `win.toggleFullscreen()`, `win.toggleWindowedFullscreen()`
+- `win.setFullscreen({ enabled })`, `win.setFloating({ enabled })`, `win.center()`
+- `win.moveToWorkspace({ workspaceId, focus? })`, `win.moveToDisplay({ displayId })`
+- `desktop.workspaces() -> DesktopWorkspace[]`
+- `desktop.focusWorkspace({ workspaceId })`, `desktop.focusDisplay({ displayId })`, `desktop.moveWorkspaceToDisplay({ workspaceId, displayId })`
+
+Semantics:
+
+- `win.move(x, y)` remains pointer movement; `moveTo` and `moveBy` move the window.
+- Only IDs returned by `desktop.window(...)`, `desktop.windows()`, `desktop.workspaces()`, and `desktop.displays()` are mutation targets. Workspace indices, window titles, and guessed IDs are never targets.
+- `win.close()` requests a close of one exact window and leaves the session alive. `computer.close()` ends the desktop session, and later calls fail.
+- `desktop.capabilities().windowControl.operations` is the authoritative list. An unadvertised operation fails with `ControlUnsupported` before any side effect; `coordinateSpace` is `"working-area"` on niri (floating positions inside the output working area) and `"desktop"` on X11 (global desktop logical coordinates). It describes window movement, not screenshot pixels.
+- A resolved call means the compositor or window manager executed or accepted the request, not that the application obeyed the close or configure. Verify with `state()` and a fresh screenshot.
+- Toggles are not idempotent, and nothing retries automatically. On niri, `maximized`, `fullscreen`, and `minimized` stay absent from `state()`. Confirm a toggle with a screenshot. After `ControlFailed` or `Timeout`, read fresh state before deciding. A timeout or partial resize can leave effects already applied.
+- Before native dispatch, control mutations invalidate every screenshot coordinate frame, including possible partial delivery. Capture again before pixel input.
+- On niri, `moveTo` and `moveBy` are refused on a tiled window, `resize` on a tiled window resizes its column or row, and `toggleMaximized` is refused for a floating window. Minimize, restore, idempotent maximize, and idempotent fullscreen are not advertised. `focusMayWarpPointer` is `true`, so focusing may move the physical cursor.
+- On X11, only what the running window manager actually supports is advertised, and `focusDisplay` is absent because X11 has no monitor focus concept.
+
+See [Scriptable computer use: window, workspace and display control](../computer-use.md#window-workspace-and-display-control) for the full per-backend behavior.
 
 ### Accessibility
 
@@ -153,18 +182,20 @@ Result details contain the resolved `code`, `readOnly`, `screenshots`, optional 
 Native errors are surfaced as `ToolError` text prefixed by the stable code name:
 
 - `PermissionDenied`, `CaptureFailed`, `InputFailed`, `BackgroundUnavailable`
-- `WindowNotFound`, `InvalidTarget`, `InvalidKey`, `InvalidCoordinateFrame`
+- `WindowNotFound`, `InvalidTarget`, `InvalidKey`, `InvalidCoordinateFrame`, `ControlUnsupported`, `ControlFailed`
 - `StaleRef`, `AxUnsupported`, `AxFailed`, `Timeout`, `Closed`, `Internal`
 
 Prelude/worker errors include `Computer session is closed`, `Computer worker is busy`, `Timed out starting computer worker`, `Computer code execution timed out after <ms>ms`, read-only mutation errors, and the worker-restart message above.
 
-Recover by refreshing the exact target screenshot after coordinate-frame errors, taking a new AX snapshot after `StaleRef`, and inspecting `desktop.capabilities()` for platform/permission failures. After `BackgroundUnavailable`, prefer AX; use `takeover: true` only for the refused call when supported. After partial-delivery or restoration errors, inspect the target before retrying because input may already have landed.
+Recover by refreshing the exact target screenshot after coordinate-frame errors, taking a new AX snapshot after `StaleRef`, and inspecting `desktop.capabilities()` for platform/permission failures. After `BackgroundUnavailable`, prefer AX. Use `takeover: true` only for the refused call when supported. After partial-delivery or restoration errors, inspect the target before retrying because input may already have landed. After `ControlUnsupported`, check `windowControl.operations` and change approach. After a control call returns `ControlFailed` or `Timeout`, read `state()` or capture a screenshot before deciding. The request may already have been applied.
 
 ## Platform constraints
 
-Current native backends support macOS, Linux X11, Linux Wayland portal capture/input where available, and Windows; other targets depend on native-addon support. Capabilities and permission state are runtime facts—inspect `desktop.capabilities()` rather than assuming them. Wayland compositors do not permit omp to activate arbitrary windows, so per-window native input and `raise()` are unavailable; use AX actions, or desktop input after focusing the target yourself. See [Scriptable computer use: Platforms](../computer-use.md#platforms) for prerequisites and permission details.
+Current native backends support macOS, Linux X11, Linux Wayland portal capture/input where available, and Windows; other targets depend on native-addon support. Capabilities and permission state are runtime facts—inspect `desktop.capabilities()` rather than assuming them. Wayland compositors do not permit per-window native input delivery; use AX actions, or desktop input after focusing the target yourself. Window control is a separate surface: niri answers focus, close, move, resize, and workspace helpers over its IPC socket, while X11 answers only what its window manager really supports. See [Scriptable computer use: Platforms](../computer-use.md#platforms) for prerequisites and permission details.
 
 Builds with `wayland-pipewire` capture all authorized monitor streams and map screenshot pixels through their logical display bounds. On niri, IPC supplies connector display IDs, window IDs, and metadata before capture. Exact `niri:<id>` window capture uses the compositor's native ScreenCast service without focus or clipboard changes and without a portal selection dialog. Normal computer read approval remains in force. Missing global window positions remain unknown; they do not prevent exact capture or make per-window native input available.
+
+On niri, `windowControl` advertises focus, close, floating move and resize, centering, `setFloating`, the three toggles, and window, workspace, and display moves. It does not advertise minimize, restore, idempotent maximize, or idempotent fullscreen, and `focusMayWarpPointer` is `true` there.
 
 ## Critical constraints
 

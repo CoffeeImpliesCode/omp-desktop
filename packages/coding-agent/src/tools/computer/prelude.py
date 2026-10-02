@@ -58,6 +58,7 @@ def _make_computer():
     def _step(method, args, kwargs):
         return {"method": method, "args": _arguments(args, kwargs)}
 
+
     class _Element:
         __slots__ = ("ref", "role", "nativeRole", "title", "description", "enabled", "focused", "childCount")
 
@@ -142,8 +143,70 @@ def _make_computer():
         async def press(self, *args, **kwargs):
             return await self._method("press", args, kwargs)
 
-        async def raise_(self, *args, **kwargs):
-            return await self._method("raise", args, kwargs)
+        async def state(self, *args, **kwargs):
+            """Fresh window state; the handle fields stay a resolution-time snapshot."""
+            return await self._method("state", args, kwargs)
+
+        async def focus(self, *args, **kwargs):
+            """Activate this window; the only activation helper."""
+            return await self._method("focus", args, kwargs)
+
+        async def close(self, *args, **kwargs):
+            """Request close of this one window; the desktop session stays alive."""
+            return await self._method("close", args, kwargs)
+
+        async def moveTo(self, *args, **kwargs):
+            """Move the window in `capabilities().windowControl.coordinateSpace`."""
+            return await self._method("moveTo", args, kwargs)
+
+        async def moveBy(self, *args, **kwargs):
+            """Move the window itself by a relative offset."""
+            return await self._method("moveBy", args, kwargs)
+
+        async def resize(self, *args, **kwargs):
+            """Give at least one axis; the other axis keeps its current size."""
+            return await self._method("resize", args, kwargs)
+
+        async def maximize(self, *args, **kwargs):
+            return await self._method("maximize", args, kwargs)
+
+        async def minimize(self, *args, **kwargs):
+            """Backends without it refuse the call; read `state()` for the outcome."""
+            return await self._method("minimize", args, kwargs)
+
+        async def restore(self, *args, **kwargs):
+            return await self._method("restore", args, kwargs)
+
+        async def toggleMaximized(self, *args, **kwargs):
+            """Non-idempotent toggle; confirm with a screenshot and never retry blindly."""
+            return await self._method("toggleMaximized", args, kwargs)
+
+        async def toggleFullscreen(self, *args, **kwargs):
+            """Non-idempotent toggle; confirm with a screenshot and never retry blindly."""
+            return await self._method("toggleFullscreen", args, kwargs)
+
+        async def toggleWindowedFullscreen(self, *args, **kwargs):
+            """Non-idempotent toggle; confirm with a screenshot and never retry blindly."""
+            return await self._method("toggleWindowedFullscreen", args, kwargs)
+
+        async def setFullscreen(self, *args, **kwargs):
+            """Idempotent setter, unlike the toggle helpers."""
+            return await self._method("setFullscreen", args, kwargs)
+
+        async def setFloating(self, *args, **kwargs):
+            """Idempotent setter, unlike the toggle helpers."""
+            return await self._method("setFloating", args, kwargs)
+
+        async def center(self, *args, **kwargs):
+            return await self._method("center", args, kwargs)
+
+        async def moveToWorkspace(self, *args, **kwargs):
+            """Move to an exact `computer.workspaces()` id; `focus` defaults to false."""
+            return await self._method("moveToWorkspace", args, kwargs)
+
+        async def moveToDisplay(self, *args, **kwargs):
+            """Move to an exact `computer.displays()` id; no focus-on-move option exists."""
+            return await self._method("moveToDisplay", args, kwargs)
 
         async def ax(self, *args, **kwargs):
             return await self._method("ax", args, kwargs)
@@ -182,6 +245,19 @@ def _make_computer():
 
         async def windows(self, *args, **kwargs):
             return await self._method("windows", args, kwargs)
+
+        async def workspaces(self, *args, **kwargs):
+            """List workspaces; their exact ids are the only accepted focus and move targets."""
+            return await self._method("workspaces", args, kwargs)
+
+        async def focusWorkspace(self, *args, **kwargs):
+            return await self._method("focusWorkspace", args, kwargs)
+
+        async def focusDisplay(self, *args, **kwargs):
+            return await self._method("focusDisplay", args, kwargs)
+
+        async def moveWorkspaceToDisplay(self, *args, **kwargs):
+            return await self._method("moveWorkspaceToDisplay", args, kwargs)
 
         async def screenshot(self, *args, **kwargs):
             return await self._method("screenshot", args, kwargs)
@@ -245,7 +321,7 @@ def _make_computer():
             return details if "backend" in details else None
 
         async def close(self):
-            """End the persistent desktop session; later calls fail."""
+            """End the persistent desktop session; later calls fail. A window's close() does not."""
             await _invoke("close", {})
 
     return _Computer()

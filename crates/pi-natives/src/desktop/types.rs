@@ -62,6 +62,25 @@ pub struct DesktopCapture {
 	pub display_server: Option<String>,
 }
 
+/// Window-control surface of the live backend. A missing
+/// [`DesktopCapabilities::window_control`] block means the backend cannot
+/// control windows at all.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct DesktopControlCapabilities {
+	/// Backend serving these operations, matching
+	/// `DesktopCapabilities::backend`.
+	pub backend:                String,
+	/// CamelCase operations this backend really implements. Absent or empty
+	/// means control is unavailable; the list is a promise, not a hint.
+	pub operations:             Vec<String>,
+	/// Coordinate space `moveWindow`/`moveWindowBy` use, absent when the backend
+	/// offers no window movement.
+	pub coordinate_space:       Option<String>,
+	/// Focusing may move the physical pointer under compositor/WM policy.
+	pub focus_may_warp_pointer: bool,
+}
+
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct DesktopCapabilities {
@@ -78,6 +97,9 @@ pub struct DesktopCapabilities {
 	pub input_permission: String,
 	pub ax_permission: String,
 	pub display_count: u32,
+	/// Window-control surface of the live backend, absent when the backend
+	/// cannot control windows.
+	pub window_control: Option<DesktopControlCapabilities>,
 }
 
 impl DesktopCapabilities {
@@ -94,8 +116,61 @@ impl DesktopCapabilities {
 			input_permission: "unavailable".to_string(),
 			ax_permission: "unavailable".to_string(),
 			display_count: 0,
+			window_control: None,
 		}
 	}
+}
+
+/// One window-control request. Only the fields its `operation` names are read;
+/// every other field must stay absent.
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct DesktopControlAction {
+	pub operation:    String,
+	/// Exact id from `listWindows`.
+	pub window_id:    Option<String>,
+	/// Exact id from `listWorkspaces`.
+	pub workspace_id: Option<String>,
+	/// Exact id from `listDisplays`.
+	pub display_id:   Option<String>,
+	pub x:            Option<f64>,
+	pub y:            Option<f64>,
+	pub dx:           Option<f64>,
+	pub dy:           Option<f64>,
+	pub width:        Option<f64>,
+	pub height:       Option<f64>,
+	pub enabled:      Option<bool>,
+	pub focus:        Option<bool>,
+}
+
+/// Fresh read of one window plus the state the backend really knows. An absent
+/// field means unknown, never `false`.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct DesktopWindowState {
+	pub window:       DesktopWindow,
+	pub workspace_id: Option<String>,
+	pub display_id:   Option<String>,
+	pub floating:     Option<bool>,
+	pub urgent:       Option<bool>,
+	pub maximized:    Option<bool>,
+	pub minimized:    Option<bool>,
+	pub fullscreen:   Option<bool>,
+}
+
+/// One workspace as the backend reports it. `id` is opaque and stable, and
+/// only an id returned here is ever a valid mutation target.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct DesktopWorkspace {
+	pub id:               String,
+	pub index:            u32,
+	pub name:             Option<String>,
+	pub display_id:       Option<String>,
+	pub active:           bool,
+	pub focused:          bool,
+	pub urgent:           bool,
+	pub active_window_id: Option<String>,
 }
 
 #[napi(object)]

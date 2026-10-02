@@ -18,6 +18,10 @@ function desktopError(code, message) {
 	return new Error(`${code}: ${message}`);
 }
 
+function controlUnsupported(what) {
+	return desktopError("ControlUnsupported", `the installed native addon does not support ${what}`);
+}
+
 function normalizeError(error, fallbackCode) {
 	if (!(error instanceof Error)) return desktopError(fallbackCode, String(error));
 	if (/^[A-Z][A-Za-z]+: /.test(error.message)) return error;
@@ -35,6 +39,9 @@ function normalizeCapabilities(capabilities) {
 		backgroundWindowInput: false,
 		takeover: true,
 		axPermission: "unavailable",
+		// The legacy ABI has no window control surface: advertise an empty
+		// operation list so membership checks refuse before any side effect.
+		windowControl: { backend: "unavailable", operations: [], coordinateSpace: null, focusMayWarpPointer: false },
 	};
 }
 
@@ -334,9 +341,19 @@ export function adaptDesktopSession(NativeDesktopSession) {
 			await this.#execute({ type: "keypress", keys }, target, this.#capturedTargets.get(target)?.native ?? this.#native);
 		}
 
-		async raiseWindow() {
+		async control() {
 			this.#ensureOpen();
-			throw desktopError("BackgroundUnavailable", "the installed native addon does not support window control");
+			throw controlUnsupported("window control");
+		}
+
+		async listWorkspaces() {
+			this.#ensureOpen();
+			throw controlUnsupported("workspace enumeration");
+		}
+
+		async windowState() {
+			this.#ensureOpen();
+			throw controlUnsupported("window state");
 		}
 
 		async axSnapshot() {

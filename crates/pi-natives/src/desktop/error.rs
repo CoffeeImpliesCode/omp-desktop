@@ -6,6 +6,8 @@ pub enum ErrorCode {
 	CaptureFailed,
 	InputFailed,
 	BackgroundUnavailable,
+	ControlUnsupported,
+	ControlFailed,
 	WindowNotFound,
 	InvalidTarget,
 	InvalidKey,
@@ -25,6 +27,8 @@ impl ErrorCode {
 			Self::CaptureFailed => "CaptureFailed",
 			Self::InputFailed => "InputFailed",
 			Self::BackgroundUnavailable => "BackgroundUnavailable",
+			Self::ControlUnsupported => "ControlUnsupported",
+			Self::ControlFailed => "ControlFailed",
 			Self::WindowNotFound => "WindowNotFound",
 			Self::InvalidTarget => "InvalidTarget",
 			Self::InvalidKey => "InvalidKey",
@@ -64,6 +68,14 @@ impl DesktopError {
 
 	pub(crate) fn background_unavailable(message: impl Into<String>) -> Self {
 		Self::new(ErrorCode::BackgroundUnavailable, message)
+	}
+
+	pub(crate) fn control_unsupported(message: impl Into<String>) -> Self {
+		Self::new(ErrorCode::ControlUnsupported, message)
+	}
+
+	pub(crate) fn control_failed(message: impl Into<String>) -> Self {
+		Self::new(ErrorCode::ControlFailed, message)
 	}
 
 	pub(crate) fn window_not_found(message: impl Into<String>) -> Self {

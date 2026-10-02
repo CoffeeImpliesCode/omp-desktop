@@ -14,6 +14,7 @@ use x11rb::{
 	rust_connection::RustConnection,
 };
 
+use super::wm::ICONIC_STATE;
 use crate::desktop::{
 	error::{CoreResult, DesktopError},
 	frame::FrameGeometry,
@@ -22,6 +23,44 @@ use crate::desktop::{
 
 const MAX_WINDOWS: usize = 48;
 const MIN_WINDOW_EDGE: u32 = 16;
+
+/// The atoms a minimized-window check needs. Interned once per listing so a
+/// client sweep does not repeat the name round trips per window.
+#[derive(Clone, Copy)]
+struct MinimizedProbe {
+	states: Atom,
+	hidden: Atom,
+	normal: Atom,
+}
+
+impl MinimizedProbe {
+	fn intern(capture: &X11Capture) -> CoreResult<Self> {
+		Ok(Self {
+			states: capture.intern("_NET_WM_STATE")?,
+			hidden: capture.intern("_NET_WM_STATE_HIDDEN")?,
+			normal: capture.intern("WM_STATE")?,
+		})
+	}
+
+	/// Whether the window manager has this client minimized: ICCCM iconified
+	/// or `_NET_WM_STATE_HIDDEN`, whichever this window manager publishes. A
+	/// minimized client keeps a stale rectangle, so it stays listed for a
+	/// direct restore while capture and input refuse it.
+	fn is_minimized(&self, capture: &X11Capture, window: Window) -> bool {
+		let hidden = capture
+			.property(window, self.states, AtomEnum::ATOM, 64)
+			.and_then(|reply| Some(reply.value32()?.any(|state| state == self.hidden)))
+			.unwrap_or(false);
+		hidden
+			|| capture
+				.conn
+				.get_property(false, window, self.normal, AtomEnum::ANY, 0, 2)
+				.ok()
+				.and_then(|cookie| cookie.reply().ok())
+				.and_then(|reply| reply.value32()?.next())
+				.is_some_and(|state| state == ICONIC_STATE)
+	}
+}
 
 #[derive(Clone, Copy)]
 struct ColorMasks {
@@ -110,6 +149,12 @@ impl X11Capture {
 
 	pub(crate) const fn root(&self) -> Window {
 		self.root
+	}
+
+	/// The root window's pixel size, the last-resort working area for window
+	/// placement when the window manager publishes none.
+	pub(crate) const fn root_size(&self) -> (u32, u32) {
+		(self.root_width, self.root_height)
 	}
 
 	pub(crate) fn displays(&self) -> CoreResult<Vec<DesktopDisplay>> {
@@ -207,9 +252,8 @@ impl X11Capture {
 			.and_then(|reply| reply.value32()?.next());
 		let name_atom = self.intern("_NET_WM_NAME")?;
 		let utf8_atom = self.intern("UTF8_STRING")?;
-		let state_atom = self.intern("_NET_WM_STATE")?;
-		let hidden_atom = self.intern("_NET_WM_STATE_HIDDEN")?;
 		let pid_atom = self.intern("_NET_WM_PID")?;
+		let minimized = MinimizedProbe::intern(self)?;
 
 		let mut windows = Vec::with_capacity(ids.len().min(MAX_WINDOWS));
 		for id in ids {
@@ -240,20 +284,22 @@ impl X11Capture {
 			if width < MIN_WINDOW_EDGE || height < MIN_WINDOW_EDGE {
 				continue;
 			}
+			// A minimized client is unmapped and keeps the rectangle it had when
+			// it was minimized. It stays listed so a direct handle can restore
+			// it, but nothing on screen has that rectangle, so its origin is not
+			// a screen position and input must refuse it.
+			let is_minimized = minimized.is_minimized(self, id);
 			let x = i32::from(origin.dst_x);
 			let y = i32::from(origin.dst_y);
-			if x >= i32::try_from(self.root_width).unwrap_or(i32::MAX)
-				|| y >= i32::try_from(self.root_height).unwrap_or(i32::MAX)
-				|| x.saturating_add(i32::try_from(width).unwrap_or(i32::MAX)) <= 0
-				|| y.saturating_add(i32::try_from(height).unwrap_or(i32::MAX)) <= 0
+			if !is_minimized
+				&& (x >= i32::try_from(self.root_width).unwrap_or(i32::MAX)
+					|| y >= i32::try_from(self.root_height).unwrap_or(i32::MAX)
+					|| x.saturating_add(i32::try_from(width).unwrap_or(i32::MAX)) <= 0
+					|| y.saturating_add(i32::try_from(height).unwrap_or(i32::MAX)) <= 0)
 			{
 				continue;
 			}
-			let hidden = self
-				.property(id, state_atom, AtomEnum::ATOM, 64)
-				.and_then(|reply| Some(reply.value32()?.any(|state| state == hidden_atom)))
-				.unwrap_or(false);
-			if attributes.map_state != MapState::VIEWABLE || hidden {
+			if attributes.map_state != MapState::VIEWABLE && !is_minimized {
 				continue;
 			}
 			let title = self
@@ -273,7 +319,7 @@ impl X11Capture {
 				title,
 				app,
 				pid,
-				position_known: Some(true),
+				position_known: Some(!is_minimized),
 				x,
 				y,
 				width,
@@ -313,6 +359,18 @@ impl X11Capture {
 				Ok((composite, frame))
 			},
 			Target::Window(id) => {
+				// A minimized client has no on-screen frame: its stored
+				// rectangle would capture whatever the window manager put
+				// there instead, so refuse instead of returning that image.
+				let minimized = MinimizedProbe::intern(self)?;
+				if let Some(client) = id.parse::<u32>().ok()
+					&& minimized.is_minimized(self, client)
+				{
+					return Err(DesktopError::capture_failed(format!(
+						"window {id} is minimized and has no frame on screen; restore it before \
+						 capturing"
+					)));
+				}
 				let window = self
 					.windows()?
 					.into_iter()

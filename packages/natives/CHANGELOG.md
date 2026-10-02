@@ -5,6 +5,12 @@
 ### Added
 
 - Added niri IPC display and window enumeration and exact native window capture, including windows without AT-SPI support.
+- Added `DesktopSession.control()`, `listWorkspaces()`, and `windowState()` with backend-reported window-control operations for niri and X11.
+- Added exact-target window close, movement, resize, state, workspace, and display controls. Unsupported compositor operations fail before mutation instead of using keyboard or pointer fallbacks.
+
+### Changed
+
+- **Breaking:** Removed `DesktopSession.raiseWindow()`. Use `control({ operation: "focusWindow", windowId })` after checking `capabilities.windowControl.operations`.
 
 ### Fixed
 
@@ -12,6 +18,12 @@
 - Refused global coordinate mapping and AX coordinate clicks when a window's global origin is unknown or its AT-SPI bounds cannot be verified.
 - Fixed niri window screenshots rejecting valid buffers on fractional-scale outputs.
 - Kept Wayland desktop capture and window discovery working when optional niri IPC metadata is unavailable.
+- Invalidated all screenshot coordinate frames before window, workspace, and display mutations, including requests that fail after possible partial delivery.
+- Kept minimized X11 windows discoverable for restore and refused capture of their stale on-screen rectangles.
+- Required niri's exact `"Handled"` action reply instead of accepting a nested or null success payload.
+- Delivered X11 close requests as `WM_PROTOCOLS` messages carrying `WM_DELETE_WINDOW`, without force-killing clients.
+- Preserved exact decorated X11 client origins during movement and left position and unrequested size axes unchanged in resize requests.
+- Kept X11 centering on the window's monitor and used the active workspace's panel reservations; corrected the root subject of workspace-focus requests.
 
 ## [18.4.10] - 2026-10-02
 

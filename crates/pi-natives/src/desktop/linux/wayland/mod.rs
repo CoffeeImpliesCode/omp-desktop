@@ -12,12 +12,14 @@ use image::RgbaImage;
 
 use crate::desktop::{
 	backend::{AxBackend, Backend, DeliveryMode, PointerEvent},
+	control::ControlAction,
 	error::{CoreResult, DesktopError},
 	frame::FrameGeometry,
 	keys::KeyName,
 	linux::ax::{AtSpiAx, AtSpiWindow},
 	types::{
-		CaptureCaps, DesktopCapabilities, DesktopDisplay, DesktopWindow, DisplaySelector, Target,
+		CaptureCaps, DesktopCapabilities, DesktopControlCapabilities, DesktopDisplay, DesktopWindow,
+		DesktopWindowState, DesktopWorkspace, DisplaySelector, Target,
 	},
 };
 
@@ -128,6 +130,9 @@ impl Backend for WaylandBackend {
 				"unavailable".to_string()
 			},
 			display_count: self.displays.len() as u32,
+			// The live window-control surface is attached centrally from
+			// `Backend::control_capabilities`, which probes niri itself.
+			window_control: None,
 		}
 	}
 
@@ -240,10 +245,32 @@ impl Backend for WaylandBackend {
 	}
 
 	fn raise_window(&mut self, id: &str) -> CoreResult<()> {
+		// niri is the one compositor on this platform that answers "activate
+		// this window"; a generic Wayland session still has no way to move
+		// focus, and that stays a compositor constraint rather than a guess.
+		if id.starts_with(niri::ID_PREFIX) && niri::compatible() {
+			return niri::focus(id);
+		}
 		Err(DesktopError::background_unavailable(format!(
 			"window {id} wayland-compositor-focus-only: Wayland cannot programmatically activate a \
 			 non-focused window; only the currently focused surface is reachable"
 		)))
+	}
+
+	fn control_capabilities(&mut self) -> DesktopControlCapabilities {
+		niri::control_capabilities()
+	}
+
+	fn control(&mut self, action: &ControlAction) -> CoreResult<()> {
+		niri::control(action)
+	}
+
+	fn workspaces(&mut self) -> CoreResult<Vec<DesktopWorkspace>> {
+		niri::workspaces()
+	}
+
+	fn window_state(&mut self, id: &str) -> CoreResult<DesktopWindowState> {
+		niri::window_state(id)
 	}
 
 	fn ax(&mut self) -> Option<&mut dyn AxBackend> {
@@ -263,7 +290,11 @@ mod tests {
 
 	use super::*;
 
-	static LIBEI_ENV_LOCK: Mutex<()> = Mutex::new(());
+	/// Serializes the tests that move process-global environment variables.
+	///
+	/// `NIRI_SOCKET` is moved by the niri compositor tests too, and two threads
+	/// racing on it would read each other's socket.
+	pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 	fn backend_without_services() -> WaylandBackend {
 		WaylandBackend {
@@ -275,7 +306,7 @@ mod tests {
 		}
 	}
 	fn with_fake_libei(action: impl FnOnce(&mut WaylandBackend)) -> bool {
-		let _guard = LIBEI_ENV_LOCK.lock().expect("lock LIBEI_SOCKET test");
+		let _guard = ENV_LOCK.lock().expect("lock the compositor environment");
 		let socket = std::env::temp_dir().join(format!("omp-libei-test-{}", std::process::id()));
 		let _ = std::fs::remove_file(&socket);
 		let listener = UnixListener::bind(&socket).expect("bind fake libei socket");
@@ -338,7 +369,7 @@ mod tests {
 	/// restarting compositor's does. The accessibility bus is unreachable too,
 	/// so the fallback listing is what decides the outcome.
 	fn with_unreachable_compositor(action: impl FnOnce(&mut WaylandBackend)) {
-		let guard = LIBEI_ENV_LOCK.lock().expect("lock LIBEI_SOCKET test");
+		let guard = ENV_LOCK.lock().expect("lock the compositor environment");
 		let previous_bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
 		let previous_niri = std::env::var_os("NIRI_SOCKET");
 		unsafe {
