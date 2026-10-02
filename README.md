@@ -2,7 +2,7 @@
 
 This fork of [oh-my-pi](https://github.com/can1357/oh-my-pi) improves desktop computer use specifically for **Linux Wayland**.
 
-Upstream base: [v18.4.10](https://github.com/can1357/oh-my-pi/releases/tag/v18.4.10).
+Upstream base: [v18.4.12](https://github.com/can1357/oh-my-pi/releases/tag/v18.4.12).
 
 ## Linux Wayland improvements
 
@@ -15,7 +15,7 @@ Upstream base: [v18.4.10](https://github.com/can1357/oh-my-pi/releases/tag/v18.4
 - Read window and workspace state on demand, with unknown flags left absent instead of reported as `false`, and move windows by exact IDs from discovery.
 
 Native capture requires a Linux build with the `wayland-pipewire` feature and system PipeWire libraries.
-See the [local build and verification notes](LOCAL-PIPEWIRE-BUILD.md).
+See the [Linux build guide](LOCAL-PIPEWIRE-BUILD.md).
 The local compile helper accepts `OMP_LOCAL_OUTFILE` to select the output path.
 Per-window Wayland input remains unavailable, and AX access depends on each application's AT-SPI registration.
 
