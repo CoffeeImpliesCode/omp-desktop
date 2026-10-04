@@ -18,7 +18,7 @@
 - Clarified computer control guidance: focus can warp the pointer, `Timeout` can leave applied effects, and screenshot frames expire before native dispatch.
 - Clarified computer AX reference lifetime: the current and immediately previous generations remain valid.
 - Local standalone builds now write to `packages/coding-agent/dist/omp-linux-x64` by default. `OMP_LOCAL_OUTFILE` still selects another destination.
-- Updated the desktop fork to upstream 18.5.1 while retaining Linux Wayland desktop controls and portable build instructions.
+- Updated the desktop fork to upstream 18.6.0 while retaining Linux Wayland desktop controls and portable build instructions.
 - Browser relay opens now create dedicated background tabs, and screenshots leave the user's foreground tab in place; `app.target` explicitly borrows an existing tab ([#14060](https://github.com/can1357/oh-my-pi/pull/14060) by [@nnnnoel](https://github.com/nnnnoel)).
 - Automatic computer AX trees now use a 16 KiB UTF-8 budget without splitting rows ([#13692](https://github.com/can1357/oh-my-pi/pull/13692) by [@will-bogusz](https://github.com/will-bogusz)).
 
@@ -29,6 +29,22 @@
 - Missing computer windows now report bounded available-window candidates ([#13655](https://github.com/can1357/oh-my-pi/pull/13655) by [@will-bogusz](https://github.com/will-bogusz)).
 - Concurrent computer Eval cells now queue safely and keep cancellation, screenshots, and AX feedback isolated.
 - Computer screenshots now preserve the saved PNG pixel frame through model delivery.
+
+## [18.6.0] - 2026-10-03
+
+### Added
+
+- The `/models` Roles view shows which saved model preset is in effect, and Ctrl+←/→ (or `p`/`P` on the role rows, for macOS where Ctrl+←/→ switches Spaces) switches to the next or previous one, in Tern and text mode ([#14210](https://github.com/can1357/oh-my-pi/pull/14210) by [@H4vC](https://github.com/H4vC))
+
+### Changed
+
+- Picking a model for a role in `/models` now puts the cursor on the model list, so ↑/↓ choose a model and Enter assigns it right away instead of moving through the sidebar and dropping the role selection; ← still reaches the providers ([#14210](https://github.com/can1357/oh-my-pi/pull/14210) by [@H4vC](https://github.com/H4vC))
+- Sped up secret redaction on long conversations: it no longer slows down as history grows ([#14213](https://github.com/can1357/oh-my-pi/pull/14213) by [@H4vC](https://github.com/H4vC))
+- Startup is faster with plugins that bundle large dependency trees: the extension loader no longer re-reads and re-checks the same files while loading them (e.g. ~280 ms → ~185 ms with the IDA MCP plugin) ([#14219](https://github.com/can1357/oh-my-pi/pull/14219) by [@H4vC](https://github.com/H4vC))
+
+### Fixed
+
+- Fixed an `EPIPE: broken pipe` unhandled rejection crashing the session when a debug adapter, eval kernel, IDA worker, or RPC server exits mid-write (seen on Windows) ([#14196](https://github.com/can1357/oh-my-pi/pull/14196) by [@andrebrait](https://github.com/andrebrait))
 
 ## [18.5.1] - 2026-10-03
 
