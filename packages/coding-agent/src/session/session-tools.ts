@@ -1537,9 +1537,14 @@ export class SessionTools {
 			role: "custom",
 			customType: EVAL_PRELUDE_NOTICE_MESSAGE_TYPE,
 			content: prompt.render(evalPreludeNoticePrompt, {
-				added: added.map(definition => ({ name: definition.name, summary: evalPreludeSummary(definition) })),
-				removed,
 				canRead,
+				added: added.map(definition => ({
+					name: definition.name,
+					summary: evalPreludeSummary(definition),
+					delivery: definition.documentationDelivery,
+				})),
+				deliveredDocs: added.some(definition => definition.documentationDelivery !== undefined),
+				removed,
 				sections: added.flatMap(definition => [
 					...(canRead ? [] : [definition.documentation.trim()]),
 					...(definition.guidance ? [definition.guidance.trim()] : []),

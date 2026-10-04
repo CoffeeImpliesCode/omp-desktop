@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Relay opens now create dedicated background tabs and close only tabs created by omp; `app.target` explicitly borrows an existing tab ([#14060](https://github.com/can1357/oh-my-pi/pull/14060) by [@nnnnoel](https://github.com/nnnnoel)).
+
 ## [18.5.1] - 2026-10-03
 
 ### Fixed

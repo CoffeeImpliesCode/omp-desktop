@@ -1,3 +1,4 @@
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { DesktopCapabilities } from "@oh-my-pi/pi-natives";
 import { withTimeout } from "@oh-my-pi/pi-utils/async";
 import * as logger from "@oh-my-pi/pi-utils/logger";
@@ -23,6 +24,16 @@ const SMOKE_TIMEOUT_MS = 5_000;
 // the first ensure may load the desktop addon, so it shares the start budget.
 const CAPABILITIES_TIMEOUT_MS = 10_000;
 const RESTART_MESSAGE = "computer worker restarted; captures and ax refs were reset";
+// Budget for re-reading what one cell's input touched: a settle delay, then one
+// tree read per touched window within the worker's own read budget.
+const SETTLE_TIMEOUT_MS = 15_000;
+
+/** What one settle answers with: the report text, and the frames it repeats. */
+export interface ComputerSettleReport {
+	text?: string;
+	/** Frames the report shows; callers mark them `detail: "original"` as for any computer capture. */
+	images?: ImageContent[];
+}
 
 /** Runs desktop scripts and owns their persistent worker session. */
 export interface ComputerController {
@@ -33,6 +44,25 @@ export interface ComputerController {
 		signal?: AbortSignal,
 	): Promise<ComputerRunOk>;
 	capabilities(snapshot: ComputerSessionSnapshot, signal?: AbortSignal): Promise<DesktopCapabilities | undefined>;
+	/**
+	 * Report what the eval cell that just ended left behind: each window its
+	 * input touched, re-read and marked against the model's last tree of it,
+	 * and windows it opened, closed or focused. `output` is what the cell
+	 * printed, so trees the cell's code read but did not print are not taken as
+	 * seen. Undefined when there is nothing to report. Controllers without it
+	 * report nothing.
+	 */
+	settle?(
+		snapshot: ComputerSessionSnapshot,
+		output: string,
+		signal?: AbortSignal,
+	): Promise<ComputerSettleReport | undefined>;
+	/**
+	 * Forget what an eval cell left pending: it was cancelled and will never
+	 * settle. A notification, not a request — nothing is answered, captured or
+	 * reported, and a cell that failed without being cancelled is untouched.
+	 */
+	discardCell?(cellId: string): void;
 	close(): Promise<void>;
 }
 
@@ -212,6 +242,45 @@ export class ComputerSupervisor implements ComputerController {
 			signal?.removeEventListener("abort", abort);
 			this.#pending.delete(id);
 		}
+	}
+
+	async settle(
+		snapshot: ComputerSessionSnapshot,
+		output: string,
+		signal?: AbortSignal,
+	): Promise<ComputerSettleReport | undefined> {
+		if (this.#closed) throw new ToolError("Computer session is closed");
+		if (signal?.aborted) throw new ToolAbortError();
+		await this.#start();
+		if (signal?.aborted) throw new ToolAbortError();
+
+		const id = `computer-settle-${++this.#nextId}`;
+		const { promise, resolve, reject } = Promise.withResolvers<ComputerRunOk>();
+		const pending: PendingRun = { resolve, reject, signal, toolCalls: new Map() };
+		this.#pending.set(id, pending);
+		const abort = (): void => {
+			this.#safeSend({ type: "abort", id });
+			for (const controller of pending.toolCalls.values()) controller.abort(signal?.reason);
+		};
+		if (signal?.aborted) abort();
+		else signal?.addEventListener("abort", abort, { once: true });
+
+		try {
+			this.#worker?.send({ type: "settle", id, timeoutMs: SETTLE_TIMEOUT_MS, session: snapshot, output });
+			const { returnValue, displays } = await this.#raceWithGrace(promise, SETTLE_TIMEOUT_MS);
+			const text = typeof returnValue === "string" ? returnValue : undefined;
+			const images = displays.filter((block): block is ImageContent => block.type === "image");
+			if (text === undefined && images.length === 0) return undefined;
+			return { text, images };
+		} finally {
+			signal?.removeEventListener("abort", abort);
+			this.#pending.delete(id);
+		}
+	}
+
+	discardCell(cellId: string): void {
+		if (this.#closed) return;
+		this.#safeSend({ type: "discard", cellId });
 	}
 
 	#start(): Promise<void> {

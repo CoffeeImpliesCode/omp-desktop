@@ -138,7 +138,7 @@ function makeWedgeTab(scope: SharedTargetScope, options: WedgeOptions = {}): Tab
 		info: {},
 		pending: new Map(),
 		kindTag: "headless",
-		ownerSessionId: "session-wedge",
+		ownsPage: true,
 		persist: false,
 		lastActivityAt: Date.now(),
 		frozen: false,
@@ -231,7 +231,7 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 
 		getTabsMapForTest().set("logos-b2b", makeWedgeTab(scope));
 		await expect(releaseTab("logos-b2b", { timeoutMs: 60 })).rejects.toThrow(
-			`Timed out after 60ms closing headless browser tab "logos-b2b"; pending resource: orphan CDP target ${JSON.stringify(TARGET_ID)} (Page.close)`,
+			`Timed out after 60ms closing headless browser tab "logos-b2b"; pending resource: owned CDP target ${JSON.stringify(TARGET_ID)} (Target.closeTarget)`,
 		);
 
 		// The tab still leaves the map (the close is reported as failed)...

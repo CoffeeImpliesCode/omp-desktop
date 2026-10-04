@@ -17,6 +17,7 @@ import type {
 	SerializedAXNode,
 	Target,
 } from "puppeteer-core";
+import type { CdpBrowser } from "puppeteer-core/internal/cdp/Browser.js";
 import { JsRuntime, type RuntimeHooks } from "../../eval/js/shared/runtime";
 import { formatScreenshot, resizeImage } from "../../utils/image-resize";
 import { resolveToCwd } from "../path-utils";
@@ -992,15 +993,13 @@ async function targetIdForPage(page: Page): Promise<string> {
 	return await targetIdForTarget(page.target());
 }
 
-async function createTrackedHeadlessPage(browser: Browser, reportTarget: (targetId: string) => void): Promise<Page> {
-	const session = await browser.target().createCDPSession();
-	let targetId: string;
-	try {
-		({ targetId } = await session.send("Target.createTarget", { url: "about:blank" }));
-		reportTarget(targetId);
-	} finally {
-		await session.detach().catch(() => undefined);
-	}
+async function createTrackedPage(browser: Browser, reportTarget: (targetId: string) => void): Promise<Page> {
+	// The relay exposes a root connection but no attachable browser target, so
+	// the creation request must go through that root connection for every
+	// backend, not through a session on a browser target.
+	const cdpBrowser = browser as unknown as CdpBrowser;
+	const { targetId } = await cdpBrowser._connection.send("Target.createTarget", { url: "about:blank" });
+	reportTarget(targetId);
 	const existing = browser.targets().find(target => privateTargetId(target) === targetId);
 	const target =
 		existing ??
@@ -1008,7 +1007,7 @@ async function createTrackedHeadlessPage(browser: Browser, reportTarget: (target
 			timeout: BROWSER_PROTOCOL_TIMEOUT_MS,
 		}));
 	const page = await target.page();
-	if (!page) throw new ToolError(`Created headless target ${targetId} did not expose a page`);
+	if (!page) throw new ToolError(`Created target ${targetId} did not expose a page`);
 	return page;
 }
 
@@ -1119,15 +1118,25 @@ export function describeScreenshot(opts?: ScreenshotOptions): string {
 	if (opts?.fullPage) return "tab.screenshot({ fullPage: true })";
 	return "tab.screenshot()";
 }
+/**
+ * Get a page ready for capture without handing the user's foreground away.
+ *
+ * `activate` raises the tab. Otherwise the page must already be visible, which
+ * protects a borrowed user tab from silently capturing a hidden neighbour.
+ * An omp-owned page is the exception: it was created in the background with
+ * focus emulated, so capturing it must neither fail nor raise the user's tab.
+ */
 export async function preparePageForScreenshot(
 	page: Pick<Page, "bringToFront" | "evaluate">,
 	signal: AbortSignal | undefined,
 	activate: boolean,
+	ownedPage: boolean,
 ): Promise<void> {
 	if (activate) {
 		await untilAborted(signal, () => page.bringToFront()).catch(() => undefined);
 		return;
 	}
+	if (ownedPage) return;
 	const visible = await untilAborted(signal, () => page.evaluate(() => document.visibilityState === "visible")).catch(
 		() => false,
 	);
@@ -1158,6 +1167,8 @@ export class WorkerCore {
 	#isolated: boolean;
 	#uninstallRejectionGuard: () => void;
 	#mode?: WorkerInitPayload["mode"];
+	/** Whether this worker created the page and may therefore destroy it. */
+	#ownsPage = false;
 	#activateForScreenshot = true;
 	#dialogs?: RuntimeDialogController;
 	#network?: BrowserNetworkManager;
@@ -1271,7 +1282,12 @@ export class WorkerCore {
 	async #init(payload: WorkerInitPayload): Promise<void> {
 		try {
 			this.#mode = payload.mode;
-			this.#activateForScreenshot = payload.mode === "headless" || payload.activateForScreenshot !== false;
+			// A creating payload (headless or relay-open) always owns its page; an
+			// attach payload adopts the user's, unless the supervisor says it is
+			// recovering a tab it created earlier.
+			this.#ownsPage = payload.mode !== "attach" || payload.ownsPage === true;
+			this.#activateForScreenshot =
+				payload.mode === "headless" || (payload.mode === "attach" && payload.activateForScreenshot !== false);
 			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
 			registerSemanticQueryHandlers(puppeteer);
 			this.#browser = await puppeteer.connect({
@@ -1285,16 +1301,21 @@ export class WorkerCore {
 			// realm setup; page creation and the first navigation run under the ready
 			// wait.
 			this.#transport.send({ type: "setup" });
-			if (payload.mode === "headless") {
+			if (payload.mode !== "attach") {
 				// Create the target directly so its id is reportable before
 				// Puppeteer waits for target/page initialization. If that wait
 				// wedges, the supervisor can still close the created target.
-				this.#page = await createTrackedHeadlessPage(this.#browser, targetId => {
+				this.#page = await createTrackedPage(this.#browser, targetId => {
 					this.#transport.send({ type: "page-created", targetId });
 				});
 				this.#observeDialogs();
-				await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null });
-				if (payload.emulateViewport !== false) await applyViewport(this.#page, payload.viewport);
+				// Stealth and fixed device emulation are launch-profile concerns:
+				// the relay drives the user's own Chrome, where patching the
+				// browser or pinning the viewport would alter what they see.
+				if (payload.mode === "headless") {
+					await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null });
+					if (payload.emulateViewport !== false) await applyViewport(this.#page, payload.viewport);
+				}
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 			} else {
 				const target = await this.#findAttachedTarget(payload.targetId);
@@ -1309,7 +1330,7 @@ export class WorkerCore {
 				this.#observeDialogs();
 				if (payload.dialogs) this.#applyDialogPolicy(payload.dialogs);
 			}
-			if (payload.mode === "headless" || payload.emulateFocus) {
+			if (this.#ownsPage || (payload.mode === "attach" && payload.emulateFocus)) {
 				// Background Chromium tabs stop producing frames, stalling rAF,
 				// IntersectionObserver, and input acknowledgements. Keep owned tabs
 				// interactive without raising a window; explicit settle-freeze still applies.
@@ -1345,13 +1366,13 @@ export class WorkerCore {
 			this.#targetId = await targetIdForPage(this.#page);
 			this.#transport.send({ type: "ready", info: await this.#currentReadyInfo() });
 		} catch (error) {
-			// A failed headless init leaves the worker's page orphaned in the shared
-			// browser (the supervisor retries with a fresh worker), so close it before
-			// reporting. Attach mode adopts an existing target — never close it.
+			// Close only pages this attempt created. An attach mode that adopts a
+			// target the supervisor still needs (a retry after a failed init
+			// recovers the same owned page) must leave it alive for the retry.
 			const page = this.#page;
 			await this.#webmcp?.dispose().catch(() => undefined);
 			this.#webmcp = undefined;
-			if (payload.mode === "headless" && page && !page.isClosed()) {
+			if (payload.mode !== "attach" && page && !page.isClosed()) {
 				await page.close().catch(() => undefined);
 			}
 			this.#transport.send({ type: "init-failed", error: errorPayload(error) });
@@ -2512,7 +2533,7 @@ export class WorkerCore {
 		opts: ScreenshotOptions = {},
 	): Promise<string | ScreenshotChangeResult> {
 		const page = this.#requirePage();
-		await preparePageForScreenshot(page, signal, this.#activateForScreenshot);
+		await preparePageForScreenshot(page, signal, this.#activateForScreenshot, this.#ownsPage);
 		screenshotQuality(opts);
 		const threshold = screenshotThreshold(opts.threshold);
 		const changeDetection = opts.ifChanged === true || opts.threshold !== undefined;
@@ -2614,7 +2635,7 @@ export class WorkerCore {
 		opts: DiffScreenshotOptions = {},
 	): Promise<DiffScreenshotResult> {
 		const page = this.#requirePage();
-		await preparePageForScreenshot(page, signal, this.#activateForScreenshot);
+		await preparePageForScreenshot(page, signal, this.#activateForScreenshot, this.#ownsPage);
 		const absoluteBaseline = resolveToCwd(baselinePath, session.cwd);
 		const baseline = await untilAborted(signal, () => fs.promises.readFile(absoluteBaseline));
 		const current = await captureScreenshotBuffer(page, {}, signal, async () => null, "png");
@@ -2899,7 +2920,7 @@ export class WorkerCore {
 		await this.#tracing?.dispose();
 		await this.#consoleCapture.detach();
 		this.#emulation?.dispose();
-		if (this.#mode === "headless" && page && !page.isClosed()) await page.close().catch(() => undefined);
+		if (this.#ownsPage && page && !page.isClosed()) await page.close().catch(() => undefined);
 		if (this.#browser?.connected) this.#browser.disconnect();
 		this.#transport.send({ type: "closed" });
 		this.#transport.close();

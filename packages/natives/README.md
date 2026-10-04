@@ -63,6 +63,11 @@ bun run build
 bun run check
 ```
 
+For local Cargo builds, `OMP_NATIVE_FEATURES` adds comma-separated Cargo feature
+names to the build. `wayland-pipewire` remains enabled even when this variable is
+set. The native build driver rejects feature requests for Bazel, cross-target,
+and prebuilt-artifact builds rather than ignoring them.
+
 ## Architecture
 
 `@oh-my-pi/pi-natives` publishes a small core package plus generated

@@ -7,6 +7,7 @@
 - Added niri IPC display and window enumeration and exact native window capture, including windows without AT-SPI support.
 - Added `DesktopSession.control()`, `listWorkspaces()`, and `windowState()` with backend-reported window-control operations for niri and X11.
 - Added exact-target window close, movement, resize, state, workspace, and display controls. Unsupported compositor operations fail before mutation instead of using keyboard or pointer fallbacks.
+- Local native builds now accept additive Cargo features through `OMP_NATIVE_FEATURES` while keeping Wayland PipeWire capture enabled ([#14058](https://github.com/can1357/oh-my-pi/pull/14058) by [@justdoGIT](https://github.com/justdoGIT)).
 
 ### Changed
 
@@ -24,6 +25,9 @@
 - Delivered X11 close requests as `WM_PROTOCOLS` messages carrying `WM_DELETE_WINDOW`, without force-killing clients.
 - Preserved exact decorated X11 client origins during movement and left position and unrequested size axes unchanged in resize requests.
 - Kept X11 centering on the window's monitor and used the active workspace's panel reservations; corrected the root subject of workspace-focus requests.
+- Fixed Wayland text input using keymaps whose shared file descriptor is at EOF or whose groups have numeric labels, and kept Enter mapped to its control key ([#13848](https://github.com/can1357/oh-my-pi/issues/13848)).
+- Kept libei input waiting for every granted device to become ready and bounded discovery even under continuous events ([#13210](https://github.com/can1357/oh-my-pi/pull/13210) by [@Komzpa](https://github.com/Komzpa)).
+- Allowed X11 startup when inherited Wayland sockets are stale without falling back on permission or live-session failures ([#10752](https://github.com/can1357/oh-my-pi/pull/10752) by [@jake8302](https://github.com/jake8302)).
 
 ## [18.5.1] - 2026-10-03
 

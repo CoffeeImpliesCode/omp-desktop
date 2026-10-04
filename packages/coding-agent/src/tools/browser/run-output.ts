@@ -21,7 +21,9 @@ export class RunOutput {
 	/** Append a `display()` payload (image/json/status), flushing buffered text first. */
 	pushDisplay(output: JsDisplayOutput): void {
 		if (output.type === "image") {
-			this.push({ type: "image", data: output.data, mimeType: output.mimeType });
+			const image: ImageContent = { type: "image", data: output.data, mimeType: output.mimeType };
+			if (output.detail !== undefined) image.detail = output.detail;
+			this.push(image);
 			return;
 		}
 		if (output.type === "json") {

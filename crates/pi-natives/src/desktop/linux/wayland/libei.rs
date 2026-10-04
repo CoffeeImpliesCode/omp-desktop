@@ -22,6 +22,12 @@ use crate::desktop::{
 	keys::KeyName,
 };
 
+/// Budget for the devices the portal granted to appear. Every handled event
+/// re-checks it, so a peer that keeps sending setup events cannot postpone it,
+/// and it is elapsed time rather than a count of loop iterations or wakeups.
+const DEVICE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Extra window once the granted devices are there, so the rest of the initial
+/// burst still lands: other monitors and the announced modifier state.
 const DEVICE_DISCOVERY_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const DRAG_STEP_DELAY: Duration = Duration::from_millis(8);
 
@@ -233,10 +239,24 @@ impl Libei {
 			return Ok(());
 		}
 		runtime.block_on(async {
-			let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+			let deadline = tokio::time::Instant::now() + DEVICE_DISCOVERY_TIMEOUT;
 			let mut drain_deadline = None;
 			loop {
-				let until = drain_deadline.unwrap_or(deadline).min(deadline);
+				let now = tokio::time::Instant::now();
+				let until = drain_deadline.unwrap_or(deadline);
+				if now >= until {
+					if targets.is_complete(
+						self.has_capability(DeviceCapability::PointerAbsolute),
+						self.has_capability(DeviceCapability::Keyboard),
+					) {
+						break;
+					}
+					return Err(DesktopError::input_failed(if drain_deadline.is_some() {
+						"libei device discovery ended before every granted device resumed"
+					} else {
+						"libei device discovery timed out"
+					}));
+				}
 				let event = match tokio::time::timeout_at(until, events.next()).await {
 					Ok(Some(event)) => event.map_err(|err| {
 						DesktopError::input_failed(format!("libei device discovery: {err}"))
@@ -244,7 +264,9 @@ impl Libei {
 					Ok(None) => {
 						return Err(DesktopError::input_failed("libei disconnected during discovery"));
 					},
-					Err(_) => break,
+					// Out of budget. Re-read the clock and completeness above
+					// instead of reporting a discovery that never arrived.
+					Err(_) => continue,
 				};
 				self.handle_event(event)?;
 				// Drain the initial burst even after the first matching devices:
@@ -701,35 +723,29 @@ fn read_keymap(keymap: &Keymap) -> Option<KeyboardLayout> {
 /// Resolves only through the active XKB group. Falling back to a key from a
 /// different group would emit the wrong glyph because libei cannot request a
 /// portable compositor group switch, so printable misses are reported.
+///
+/// Control characters and ASCII on a US group resolve to fixed evdev keys
+/// first, before the keymap is consulted at all: a French keymap binds `'\n'`
+/// to `<LNFD>`, and `type("…\n")` has to press Enter regardless of layout.
 fn char_stroke(layout: Option<&mut KeyboardLayout>, character: char) -> CoreResult<KeyStroke> {
-	if let Some(layout) = layout {
-		if character.is_ascii()
-			&& layout.can_use_us_ascii_fast_path()
-			&& let Some((keycode, shift)) = evdev_char(character)
-		{
-			return Ok(KeyStroke { keycode, modifiers: if shift { vec![42] } else { Vec::new() } });
-		}
-		if let Some(stroke) = layout.resolve_char(character) {
-			return Ok(stroke);
-		}
-		if character.is_control()
-			&& let Some((keycode, shift)) = evdev_char(character)
-		{
-			return Ok(KeyStroke { keycode, modifiers: if shift { vec![42] } else { Vec::new() } });
-		}
-		return Err(DesktopError::input_failed(format!(
-			"libei cannot type character {character:?} in active XKB group {}",
-			layout.active_group()
-		)));
-	}
-	if character.is_control()
-		&& let Some((keycode, shift)) = evdev_char(character)
-	{
+	let us_ascii = layout
+		.as_deref()
+		.is_some_and(KeyboardLayout::can_use_us_ascii_fast_path);
+	let fixed_key = character.is_control() || (character.is_ascii() && us_ascii);
+	if fixed_key && let Some((keycode, shift)) = evdev_char(character) {
 		return Ok(KeyStroke { keycode, modifiers: if shift { vec![42] } else { Vec::new() } });
 	}
-	Err(DesktopError::input_failed(format!(
-		"libei cannot type character {character:?}: no usable XKB keymap was announced"
-	)))
+	let Some(layout) = layout else {
+		return Err(DesktopError::input_failed(format!(
+			"libei cannot type character {character:?}: no usable XKB keymap was announced"
+		)));
+	};
+	layout.resolve_char(character).ok_or_else(|| {
+		DesktopError::input_failed(format!(
+			"libei cannot type character {character:?} in active XKB group {}",
+			layout.active_group()
+		))
+	})
 }
 
 fn evdev_keycode(key: KeyName) -> CoreResult<u32> {
@@ -842,12 +858,24 @@ fn evdev_char(character: char) -> Option<(u32, bool)> {
 
 #[cfg(test)]
 mod tests {
+	use std::{
+		fs::File,
+		io::{ErrorKind, Write},
+		os::fd::{FromRawFd, OwnedFd},
+		sync::{
+			Arc, LazyLock, Mutex, MutexGuard,
+			atomic::{AtomicBool, Ordering},
+		},
+		time::Instant,
+	};
+
+	use reis::{PendingRequestResult, eis, handshake};
+
 	use super::*;
+	use crate::desktop::error::ErrorCode;
 
 	#[test]
 	fn drag_motions_and_release_are_spaced_for_event_consumers() {
-		use std::time::Instant;
-
 		let started = Instant::now();
 		let mut previous = started;
 		let mut received = Vec::new();
@@ -878,11 +906,381 @@ mod tests {
 		assert!(discrete_detents(f64::from(i32::MAX)).is_err());
 	}
 
-	#[test]
-	fn discovery_waits_for_every_granted_device() {
-		let targets = DiscoveryTargets { pointer: true, keyboard: true };
+	const FR: &str = include_str!("testdata/fr.xkb");
+	/// How often the scripted EIS peer polls its socket.
+	const PEER_POLL: Duration = Duration::from_millis(1);
+	/// Long enough for the fixture thread to record what the client sent, short
+	/// enough that a lost write fails the test instead of stalling the suite.
+	const PEER_RECORD_TIMEOUT: Duration = Duration::from_secs(5);
+	/// A peer that announces this many deviceless seats keeps the connection
+	/// busy without ever resuming anything.
+	const SEAT_FLOOD: usize = 512;
 
-		assert!(!targets.is_complete(false, true));
-		assert!(targets.is_complete(true, true));
+	/// What the scripted peer announces once the handshake is answered.
+	type Announce = Box<dyn FnOnce(&eis::Connection) + Send>;
+
+	/// The fixture runtime plus the lock that keeps two fixture tests from
+	/// driving it at once. `Libei` borrows its runtime for `'static`, so the
+	/// runtime is process-wide exactly like the shared portal runtime; nextest
+	/// already isolates each test in its own process, and the lock keeps
+	/// `cargo test`'s single binary honest. Time is real, so the discovery
+	/// tests that must reach the production deadline cost that much wall
+	/// clock; nextest runs them in parallel.
+	fn fixture_runtime() -> (&'static tokio::runtime::Runtime, MutexGuard<'static, ()>) {
+		static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
+			tokio::runtime::Builder::new_current_thread()
+				.enable_io()
+				.enable_time()
+				.build()
+				.expect("build the fixture runtime")
+		});
+		static DRIVER: Mutex<()> = Mutex::new(());
+		let locked = DRIVER.lock();
+		let guard = locked.unwrap_or_else(std::sync::PoisonError::into_inner);
+		(&RUNTIME, guard)
+	}
+
+	/// The scripted EIS peer. Dropping it stops the fixture thread, so a failing
+	/// assertion cannot leave a thread reading a closed socket.
+	struct Peer {
+		stop:     Arc<AtomicBool>,
+		keys:     Arc<Mutex<Vec<u32>>>,
+		thread:   Option<thread::JoinHandle<()>>,
+		/// Holds the fixture runtime for as long as this peer exists.
+		_runtime: MutexGuard<'static, ()>,
+	}
+
+	impl Peer {
+		fn spawn(announce: Announce, runtime: MutexGuard<'static, ()>) -> (UnixStream, Self) {
+			let (client, server) = UnixStream::pair().expect("pair the EIS fixture sockets");
+			let stop = Arc::new(AtomicBool::new(false));
+			let keys = Arc::new(Mutex::new(Vec::new()));
+			let thread_keys = Arc::clone(&keys);
+			let thread_stop = Arc::clone(&stop);
+			let serve = move || serve_eis(server, announce, thread_keys, thread_stop);
+			let handle = thread::spawn(serve);
+			(client, Self { stop, keys, thread: Some(handle), _runtime: runtime })
+		}
+
+		/// Key codes the client pressed, waiting for `count` of them so the
+		/// assertion does not race the fixture thread.
+		fn key_presses(&self, count: usize) -> Vec<u32> {
+			let deadline = Instant::now() + PEER_RECORD_TIMEOUT;
+			loop {
+				let keys = self.keys.lock().expect("lock the recorded key presses");
+				if keys.len() >= count || Instant::now() >= deadline {
+					return keys.clone();
+				}
+				drop(keys);
+				thread::sleep(PEER_POLL);
+			}
+		}
+	}
+
+	impl Drop for Peer {
+		fn drop(&mut self) {
+			self.stop.store(true, Ordering::Relaxed);
+			if let Some(handle) = self.thread.take() {
+				let _ = handle.join();
+			}
+		}
+	}
+
+	/// Answers the handshake, hands the announced burst to the client, then
+	/// records the key requests the client emulates until the test stops the
+	/// peer.
+	fn serve_eis(
+		socket: UnixStream,
+		announce: Announce,
+		keys: Arc<Mutex<Vec<u32>>>,
+		stop: Arc<AtomicBool>,
+	) {
+		let opened = eis::Context::new(socket);
+		let context = opened.expect("open the EIS fixture context");
+		let mut handshaker = handshake::EisHandshaker::new(&context, 1);
+		let connection = loop {
+			if let Some(result) = context.pending_request() {
+				let PendingRequestResult::Request(request) = result else {
+					panic!("EIS fixture received an unparsable request");
+				};
+				let answered = handshaker.handle_request(request);
+				if let Some(response) = answered.expect("answer the handshake") {
+					break response.connection;
+				}
+				continue;
+			}
+			match context.read() {
+				Ok(_) => {},
+				// The fixture socket is non-blocking, so an empty queue is the
+				// normal case rather than a closed connection.
+				Err(err) if err.kind() == ErrorKind::WouldBlock => {
+					if stop.load(Ordering::Relaxed) {
+						return;
+					}
+					thread::sleep(PEER_POLL);
+				},
+				// The client went away: nothing left to announce or record.
+				Err(_) => return,
+			}
+		};
+
+		context.flush().expect("flush the handshake response");
+		// A real EIS announces its seats and devices immediately after the
+		// connection event, so they are already queued when the client looks.
+		announce(&connection);
+		context.flush().expect("flush the announced devices");
+
+		while !stop.load(Ordering::Relaxed) {
+			match context.read() {
+				Ok(_) => {},
+				Err(err) if err.kind() == ErrorKind::WouldBlock => {},
+				Err(_) => return,
+			}
+			while let Some(result) = context.pending_request() {
+				let PendingRequestResult::Request(request) = result else {
+					continue;
+				};
+				record_press(&keys, &request);
+			}
+			thread::sleep(PEER_POLL);
+		}
+	}
+
+	/// Remembers the key code of every key press the client emulated, which is
+	/// exactly what the compositor would have typed.
+	fn record_press(keys: &Mutex<Vec<u32>>, request: &eis::Request) {
+		let eis::Request::Keyboard(_, eis::keyboard::Request::Key { key, state }) = request else {
+			return;
+		};
+		if *state == eis::keyboard::KeyState::Press {
+			keys.lock().expect("record a key press").push(*key);
+		}
+	}
+
+	/// A `Libei` that has completed its handshake against the scripted peer,
+	/// before any device has been discovered.
+	fn handshaken_backend(announce: Announce) -> (Libei, EiConvertEventStream, Peer) {
+		let (runtime, driver) = fixture_runtime();
+		let (socket, peer) = Peer::spawn(announce, driver);
+		let context = ei::Context::new(socket).expect("open the client context");
+		let sender = ei::handshake::ContextType::Sender;
+		let reply = context.handshake_tokio("omp-test", sender);
+		let completed =
+			runtime.block_on(async { tokio::time::timeout(Duration::from_secs(5), reply).await });
+		let answered = completed.expect("the fixture peer answered the handshake");
+		let negotiated = answered.expect("handshake with the fixture peer");
+		let (connection, events) = negotiated;
+		let backend = Libei {
+			context,
+			devices: Vec::new(),
+			connection: Some(connection),
+			sequence: 1,
+			runtime,
+			events: None,
+			disconnected: false,
+			portal_session: None,
+		};
+		(backend, events, peer)
+	}
+
+	/// Runs the same discovery `Libei::new` runs, so the fixtures below cover
+	/// the production entry point rather than a test-only variant.
+	fn discover(backend: &mut Libei, events: &mut EiConvertEventStream) -> CoreResult<()> {
+		let runtime = backend.runtime;
+		let targets = DiscoveryTargets::ALL;
+		backend.discover_devices(runtime, events, targets)
+	}
+
+	/// A fresh memfd holding `text`, with its shared offset left at EOF exactly
+	/// where a compositor that just serialized the keymap leaves it.
+	fn memfd(text: &str) -> File {
+		// SAFETY: `memfd_create` returns a fresh descriptor or -1, which the
+		// assertion rejects; ownership moves into `File` exactly once.
+		let mut file = unsafe {
+			let fd = libc::memfd_create(c"keymap".as_ptr(), 0);
+			assert!(fd >= 0, "memfd_create failed");
+			File::from_raw_fd(fd)
+		};
+		let written = file.write_all(text.as_bytes());
+		written.expect("write the keymap");
+		file
+	}
+
+	/// Builds a layout the way `read_keymap` does: a memfd holding the
+	/// serialized keymap, duplicated so the shared offset stays at EOF.
+	fn announced_layout(keymap: &str) -> Option<KeyboardLayout> {
+		let composer = memfd(keymap);
+		let reader = OwnedFd::from(composer.try_clone().expect("duplicate the keymap fd"));
+		KeyboardLayout::from_fd(reader, keymap.len())
+	}
+
+	/// Announces the burst a compositor sends once `ei_connection.connection`
+	/// is out: one seat carrying an absolute pointer and a keyboard, both
+	/// resumed. `keymap` is handed over as a keymap fd left at EOF, which is
+	/// what every real EIS does.
+	fn announce_pointer_and_keyboard(keymap: Option<&'static str>) -> Announce {
+		Box::new(move |connection: &eis::Connection| {
+			let seat = connection.seat(1);
+			seat.name("omp-fixture");
+			seat.capability(0b11, "ei_pointer_absolute");
+			seat.capability(0b11, "ei_keyboard");
+			seat.done();
+
+			let pointer = seat.device(1);
+			pointer.name("fixture pointer");
+			pointer.device_type(eis::device::DeviceType::Virtual);
+			pointer.region(0, 0, 1920, 1080, 1.0);
+			pointer.interface::<eis::PointerAbsolute>(1);
+			pointer.done();
+			pointer.resumed(2);
+
+			let keyboard = seat.device(1);
+			keyboard.name("fixture keyboard");
+			keyboard.device_type(eis::device::DeviceType::Virtual);
+			let interface = keyboard.interface::<eis::Keyboard>(1);
+			if let Some(keymap) = keymap {
+				let composer = memfd(keymap);
+				let bytes = keymap.len() as u32;
+				let fd = composer.as_fd();
+				interface.keymap(eis::keyboard::KeymapType::Xkb, bytes, fd);
+			}
+			keyboard.done();
+			keyboard.resumed(3);
+		})
+	}
+
+	/// Announces the same seat but never resumes a keyboard: the portal granted
+	/// one the EIS implementation then fails to hand over.
+	fn announce_pointer_without_keyboard() -> Announce {
+		Box::new(|connection: &eis::Connection| {
+			let seat = connection.seat(1);
+			seat.name("omp-fixture");
+			seat.capability(0b11, "ei_pointer_absolute");
+			seat.done();
+
+			let pointer = seat.device(1);
+			pointer.name("fixture pointer");
+			pointer.device_type(eis::device::DeviceType::Virtual);
+			pointer.region(0, 0, 1920, 1080, 1.0);
+			pointer.interface::<eis::PointerAbsolute>(1);
+			pointer.done();
+			pointer.resumed(2);
+		})
+	}
+
+	/// Seats that carry no device at all: a peer that keeps the connection busy
+	/// with events but never resumes anything.
+	fn announce_idle_seats(count: usize) -> Announce {
+		Box::new(move |connection: &eis::Connection| {
+			for _ in 0..count {
+				let seat = connection.seat(1);
+				seat.name("omp-fixture-idle");
+				seat.capability(0b11, "ei_pointer_absolute");
+				seat.capability(0b11, "ei_keyboard");
+				seat.done();
+			}
+		})
+	}
+
+	#[test]
+	fn newline_presses_enter_even_when_the_keymap_binds_linefeed() {
+		let compiled = announced_layout(FR);
+		let mut layout = compiled.expect("French fixture must compile");
+		// The keymap really does bind `\n` to `<LNFD>` (evdev keycode 101).
+		let linefeed = KeyStroke { keycode: 101, modifiers: Vec::new() };
+		assert_eq!(layout.resolve_char('\n'), Some(linefeed));
+
+		let resolved = char_stroke(Some(&mut layout), '\n');
+		let newline = resolved.expect("newline must resolve");
+		assert_eq!(newline.keycode, 28);
+	}
+
+	#[test]
+	fn types_the_announced_layout_through_a_keymap_fd_left_at_end_of_file() {
+		let announce = announce_pointer_and_keyboard(Some(FR));
+		let (mut backend, mut events, peer) = handshaken_backend(announce);
+		let result = discover(&mut backend, &mut events);
+		result.expect("the announced keyboard must be discovered");
+		backend.events = Some(events);
+
+		let typed = backend.type_text("a");
+		typed.expect("type through the announced keymap");
+
+		// `<AD01>` is `a` at evdev keycode 16 on this French keymap; 30 is the
+		// US `a` a layout-less type would send.
+		assert_eq!(peer.key_presses(1), vec![16]);
+	}
+
+	/// Keyboard state is re-read from the event stream before every chord, so
+	/// without one there is nothing to type against. Refusing here is what
+	/// keeps a stale device table from typing the wrong glyph later.
+	#[test]
+	fn typing_without_a_live_event_stream_sends_no_input() {
+		let announce = announce_pointer_and_keyboard(None);
+		let (mut backend, mut events, peer) = handshaken_backend(announce);
+		let result = discover(&mut backend, &mut events);
+		result.expect("the announced keyboard must be discovered");
+
+		let typed = backend.type_text("a");
+		let error = typed.expect_err("typing without an event stream must be refused");
+
+		assert_eq!(error.code, ErrorCode::InputFailed);
+		assert!(peer.key_presses(0).is_empty(), "no key may reach the compositor");
+	}
+
+	#[test]
+	fn discovery_uses_events_the_peer_queued_right_after_the_handshake() {
+		let announce = announce_pointer_and_keyboard(None);
+		let (mut backend, mut events, _peer) = handshaken_backend(announce);
+
+		let result = discover(&mut backend, &mut events);
+		result.expect("queued devices must still be discovered");
+
+		assert!(backend.has_capability(DeviceCapability::PointerAbsolute));
+		assert!(backend.has_capability(DeviceCapability::Keyboard));
+	}
+
+	#[test]
+	fn discovery_refuses_a_peer_that_never_resumes_a_device() {
+		let (mut backend, mut events, _peer) = handshaken_backend(announce_idle_seats(0));
+		let result = discover(&mut backend, &mut events);
+		let error = result.expect_err("a silent peer is not a discovery");
+
+		assert_eq!(error.code, ErrorCode::InputFailed);
+		assert!(!backend.has_capability(DeviceCapability::PointerAbsolute));
+		assert!(!backend.has_capability(DeviceCapability::Keyboard));
+	}
+
+	/// A keyboard the portal granted but the EIS implementation never resumes
+	/// leaves the active group and modifier state unverifiable, so nothing may
+	/// be typed on it. The half-arrived pointer proves discovery really ran.
+	#[test]
+	fn an_unresumed_granted_keyboard_blocks_all_input() {
+		let announce = announce_pointer_without_keyboard();
+		let (mut backend, mut events, peer) = handshaken_backend(announce);
+		let result = discover(&mut backend, &mut events);
+		let error = result.expect_err("half a granted session is not a discovery");
+
+		// The pointer did arrive, so discovery made progress and still has to
+		// refuse rather than hand back a backend that rejects every keystroke
+		// later with nothing the caller can act on.
+		assert!(backend.has_capability(DeviceCapability::PointerAbsolute));
+		assert_eq!(error.code, ErrorCode::InputFailed);
+		assert!(!backend.has_capability(DeviceCapability::Keyboard));
+		assert!(peer.key_presses(0).is_empty(), "no key may reach the compositor");
+	}
+
+	/// A peer that answers with endless setup events and never resumes
+	/// anything must not be able to postpone the deadline: each handled event
+	/// has to re-check it, or the session waits for the compositor to go away.
+	#[test]
+	fn an_event_storm_cannot_postpone_the_discovery_deadline() {
+		let announce = announce_idle_seats(SEAT_FLOOD);
+		let (mut backend, mut events, _peer) = handshaken_backend(announce);
+		let result = discover(&mut backend, &mut events);
+		let error = result.expect_err("a peer that only keeps talking must not stall discovery");
+
+		assert_eq!(error.code, ErrorCode::InputFailed);
+		assert!(!backend.has_capability(DeviceCapability::Keyboard));
 	}
 }

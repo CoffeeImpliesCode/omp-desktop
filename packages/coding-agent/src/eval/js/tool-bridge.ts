@@ -6,7 +6,7 @@ import type { ToolSession } from "../../tools";
 import { committedTodoPhases } from "../../tools/todo";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { schemaDeclaresIntentField } from "../../utils/tool-schema";
-import { findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
+import { type EvalPreludeCell, findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
 import { EVAL_AGENT_BRIDGE_NAME, type EvalAgentHandleResult, runEvalAgent } from "../agent-bridge";
 import { EVAL_BUDGET_BRIDGE_NAME, type EvalBudgetResult, runEvalBudget } from "../budget-bridge";
 import { withBridgeTimeoutPause } from "../bridge-timeout";
@@ -40,6 +40,8 @@ export interface ToolBridgeOptions {
 	emitStatus?: (event: JsStatusEvent) => void;
 	identity?: RuntimeCallIdentity;
 	shadowCell?: EvalShadowCellSession;
+	/** The eval cell this call runs in, forwarded to prelude handlers. */
+	cell?: EvalPreludeCell;
 }
 
 type ToolValue =
@@ -56,7 +58,7 @@ type ToolValue =
 	| {
 			text: string;
 			details?: unknown;
-			images?: Array<{ mimeType: string; data: string }>;
+			images?: Array<{ mimeType: string; data: string; detail?: "auto" | "low" | "high" | "original" }>;
 			hasError?: boolean;
 	  };
 function toolResultHasError(result: AgentToolResult): boolean {
@@ -158,7 +160,9 @@ export function bridgeValueFromToolResult(
 			content.type === "text" && typeof content.text === "string",
 	);
 	const imageBlocks = result.content.filter(
-		(content): content is { type: "image"; mimeType: string; data: string } =>
+		(
+			content,
+		): content is { type: "image"; mimeType: string; data: string; detail?: "auto" | "low" | "high" | "original" } =>
 			content.type === "image" && typeof content.mimeType === "string" && typeof content.data === "string",
 	);
 	const text = textBlocks.map(block => block.text).join("");
@@ -170,7 +174,7 @@ export function bridgeValueFromToolResult(
 	if (result.details === undefined && imageBlocks.length === 0 && !hasError) return text;
 	const value: Exclude<ToolValue, string> = { text, details: result.details };
 	if (imageBlocks.length > 0) {
-		value.images = imageBlocks.map(block => ({ mimeType: block.mimeType, data: block.data }));
+		value.images = imageBlocks.map(block => ({ mimeType: block.mimeType, data: block.data, detail: block.detail }));
 	}
 	if (hasError) value.hasError = true;
 	return value;
@@ -212,6 +216,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 					session: options.session,
 					toolCallId,
 					signal: options.signal,
+					cell: options.cell,
 					context: options.session.getToolContext?.(),
 				}),
 			);

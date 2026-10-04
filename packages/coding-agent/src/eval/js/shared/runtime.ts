@@ -31,6 +31,11 @@ export interface RuntimeHooks {
 	callTool(name: string, args: unknown, identity?: RuntimeCallIdentity): Promise<unknown>;
 }
 
+/** An image resolution hint as the transports spell it; an unknown value drops it. */
+function imageDetail(value: unknown): "auto" | "low" | "high" | "original" | undefined {
+	return value === "auto" || value === "low" || value === "high" || value === "original" ? value : undefined;
+}
+
 /**
  * Bridged tool results carry image blocks as a base64 `images` array that no
  * cell code consumes. Emit each block as an image display output so the model
@@ -45,9 +50,9 @@ function surfaceBridgedToolImages(value: unknown, hooks: RuntimeHooks): unknown 
 	let displayed = 0;
 	for (const image of images) {
 		if (!image || typeof image !== "object") continue;
-		const { data, mimeType } = image as { data?: unknown; mimeType?: unknown };
+		const { data, mimeType, detail } = image as { data?: unknown; mimeType?: unknown; detail?: unknown };
 		if (typeof data !== "string" || typeof mimeType !== "string") continue;
-		hooks.onDisplay({ type: "image", data, mimeType });
+		hooks.onDisplay({ type: "image", data, mimeType, detail: imageDetail(detail) });
 		displayed++;
 	}
 	if (displayed === 0) return value;
@@ -559,7 +564,7 @@ export class JsRuntime {
 			if (record.type === "image" && typeof record.mimeType === "string") {
 				const data = coerceImageBase64(record.data);
 				if (data !== null) {
-					hooks.onDisplay({ type: "image", data, mimeType: record.mimeType });
+					hooks.onDisplay({ type: "image", data, mimeType: record.mimeType, detail: imageDetail(record.detail) });
 					return;
 				}
 				logger.warn("js displayValue: dropping image with unrecognized data shape", {

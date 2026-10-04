@@ -9,13 +9,19 @@ import type {
 import type { ImageContent, ToolExample } from "@oh-my-pi/pi-ai";
 import { formatBackgroundNotice } from "@oh-my-pi/pi-tui/tools/bash";
 import { parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
-import { isRecord, prompt } from "@oh-my-pi/pi-utils";
+import { isRecord, logger, prompt } from "@oh-my-pi/pi-utils";
 import { raceJobSettlement, resolveAutoBackgroundWaitMs } from "../async";
 import { jsBackend, pythonBackend } from "../eval";
 import type { ExecutorBackend, ExecutorBackendResult } from "../eval/backend";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../eval/bridge-timeout";
 import { IdleTimeout } from "../eval/idle-timeout";
-import { type EvalPreludeDefinition, evalPreludeSummary, getEnabledEvalPreludes } from "../eval/preludes";
+import {
+	type EvalPreludeDefinition,
+	type EvalPreludeSettleReply,
+	evalPreludeSummary,
+	getEnabledEvalPreludes,
+	runWithEvalPreludeCell,
+} from "../eval/preludes";
 import { prepareEvalSource } from "../eval/input";
 import type { BackendProbeOptions } from "../eval/probe";
 import { defaultEvalSessionId } from "../eval/session-id";
@@ -214,7 +220,7 @@ export interface EvalToolDescriptionOptions {
 	/** Point blocked callers at the `wait` tool; false when the session lacks it (subagents). Default: true. */
 	waitTool?: boolean;
 	/** Enabled preludes; each becomes an `xd://eval/<name>` doc topic. */
-	preludes?: readonly Pick<EvalPreludeDefinition, "name" | "documentation">[];
+	preludes?: readonly Pick<EvalPreludeDefinition, "name" | "documentation" | "documentationDelivery">[];
 	/**
 	 * Inline every doc topic instead of linking `xd://eval/<topic>`. Required
 	 * when the session cannot `read` (the only transport for topic docs).
@@ -261,13 +267,17 @@ export function getEvalDocTopics(options: EvalToolDescriptionOptions = {}): Reco
 
 /** Model-facing eval description: core kernel surface plus one pointer per doc topic. */
 export function getEvalToolDescription(options: EvalToolDescriptionOptions = {}): string {
-	const preludes: { name: string; summary: string }[] = [];
+	const preludes: { name: string; summary: string; delivery?: string }[] = [];
+	let deliveredDocs = false;
 	for (const prelude of options.preludes ?? []) {
 		const summary = evalPreludeSummary(prelude);
-		if (summary) preludes.push({ name: prelude.name, summary });
+		if (!summary) continue;
+		preludes.push({ name: prelude.name, summary, delivery: prelude.documentationDelivery });
+		if (prelude.documentationDelivery !== undefined) deliveredDocs = true;
 	}
 	return prompt.render(evalDescription, {
 		...evalTemplateContext(options),
+		deliveredDocs,
 		preludes,
 		inlineTopics: options.inlineTopics ? Object.values(getEvalDocTopics(options)).join("\n\n") : undefined,
 	});
@@ -937,55 +947,82 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				pushUpdate();
 
 				const startTime = Date.now();
+				// Prelude calls this cell makes carry `preludeCell`; each prelude may
+				// append what the cell left behind once it has settled.
+				const preludeCell = { signal: combinedSignal };
 				let result: ExecutorBackendResult;
 				try {
-					result = await backend.execute(cell.code, {
-						cwd: session.cwd,
-						sessionId,
-						sessionFile: sessionFile ?? undefined,
-						kernelOwnerId,
-						signal: combinedSignal,
-						session,
-						idleTimeoutMs,
-						reset: cell.reset,
-						filename: cell.filename,
-						packages: cell.packages,
-						environment: cell.environment,
-						onChunk: chunk => {
-							outputSink!.push(chunk);
-						},
-						onStatus: event => {
-							if (event.op === EVAL_TIMEOUT_PAUSE_OP) {
-								idle?.pause();
-								return;
-							}
-							if (event.op === EVAL_TIMEOUT_RESUME_OP) {
-								idle?.resume();
-								return;
-							}
-							cellResult.statusEvents ??= [];
-							upsertStatusEvent(cellResult.statusEvents, {
-								...event,
-								resolvedThinkingLevel: parseConfiguredThinkingLevel(
-									typeof event.resolvedThinkingLevel === "string" ? event.resolvedThinkingLevel : undefined,
-								),
-							});
-							pushUpdate();
-						},
-					});
+					result = await runWithEvalPreludeCell(preludeCell, () =>
+						backend.execute(cell.code, {
+							cwd: session.cwd,
+							sessionId,
+							sessionFile: sessionFile ?? undefined,
+							kernelOwnerId,
+							signal: combinedSignal,
+							session,
+							idleTimeoutMs,
+							reset: cell.reset,
+							filename: cell.filename,
+							packages: cell.packages,
+							environment: cell.environment,
+							onChunk: chunk => {
+								outputSink!.push(chunk);
+							},
+							onStatus: event => {
+								if (event.op === EVAL_TIMEOUT_PAUSE_OP) {
+									idle?.pause();
+									return;
+								}
+								if (event.op === EVAL_TIMEOUT_RESUME_OP) {
+									idle?.resume();
+									return;
+								}
+								cellResult.statusEvents ??= [];
+								upsertStatusEvent(cellResult.statusEvents, {
+									...event,
+									resolvedThinkingLevel: parseConfiguredThinkingLevel(
+										typeof event.resolvedThinkingLevel === "string" ? event.resolvedThinkingLevel : undefined,
+									),
+								});
+								pushUpdate();
+							},
+						}),
+					);
 				} finally {
 					idle?.dispose();
 					// Publish the cell's last live state before its final output replaces it.
 					flushUpdate();
 					activeLiveCell = undefined;
 				}
+				const preludeReplies: string[] = [];
+				// Settle images join the cell's own displays, so they are noted alike.
+				const displayOutputs = [...result.displayOutputs];
+				if (!result.cancelled) {
+					const failed = result.exitCode !== undefined && result.exitCode !== 0;
+					for (const prelude of getEnabledEvalPreludes(session.getEvalPreludes?.() ?? [])) {
+						let reply: EvalPreludeSettleReply | undefined;
+						try {
+							reply = await prelude.settleCell?.(preludeCell, { failed, output: result.output });
+						} catch (error) {
+							// One prelude's settle must not cost the cell its output.
+							logger.warn("Eval prelude settle failed", {
+								prelude: prelude.name,
+								error: error instanceof Error ? error.message : String(error),
+							});
+						}
+						if (reply?.text) preludeReplies.push(reply.text);
+						for (const image of reply?.images ?? []) displayOutputs.push(image);
+					}
+				}
+				// Settling is part of the cell as the model sees it, including a cancellation that lands during it.
+				const cancelled = result.cancelled || combinedSignal.aborted;
 				const durationMs = Date.now() - startTime;
 
 				const cellStatusEvents: EvalStatusEvent[] = [];
 				const cellDisplayTexts: string[] = [];
 				const cellImageNotes: string[] = [];
 				let cellHasMarkdown = false;
-				for (const output of result.displayOutputs) {
+				for (const output of displayOutputs) {
 					if (output.type === "json") {
 						const formatted = formatDisplayJson(output.data, artifactPath !== undefined);
 						const label = `display[${cellDisplayTexts.length + 1}]:\n`;
@@ -1000,6 +1037,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						}
 					}
 					if (output.type === "image") {
+						if (output.detail === "original") {
+							// Already the capped native capture saved beside it: rescaling
+							// would break the promise that the model sees those exact pixels.
+							images.push({ ...output });
+							continue;
+						}
 						const resized = await resizeImage(
 							{
 								type: "image",
@@ -1045,10 +1088,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				const displayText = cellDisplayTexts.join("\n\n");
 				const visibleDisplayText =
 					displayText && imageText ? `${displayText}\n\n${imageText}` : displayText || imageText;
-				const cellOutput =
-					stdoutTrimmed && visibleDisplayText
-						? `${stdoutTrimmed}\n\n${visibleDisplayText}`
-						: stdoutTrimmed || visibleDisplayText;
+				const cellOutput = [stdoutTrimmed, visibleDisplayText, ...preludeReplies]
+					.filter(text => text !== "")
+					.join("\n\n");
 				cellResult.output = cellOutput;
 				cellResult.exitCode = result.exitCode;
 				cellResult.durationMs = durationMs;
@@ -1060,12 +1102,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					appendTail(cellOutput);
 				}
 
-				if (result.cancelled || (result.exitCode !== 0 && result.exitCode !== undefined)) {
+				if (cancelled || (result.exitCode !== 0 && result.exitCode !== undefined)) {
 					cellResult.status = "error";
 					pushUpdate();
 					const combinedOutput = cellOutputs.join("\n\n");
 					const exitLine = `Command exited with code ${result.exitCode}`;
-					const outputText = result.cancelled
+					const outputText = cancelled
 						? combinedOutput || result.output || "Command aborted"
 						: combinedOutput
 							? `${combinedOutput}\n\n${exitLine}`

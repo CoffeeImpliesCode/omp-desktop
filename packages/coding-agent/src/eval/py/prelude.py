@@ -471,7 +471,13 @@ if "__omp_prelude_loaded__" not in globals():
             mime_type = image.get("mimeType")
             if not isinstance(data, str) or not isinstance(mime_type, str):
                 continue
-            _omp_display({mime_type: data}, raw=True)
+            bundle = {mime_type: data}
+            # A frame captured as `original` is already the capture saved beside it:
+            # without this the host would rescale and re-encode those exact pixels.
+            detail = image.get("detail")
+            if detail in ("auto", "low", "high", "original"):
+                bundle["detail"] = detail
+            _omp_display(bundle, raw=True)
             displayed += 1
         if displayed == 0:
             return value

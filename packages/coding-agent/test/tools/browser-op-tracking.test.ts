@@ -52,7 +52,7 @@ describe("browser screenshot activation", () => {
 			},
 		};
 
-		await preparePageForScreenshot(page as ScreenshotPage, undefined, true);
+		await preparePageForScreenshot(page as ScreenshotPage, undefined, true, true);
 
 		expect(activations).toBe(1);
 	});
@@ -66,7 +66,7 @@ describe("browser screenshot activation", () => {
 			evaluate: async () => true,
 		};
 
-		await preparePageForScreenshot(page as ScreenshotPage, undefined, false);
+		await preparePageForScreenshot(page as ScreenshotPage, undefined, false, false);
 
 		expect(activations).toBe(0);
 	});
@@ -77,8 +77,25 @@ describe("browser screenshot activation", () => {
 			evaluate: async () => false,
 		};
 
-		await expect(preparePageForScreenshot(page as ScreenshotPage, undefined, false)).rejects.toThrow(
+		await expect(preparePageForScreenshot(page as ScreenshotPage, undefined, false, false)).rejects.toThrow(
 			"The attached browser tab is not visible",
 		);
+	});
+
+	it("captures an owned background page without raising the user's tab", async () => {
+		let activations = 0;
+		const page = {
+			bringToFront: async () => {
+				activations += 1;
+			},
+			evaluate: async () => false,
+		};
+
+		// omp creates its own relay pages in the background and emulates their
+		// focus, so a screenshot must neither fail for being hidden nor steal
+		// the user's foreground tab.
+		await preparePageForScreenshot(page as ScreenshotPage, undefined, false, true);
+
+		expect(activations).toBe(0);
 	});
 });

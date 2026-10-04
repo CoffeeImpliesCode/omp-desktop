@@ -1,3 +1,4 @@
+import type { ImageContent } from "@oh-my-pi/pi-ai";
 import type { EvalLanguage, EvalStatusEvent } from "@oh-my-pi/pi-tui/tools/eval";
 
 /** Kernel-defined tool metadata exposed to task subagents. */
@@ -14,6 +15,6 @@ export type EvalToolInvokeResult = { ok: true; value: unknown } | { ok: false; e
 /** Display output captured during eval execution across supported backends. */
 export type EvalDisplayOutput =
 	| { type: "json"; data: unknown }
-	| { type: "image"; data: string; mimeType: string }
+	| { type: "image"; data: string; mimeType: string; detail?: ImageContent["detail"] }
 	| { type: "markdown"; text?: string }
 	| { type: "status"; event: EvalStatusEvent };

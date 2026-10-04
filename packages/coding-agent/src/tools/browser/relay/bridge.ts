@@ -146,6 +146,8 @@ class TabState {
 	attached = false;
 	/** Set when attach failed or the user cancelled the debugger; cleared on navigation. */
 	banned = false;
+	/** Only tabs created by a downstream createTarget may be closed by the relay. */
+	createdByRelay = false;
 	/** Whether targets for this tab were announced to discovering connections. */
 	announced = false;
 	attaching: Promise<boolean> | null = null;
@@ -678,6 +680,17 @@ export class RelayBridge {
 			this.#replyError(conn, msg, `No tab with key ${tabKey}`);
 			return;
 		}
+		// A session-scoped target close is still a browser-level close: routing
+		// it through the browser handler keeps the ownership check in one place
+		// instead of trusting the session that issued it.
+		if (msg.method === "Target.closeTarget") {
+			await this.#handleBrowserCommand(conn, msg);
+			return;
+		}
+		if (msg.method === "Page.close" && !tab.createdByRelay) {
+			this.#replyError(conn, msg, "Refusing to close a borrowed user tab");
+			return;
+		}
 		const inst = this.#instances.get(tab.instanceId);
 		if (!inst || !inst.socket) {
 			this.#replyError(conn, msg, "relay extension is not connected");
@@ -860,6 +873,8 @@ export class RelayBridge {
 				this.#onTabUpsert(result.tab, inst.instanceId);
 				// Creating a tab is an explicit act of driving it.
 				const createdKey = tabKeyOf(inst.code, result.tab.tabId);
+				const createdTab = this.#tabs.get(createdKey);
+				if (createdTab) createdTab.createdByRelay = true;
 				this.#claimTab(conn, createdKey);
 				this.#reply(conn, msg, { targetId: pageTargetIdFromKey(createdKey) });
 				return;
@@ -873,6 +888,10 @@ export class RelayBridge {
 				const removedTab = this.#tabs.get(parsed.key);
 				if (!removedTab) {
 					this.#replyError(conn, msg, `No target with id ${String(msg.params?.targetId)}`);
+					return;
+				}
+				if (!removedTab.createdByRelay) {
+					this.#replyError(conn, msg, "Refusing to close a borrowed user tab");
 					return;
 				}
 				await this.#rpc({ op: "removeTab", tabId: removedTab.tabId }, this.#instanceFor(removedTab));

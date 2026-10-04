@@ -11,6 +11,12 @@ export interface ComputerSessionSnapshot {
 	captureMaxHeight: number;
 	display: string;
 	readOnly: boolean;
+	/**
+	 * Opaque identity of the eval cell this request belongs to, stable across
+	 * that cell's runs and its settle. Absent for callers that are not eval
+	 * cells; the worker then treats each request id as its own cell.
+	 */
+	cellId?: string;
 }
 
 /** Reply envelope for a session tool invoked by desktop JavaScript. */
@@ -22,6 +28,16 @@ export type ComputerWorkerInbound =
 	| { type: "run"; id: string; code: string; timeoutMs: number; session: ComputerSessionSnapshot }
 	| { type: "capabilities"; id: string; session: ComputerSessionSnapshot }
 	| { type: "abort"; id: string }
+	/**
+	 * Forget everything an eval cell left pending: it was cancelled and will
+	 * never settle. Answered by nothing, and never captured or reported.
+	 */
+	| { type: "discard"; cellId: string }
+	/**
+	 * Re-read what the cell that just ended touched; the result's `returnValue` is the report text or undefined.
+	 * `output` is what the cell printed: an `ax()` tree it carries counts as seen by the model.
+	 */
+	| { type: "settle"; id: string; timeoutMs: number; session: ComputerSessionSnapshot; output: string }
 	| { type: "tool-reply"; id: string; reply: ToolReply }
 	| { type: "close" };
 

@@ -14,12 +14,17 @@ export interface PythonStatusEvent {
 
 export type KernelDisplayOutput =
 	| { type: "json"; data: unknown }
-	| { type: "image"; data: string; mimeType: string }
+	| { type: "image"; data: string; mimeType: string; detail?: "auto" | "low" | "high" | "original" }
 	| { type: "markdown" }
 	| { type: "status"; event: PythonStatusEvent };
 
 function normalizeDisplayText(text: string): string {
 	return text.endsWith("\n") ? text : `${text}\n`;
+}
+
+/** An image resolution hint as the transports spell it; an unknown value drops it. */
+function imageDetail(value: unknown): "auto" | "low" | "high" | "original" | undefined {
+	return value === "auto" || value === "low" || value === "high" || value === "original" ? value : undefined;
 }
 
 /** Render a MIME bundle into text + structured outputs. */
@@ -44,11 +49,13 @@ export async function renderKernelDisplay(content: Record<string, unknown>): Pro
 		return { text: "", outputs };
 	}
 
+	// An `original` resolution hint rides along: the frame is already the capture saved beside it.
+	const detail = imageDetail(data["detail"]);
 	if (typeof data["image/png"] === "string") {
-		outputs.push({ type: "image", data: data["image/png"] as string, mimeType: "image/png" });
+		outputs.push({ type: "image", data: data["image/png"] as string, mimeType: "image/png", detail });
 	}
 	if (typeof data["image/jpeg"] === "string") {
-		outputs.push({ type: "image", data: data["image/jpeg"] as string, mimeType: "image/jpeg" });
+		outputs.push({ type: "image", data: data["image/jpeg"] as string, mimeType: "image/jpeg", detail });
 	}
 	if (data["application/json"] !== undefined) {
 		outputs.push({ type: "json", data: data["application/json"] });

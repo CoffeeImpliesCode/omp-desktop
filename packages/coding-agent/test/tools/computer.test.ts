@@ -1,12 +1,15 @@
-import { afterAll, describe, expect, it } from "bun:test";
+import { afterAll, describe, expect, it, spyOn } from "bun:test";
 import { createContext, runInContext } from "node:vm";
+import { scheduler } from "node:timers/promises";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/preludes";
 import { disposeAllKernelSessions, executePython } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { computerApproval, createComputerPrelude } from "@oh-my-pi/pi-coding-agent/tools/computer";
 import { isReadOnlyComputerCall, renderComputerCall } from "@oh-my-pi/pi-coding-agent/tools/computer/call";
 import type {
+	ComputerRunOk,
 	ComputerSessionSnapshot,
 	ComputerWorkerInbound,
 	ComputerWorkerOutbound,
@@ -14,10 +17,12 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/tools/computer/protocol";
 import {
 	type ComputerController,
+	type ComputerSettleReport,
 	ComputerSupervisor,
 	type ComputerWorkerHandle,
 } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
 import { ComputerWorkerCore, type NativeDesktopSession } from "@oh-my-pi/pi-coding-agent/tools/computer/worker";
+import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import type {
 	AxNode,
 	AxQuery,
@@ -32,6 +37,7 @@ import type {
 	DesktopWorkspace,
 	PointerOptions,
 } from "@oh-my-pi/pi-natives";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 import { cfgComputerEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
 
@@ -185,6 +191,17 @@ interface FakeSessionOptions {
 	displays?: DesktopDisplay[];
 }
 
+/** One captured frame; `displays` rides desktop captures, in the capture's own pixels. */
+interface FakeFrame {
+	data: Uint8Array;
+	width: number;
+	height: number;
+	sourceWidth: number;
+	sourceHeight: number;
+	target: string;
+	displays?: DesktopDisplay[];
+}
+
 /** One modeled window: its listed descriptor plus the state a control action changes. */
 interface FakeWindow {
 	descriptor: DesktopWindow;
@@ -211,6 +228,10 @@ class FakeNativeSession implements NativeDesktopSession {
 	clickCount = 0;
 	closeCount = 0;
 	controlCount = 0;
+	/** Capture caps each `capture()` call was given, in order. */
+	captureCaps: Array<{ maxWidth?: number; maxHeight?: number }> = [];
+	/** Frame the captures answer with; the fixed 64×32 frame when unset. */
+	captureFrame?: (target: string) => FakeFrame;
 	/** Actions that reached the native boundary, including ones the backend itself refuses. */
 	readonly receivedActions: DesktopControlAction[] = [];
 	sourceWidth = 64;
@@ -259,15 +280,10 @@ class FakeNativeSession implements NativeDesktopSession {
 	async listWindows(): Promise<DesktopWindow[]> {
 		return this.#windows.map(candidate => ({ ...candidate.descriptor }));
 	}
-	async capture(target: string): Promise<{
-		data: Uint8Array;
-		width: number;
-		height: number;
-		sourceWidth: number;
-		sourceHeight: number;
-		target: string;
-	}> {
+	async capture(target: string, caps?: { maxWidth?: number; maxHeight?: number } | null): Promise<FakeFrame> {
+		this.captureCaps.push({ ...caps });
 		this.#frames.add(target);
+		if (this.captureFrame) return this.captureFrame(target);
 		return {
 			data: Uint8Array.of(137, 80, 78, 71),
 			width: 64,
@@ -620,11 +636,206 @@ async function runWorker(
 	code: string,
 	readOnly = false,
 	timeoutMs = 2_000,
+	cellId?: string,
 ): Promise<Extract<ComputerWorkerOutbound, { type: "result" }>> {
-	transport.inbound({ type: "run", id, code, timeoutMs, session: snapshot(readOnly) });
+	transport.inbound({ type: "run", id, code, timeoutMs, session: { ...snapshot(readOnly), cellId } });
 	const message = await transport.waitFor(candidate => candidate.type === "result" && candidate.id === id);
 	if (message.type !== "result") throw new Error(`Expected computer result, received ${message.type}`);
 	return message;
+}
+
+/** Settles the cell that just ended; `output` is what that cell printed. */
+async function settleRun(
+	transport: MemoryTransport,
+	id: string,
+	output = "",
+	cellId?: string,
+): Promise<Extract<ComputerWorkerOutbound, { type: "result" }>> {
+	// The `settle` verb arrives with the post-input report; the cast keeps this
+	// request typed by its own shape rather than the protocol's earlier union.
+	transport.inbound({
+		type: "settle",
+		id,
+		timeoutMs: 5_000,
+		session: { ...snapshot(true), cellId },
+		output,
+	} as unknown as ComputerWorkerInbound);
+	const message = await transport.waitFor(candidate => candidate.type === "result" && candidate.id === id);
+	if (message.type !== "result") throw new Error(`Expected computer result, received ${message.type}`);
+	return message;
+}
+
+/** What a settle answered with; a failed settle is a bug in the test, not a report. */
+async function settledPayload(
+	transport: MemoryTransport,
+	id: string,
+	output = "",
+	cellId?: string,
+): Promise<ComputerRunOk> {
+	const result = await settleRun(transport, id, output, cellId);
+	if (!result.ok) throw new Error(`settle ${id} failed: ${result.error.message}`);
+	return result.payload;
+}
+
+/** What a settle reported, or undefined when it had nothing to say. */
+async function settleWorker(transport: MemoryTransport, id: string, output = "", cellId?: string): Promise<unknown> {
+	const result = await settleRun(transport, id, output, cellId);
+	if (!result.ok) throw new Error(`settle ${id} failed: ${result.error.message}`);
+	return result.payload.returnValue;
+}
+
+/** A cell that prints the window's tree, settled: the model has now seen that tree. */
+async function readCell(transport: MemoryTransport, id: string): Promise<string> {
+	const read = await runWorker(transport, id, 'return await (await desktop.window("42")).ax()');
+	if (!read.ok) throw new Error(`read ${id} failed: ${read.error.message}`);
+	const tree = String(read.payload.returnValue);
+	expect(await settleWorker(transport, `${id}-settle`, tree)).toBeUndefined();
+	return tree;
+}
+
+/**
+ * A window whose tree answers inputs the way an app does: pressing "Edit"
+ * turns it into "Done" and reveals a field. Every snapshot mints fresh refs;
+ * like the native registry, the current and the previous snapshot's refs
+ * resolve and older ones throw `StaleRef`.
+ */
+class EditableWindowSession extends FakeNativeSession {
+	editing = false;
+	snapshots = 0;
+	/** Read-only rows added to the tree, to push a report past its byte budget. */
+	filler = 0;
+	/** A prose line after the rows, like the walk's truncation trailers. */
+	trailer = "";
+	/** Value of the window's text row, to vary it between reads. */
+	status = "Ready";
+	/** Whether the window refuses accessibility reads. */
+	axFails = false;
+	windows: DesktopWindow[] = [windowFixture];
+	#nextRef = 1;
+	#live = new Set<string>();
+	#previous = new Set<string>();
+
+	#resolves(ref: string): boolean {
+		return this.#live.has(ref) || this.#previous.has(ref);
+	}
+
+	override async listWindows(): Promise<DesktopWindow[]> {
+		return this.windows;
+	}
+
+	override async axSnapshot(): Promise<{ text: string }> {
+		if (this.axFails) throw new Error("AxFailed: window has no accessibility root");
+		this.snapshots += 1;
+		this.#previous = this.#live;
+		this.#live = new Set();
+		const ref = (): string => {
+			const minted = `e${this.#nextRef++}`;
+			this.#live.add(minted);
+			return minted;
+		};
+		const rows = [
+			`- window "Editor" [ref=${ref()}] app=Code (focused)`,
+			`  - toolbar [ref=${ref()}]`,
+			`    - button "${this.editing ? "Done" : "Edit"}" [ref=${ref()}]`,
+			...(this.editing ? [`    - textfield "Phone" [ref=${ref()}]: "555"`] : []),
+			`    - button "Share" [ref=${ref()}]`,
+			`  - statictext [ref=${ref()}]: "${this.status}"`,
+			...(this.filler > 0 ? [`  - list [ref=${ref()}]`] : []),
+			...Array.from(
+				{ length: this.filler },
+				(_, index) => `    - statictext "Row ${index} of the ${this.status} transcript" [ref=${ref()}]`,
+			),
+		];
+		return { text: [...rows, ...(this.trailer === "" ? [] : [this.trailer])].join("\n") };
+	}
+
+	override async axNode(ref: string): Promise<AxNode> {
+		if (!this.#resolves(ref)) throw new Error(`StaleRef: ${ref} expired; re-run ax()/find()`);
+		return { ...axNode, ref };
+	}
+
+	override async axPerform(ref: string, _action: string): Promise<void> {
+		if (!this.#resolves(ref)) throw new Error(`StaleRef: ${ref} expired; re-run ax()/find()`);
+		this.editing = !this.editing;
+	}
+}
+
+/** A controller carrying the settle verb a post-input report arrives through. */
+type SettlingController = ComputerController & {
+	settle(
+		runSnapshot: ComputerSessionSnapshot,
+		output: string,
+		signal?: AbortSignal,
+	): Promise<ComputerSettleReport | undefined>;
+};
+
+/** A controller that runs every call through a real worker core over `native`. */
+function workerController(native: NativeDesktopSession): SettlingController {
+	const transport = new MemoryTransport();
+	new ComputerWorkerCore(transport, () => native);
+	let runs = 0;
+	let settles = 0;
+	const controller: SettlingController = {
+		async run(code) {
+			const result = await runWorker(transport, `kernel-${++runs}`, code);
+			if (!result.ok) {
+				const error = result.error.isToolError
+					? new ToolError(result.error.message)
+					: new Error(result.error.message);
+				error.name = result.error.name;
+				throw error;
+			}
+			return result.payload;
+		},
+		async settle(_runSnapshot, output) {
+			const id = `settle-${++settles}`;
+			const result = await settleRun(transport, id, output);
+			if (!result.ok) throw new Error(`${id} failed: ${result.error.message}`);
+			const { returnValue, displays } = result.payload;
+			const text = typeof returnValue === "string" ? returnValue : undefined;
+			const images = displays.filter(block => block.type === "image");
+			return text === undefined && images.length === 0 ? undefined : { text, images };
+		},
+		async capabilities() {
+			return undefined;
+		},
+		async close() {},
+	};
+	return controller;
+}
+
+/** What a stubbed host controller answers with; every field is read per call. */
+interface StubController {
+	/** What a call resolves to, unless `failure` is set. */
+	value?: unknown;
+	/** Thrown by a call instead of answering. */
+	failure?: Error;
+	/** The post-input report a settle appends; undefined settles silently. */
+	report?: string;
+	/** Thrown by the settle instead of answering. */
+	settleFailure?: Error;
+	/** Runs inside the settle, before it answers. */
+	onSettle?: () => void;
+}
+
+/** A host controller that answers from the stub the test mutates between calls. */
+function stubController(stub: StubController): SettlingController {
+	const controller: SettlingController = {
+		async run() {
+			if (stub.failure) throw stub.failure;
+			return { displays: [], returnValue: stub.value, screenshots: [] };
+		},
+		async settle() {
+			stub.onSettle?.();
+			if (stub.settleFailure) throw stub.settleFailure;
+			return stub.report === undefined ? undefined : { text: stub.report };
+		},
+		async capabilities() {
+			return undefined;
+		},
+		async close() {},
+	};
+	return controller;
 }
 
 function toolSession(): ToolSession {
@@ -637,8 +848,25 @@ function toolSession(): ToolSession {
 	};
 }
 
+/** The identity a prelude sees for the eval cell its calls belong to. */
+type PreludeCell = { readonly signal: AbortSignal };
+
+/** What a prelude adds to a cell once that cell has ended. */
+interface SettleReply {
+	text?: string;
+	images?: Array<{ data: string; mimeType: string }>;
+}
+
+/** A prelude definition carrying the settle hook the host invokes after a cell. */
+type SettlingPrelude = EvalPreludeDefinition & {
+	settleCell?(cell: PreludeCell, outcome: { failed: boolean; output: string }): Promise<SettleReply | undefined>;
+};
+
+/** Host context carrying the cell a prelude call belongs to. */
+type CellAwareContext = Parameters<EvalPreludeDefinition["invoke"]>[1] & { cell?: PreludeCell };
+
 afterAll(async () => {
-	await disposeAllKernelSessions();
+	await Promise.all([disposeAllKernelSessions(), disposeAllVmContexts()]);
 });
 
 describe("computer prelude", () => {
@@ -1167,6 +1395,151 @@ describe("computer prelude", () => {
 		cfgComputerEnabled.override(session.settings, false);
 		expect(prelude.enabled?.()).toBe(false);
 	});
+
+	it("settles only cells whose code reached the desktop, and says when a settle fails", async () => {
+		const stub: StubController = { report: 'window "42" after press e3 — current tree:' };
+		const prelude = createComputerPrelude(toolSession(), () => stubController(stub)) as SettlingPrelude;
+		const press = {
+			action: "call",
+			chain: [
+				{ method: "ref", args: ["e3"] },
+				{ method: "press", args: [] },
+			],
+		};
+		const acting: PreludeCell = { signal: new AbortController().signal };
+		const idle: PreludeCell = { signal: new AbortController().signal };
+		const actingContext: CellAwareContext = { session: toolSession(), toolCallId: "press", cell: acting };
+		await prelude.invoke(press, actingContext);
+		expect(await prelude.settleCell?.(idle, { failed: false, output: "" })).toBeUndefined();
+		expect(await prelude.settleCell?.(acting, { failed: false, output: "" })).toEqual({
+			text: 'window "42" after press e3 — current tree:',
+		});
+		// Settled once: the cell is reported, not re-reported on every later turn.
+		expect(await prelude.settleCell?.(acting, { failed: false, output: "" })).toBeUndefined();
+
+		stub.settleFailure = new Error("computer worker restarted; captures and ax refs were reset");
+		const broken: PreludeCell = { signal: new AbortController().signal };
+		const brokenContext: CellAwareContext = { session: toolSession(), toolCallId: "press-2", cell: broken };
+		await prelude.invoke(press, brokenContext);
+		expect((await prelude.settleCell?.(broken, { failed: false, output: "" }))?.text).toContain(
+			"No post-input report for this cell (computer worker restarted",
+		);
+	});
+
+	it("appends the guide once per conversation to the cell of its first window lookup, hit or miss", async () => {
+		let conversation = "session-a";
+		let readActive = true;
+		const session: ToolSession = {
+			...toolSession(),
+			getSessionId: () => conversation,
+			isToolActive: (name: string) => name !== "read" || readActive,
+		};
+		const stub: StubController = { value: { id: "42", app: "Code", title: "main.ts", focused: true } };
+		// The turn a cell belongs to, aborted while that cell's report settles.
+		let abortedWhileSettling: AbortController | undefined;
+		stub.onSettle = () => abortedWhileSettling?.abort();
+		const prelude = createComputerPrelude(session, () => stubController(stub)) as SettlingPrelude;
+		/** Run one cell of direct calls (each `[method, …]` a chain), then settle it unless cancelled. */
+		const cell = async (chains: string[][], end: "settle" | "cancel" | "abort" = "settle") => {
+			const turn = new AbortController();
+			const current: PreludeCell = { signal: turn.signal };
+			for (const methods of chains) {
+				const chain = methods.map(method => ({
+					method,
+					args: method === "window" ? [{ app: "Reminders" }] : [],
+				}));
+				const context: CellAwareContext = { session, toolCallId: methods[0]!, cell: current };
+				await prelude.invoke({ action: "call", chain }, context).catch(() => undefined);
+			}
+			if (end === "cancel") {
+				turn.abort();
+				return undefined;
+			}
+			abortedWhileSettling = end === "abort" ? turn : undefined;
+			return (await prelude.settleCell?.(current, { failed: stub.failure !== undefined, output: "" }))?.text;
+		};
+
+		// Other calls, and window methods on a handle, never bring it.
+		expect(await cell([["windows"], ["window", "ax"]])).toBeUndefined();
+		// A miss brings it, caught or not; later lookups do not.
+		stub.failure = new ToolError('no window matches {"app":"Reminders"}');
+		expect(await cell([["window"]])).toContain(prelude.documentation!);
+		expect(await cell([["window"]])).toBeUndefined();
+		stub.failure = undefined;
+		expect(await cell([["focusedWindow"]])).toBeUndefined();
+		// A cancelled cell is never settled, and a turn aborted while settling is not answered, so the next
+		// lookup still brings it; so does a null focusedWindow().
+		conversation = "session-b";
+		stub.value = null;
+		expect(await cell([["focusedWindow"]], "cancel")).toBeUndefined();
+		expect(await cell([["focusedWindow"]], "abort")).toBeUndefined();
+		expect(await cell([["focusedWindow"]])).toContain(prelude.documentation!);
+		conversation = "session-a";
+		expect(await cell([["window"]])).toBeUndefined();
+		// A session without `read` has the guide inline in the eval description instead.
+		conversation = "session-c";
+		readActive = false;
+		expect(await cell([["window"]])).toBeUndefined();
+	});
+
+	it("puts the guide ahead of the post-input report of the first lookup's cell", async () => {
+		const session: ToolSession = { ...toolSession(), getSessionId: () => "session" };
+		const report = 'window "42" after press e3 — current tree:';
+		const prelude = createComputerPrelude(session, () =>
+			stubController({
+				value: { id: "42", app: "Code", title: "main.ts" },
+				report,
+			}),
+		) as SettlingPrelude;
+		const current: PreludeCell = { signal: new AbortController().signal };
+		const lookup: CellAwareContext = { session, toolCallId: "window", cell: current };
+		await prelude.invoke({ action: "call", chain: [{ method: "window", args: [{ app: "Code" }] }] }, lookup);
+
+		const text = (await prelude.settleCell?.(current, { failed: false, output: "" }))?.text ?? "";
+		expect(text).toContain(prelude.documentation!);
+		expect(text).toContain(report);
+		expect(text.indexOf(prelude.documentation!)).toBeLessThan(text.indexOf(report));
+	});
+
+	it("appends the guide after the first lookup's cell through the eval tool in JavaScript and Python", async () => {
+		const native = new FakeNativeSession();
+		native.listWindows = async () => [
+			windowFixture,
+			{ ...windowFixture, id: "67", app: "Reminders", title: "Reminders", pid: 11, focused: false },
+		];
+		let conversation = "js";
+		let definitions: readonly EvalPreludeDefinition[] = [];
+		const session: ToolSession = {
+			...toolSession(),
+			settings: Settings.isolated({ "computer.enabled": true, "async.enabled": false }),
+			getSessionId: () => conversation,
+			getEvalSessionId: () => `computer-guide-${conversation}`,
+			getEvalPreludes: () => definitions,
+		};
+		const prelude = createComputerPrelude(session, () => workerController(native));
+		definitions = [prelude];
+		const tool = new EvalTool(session);
+		const output = async (language: "js" | "py", code: string): Promise<string> =>
+			(await tool.execute(`guide-${language}-${crypto.randomUUID()}`, { language, code })).content
+				.map(block => (block.type === "text" ? block.text : ""))
+				.join("");
+		const guide = prelude.documentation!;
+
+		// A miss the cell swallows still brings it, after the cell's own output.
+		const swallowed = await output(
+			"js",
+			'try { await computer.window({ app: "Contacts" }); } catch {} print("after");',
+		);
+		expect(swallowed).toContain(guide);
+		expect(swallowed.indexOf("after")).toBeLessThan(swallowed.indexOf(guide));
+		expect(await output("js", 'print((await computer.window({ app: "Reminders" })).title);')).toBe("Reminders");
+
+		conversation = "py";
+		const failed = await output("py", 'await computer.window({"app": "Contacts"})');
+		expect(failed).toContain("Contacts");
+		expect(failed).toContain(guide);
+		expect(await output("py", 'print((await computer.window({"app": "Reminders"})).title)')).toBe("Reminders");
+	});
 });
 
 describe("computer worker round trips", () => {
@@ -1342,7 +1715,63 @@ describe("computer worker round trips", () => {
 			);
 			const result = await runWorker(transport, "numeric-miss", `await desktop.window(${id})`);
 			expect(result.ok).toBe(false);
-			if (!result.ok) expect(result.error.message).toBe(`no window matches ${id}`);
+			if (!result.ok) expect(result.error.message.split("\n")[0]).toBe(`no window matches ${id}`);
+		});
+	});
+
+	describe("window selector misses", () => {
+		const desktopWindows: DesktopWindow[] = [
+			windowFixture,
+			{ ...windowFixture, id: "43", title: "", focused: false },
+			{ ...windowFixture, id: "7", app: "Finder", title: "Downloads", pid: 9, focused: false },
+			{ ...windowFixture, id: "8", app: "TextEdit", title: "notes.txt", pid: 10, focused: false },
+			{ ...windowFixture, id: "9", app: "TextEdit", title: "draft.txt", pid: 10, focused: false },
+		];
+
+		async function missMessage(windows: DesktopWindow[], selector: string): Promise<string> {
+			const transport = new MemoryTransport();
+			const native = new FakeNativeSession({ windows });
+			native.listWindows = async () => windows;
+			new ComputerWorkerCore(transport, () => native);
+			const result = await runWorker(transport, "window-miss", `await desktop.window(${selector})`);
+			expect(result.ok).toBe(false);
+			return result.ok ? "" : result.error.message;
+		}
+
+		it("leads with the requested app's windows when its title filter misses", async () => {
+			const message = await missMessage(desktopWindows, '{ app: "textedit", title: "report" }');
+			const requestedApp = message.indexOf("notes.txt");
+			expect(requestedApp).toBeGreaterThanOrEqual(0);
+			expect(requestedApp).toBeLessThan(message.indexOf("Editor"));
+			expect(requestedApp).toBeLessThan(message.indexOf("Downloads"));
+		});
+
+		it("counts an app's untitled windows instead of leaving them out", async () => {
+			const lines = (await missMessage(desktopWindows, '{ app: "Calendar" }')).split("\n");
+			expect(lines).toContain('- Code: 42 "Editor", 1 untitled');
+			expect(lines).toContain('- Finder: 7 "Downloads"');
+			expect(lines).toContain('- TextEdit: 8 "notes.txt", 9 "draft.txt"');
+		});
+
+		it("keeps a newline in an app name from forging a row", async () => {
+			const forged = { ...windowFixture, id: "11", app: "Notes\n- Calendar: 404", title: "x", focused: false };
+			const message = await missMessage([...desktopWindows, forged], '{ app: "Calendar", title: "agenda" }');
+			expect(message.split("\n").filter(line => line.startsWith("- Calendar"))).toEqual([]);
+		});
+
+		it("bounds the listing on a desktop with many apps and long titles", async () => {
+			const crowded = Array.from({ length: 40 }, (_, app) =>
+				Array.from({ length: 4 }, (_, index) => ({
+					...windowFixture,
+					id: `${app}-${index}`,
+					app: `App ${String(app).padStart(2, "0")}`,
+					title: "t".repeat(300),
+					focused: false,
+				})),
+			).flat();
+			const message = await missMessage(crowded, '{ app: "Calendar" }');
+			expect(message.length).toBeLessThan(5_000);
+			expect(message.split("\n").at(-1)).toBe("- 28 more apps with 112 windows");
 		});
 	});
 
@@ -2106,5 +2535,714 @@ describe("computer supervisor recovery", () => {
 		const direct = await supervisor.capabilities(snapshot(true));
 		expect(direct).toEqual(capabilities);
 		await supervisor.close();
+	});
+});
+
+describe("computer cell settlement", () => {
+	/** A desktop capture twice the display's pixels, so pointer pixels are halved on the way in. */
+	const doubledFrame = (target: string): FakeFrame => ({
+		data: Uint8Array.of(137, 80, 78, 71),
+		width: 128,
+		height: 64,
+		sourceWidth: 128,
+		sourceHeight: 64,
+		target,
+		displays: [{ ...display, pixelWidth: 128, pixelHeight: 64 }],
+	});
+
+	/** The frames a settle showed the model alongside its report. */
+	const imageBlocks = (payload: ComputerRunOk) => payload.displays.filter(block => block.type === "image");
+
+	it("reports a touched window's tree marked against the model's last read, with live refs", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		expect(await readCell(transport, "read")).toContain('- button "Edit" [ref=e3]');
+		const press = await runWorker(transport, "press", 'await (await desktop.ref("e3")).press()');
+		expect(press.ok).toBe(true);
+
+		const report = await settleWorker(transport, "settle-press");
+		expect(report).toBe(
+			[
+				'window "42" Code "Editor" after press e3 — 1 changed, 1 added, 0 removed (rows marked ~ changed, + added):',
+				'- window "Editor" [ref=e6] app=Code (focused)',
+				"  - toolbar [ref=e7]",
+				'    ~ button "Done" [ref=e8] (was: button "Edit")',
+				'    + textfield "Phone" [ref=e9]: "555"',
+				'    - button "Share" [ref=e10]',
+				'  - statictext [ref=e11]: "Ready"',
+			].join("\n"),
+		);
+		// The printed refs are live: the next cell acts on them directly.
+		const next = await runWorker(transport, "press-done", 'await (await desktop.ref("e8")).press()');
+		expect(next.ok).toBe(true);
+		expect(native.editing).toBe(false);
+		expect(await settleWorker(transport, "settle-done")).toContain("after press e8 — 1 changed, 0 added, 1 removed");
+		// Nothing new since that read: a further settle has nothing to say.
+		expect(await settleWorker(transport, "settle-idle")).toBeUndefined();
+	});
+
+	it("reads an unchanged window once, so refs held before the cell still resolve", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		await readCell(transport, "read");
+		// A silent screenshot is not shown to the model: it does not put the window in pixel mode.
+		await runWorker(transport, "silent-shot", 'await (await desktop.window("42")).screenshot({ silent: true })');
+		await runWorker(transport, "key", 'await (await desktop.window("42")).press("shift")');
+		const before = native.snapshots;
+		const report = String(await settleWorker(transport, "settle-key"));
+		expect(native.snapshots).toBe(before + 1);
+		expect(report.split("\n")[0]).toMatch(
+			/after press shift — no accessibility change visible \d\.\d s after the input/,
+		);
+		expect(report).not.toContain("screenshot below");
+		const held = await runWorker(transport, "held", 'return (await desktop.ref("e3")).ref');
+		expect(held.ok && held.payload.returnValue).toBe("e3");
+	});
+
+	it("does not count a changed native object address as a change", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		native.status = "<AXUIElement 0x600003b2c0f0> {pid=123}";
+		await readCell(transport, "read");
+		native.status = "<AXUIElement 0x600003b2d9a0> {pid=123}";
+		await runWorker(transport, "key", 'await (await desktop.window("42")).press("shift")');
+		expect(String(await settleWorker(transport, "settle-key")).split("\n")[0]).toContain("no accessibility change");
+	});
+
+	it("skips the read-back when the cell printed the window's tree after its last input", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		await readCell(transport, "read");
+		const printed = await runWorker(
+			transport,
+			"press-then-read",
+			'const win = await desktop.window("42"); await (await desktop.ref("e3")).press(); return await win.ax()',
+		);
+		const before = native.snapshots;
+		expect(
+			await settleWorker(transport, "settle", String(printed.ok && printed.payload.returnValue)),
+		).toBeUndefined();
+		expect(native.snapshots).toBe(before);
+	});
+
+	it("reports a window whose tree the cell read after its input but did not print", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		await readCell(transport, "read");
+		await runWorker(
+			transport,
+			"press-then-discard",
+			'const win = await desktop.window("42"); await (await desktop.ref("e3")).press(); await win.ax(); return "done"',
+		);
+		// Marked against the tree the model saw, not the one the cell's code discarded.
+		expect(String(await settleWorker(transport, "settle", "done")).split("\n")[0]).toBe(
+			'window "42" Code "Editor" after press e3 — 1 changed, 1 added, 0 removed (rows marked ~ changed, + added):',
+		);
+	});
+
+	it("carries the current tree after a call fails on an expired ref, without a separate read", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		for (const id of ["read-1", "read-2", "read-3"])
+			await runWorker(transport, id, 'return await (await desktop.window("42")).ax()');
+		const stale = await runWorker(transport, "stale", 'await (await desktop.ref("e3")).press()');
+		expect(stale.ok).toBe(false);
+		expect(native.editing).toBe(false);
+
+		const report = await settleWorker(transport, "settle-stale");
+		expect(report).toBe(
+			[
+				'window "42" Code "Editor" after ref e3 failed: StaleRef: e3 expired; re-run ax()/find() — current tree:',
+				'- window "Editor" [ref=e16] app=Code (focused)',
+				"  - toolbar [ref=e17]",
+				'    - button "Edit" [ref=e18]',
+				'    - button "Share" [ref=e19]',
+				'  - statictext [ref=e20]: "Ready"',
+			].join("\n"),
+		);
+	});
+
+	it("reports desktop key input on the window focused when it was sent", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		await readCell(transport, "read");
+		const other: DesktopWindow = { ...windowFixture, id: "43", title: "Other", focused: false };
+		native.windows = [windowFixture, other];
+		// The key reaches the focused window and then moves focus away from it.
+		native.keyChord = async () => {
+			native.editing = true;
+			native.windows = [
+				{ ...windowFixture, focused: false },
+				{ ...other, focused: true },
+			];
+		};
+		await runWorker(transport, "root", 'await desktop.press("cmd+e")');
+		const report = String(await settleWorker(transport, "settle-root"));
+		expect(report.split("\n")[0]).toBe(
+			'window "42" Code "Editor" after desktop press cmd+e — 1 changed, 1 added, 0 removed (rows marked ~ changed, + added):',
+		);
+		expect(report).not.toContain('window "43" Code "Other" after');
+	});
+
+	it("attributes desktop pointer input to the one window under the pointer, even one filling the display", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		native.captureFrame = doubledFrame;
+		new ComputerWorkerCore(transport, () => native);
+		// The window fills the display: still the target, never passed over as an overlay.
+		native.windows = [{ ...windowFixture, x: 0, y: 0, width: 64, height: 32 }];
+
+		await readCell(transport, "read");
+		await runWorker(transport, "look", "await desktop.screenshot({ silent: true })");
+		await runWorker(transport, "click", "await desktop.click(24, 20)");
+		const header = String(await settleWorker(transport, "settle-click")).split("\n")[0];
+		expect(header).toMatch(/^window "42" Code "Editor" after desktop click 24,20 — /);
+		expect(header).not.toContain("unknown");
+	});
+
+	it("leaves desktop pointer input unattributed when listed windows overlap under the pointer", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		native.captureFrame = doubledFrame;
+		new ComputerWorkerCore(transport, () => native);
+		// Two windows contain the point; no compositor ordering is promised, so neither is chosen.
+		native.windows = [windowFixture, { ...windowFixture, id: "43", title: "Behind", x: 8, y: 8, focused: false }];
+
+		await readCell(transport, "read");
+		await runWorker(transport, "look", "await desktop.screenshot({ silent: true })");
+		await runWorker(transport, "click", "await desktop.click(24, 24)");
+		const report = String(await settleWorker(transport, "settle-click"));
+		expect(report.split("\n")[0]).toMatch(
+			/^window "42" Code "Editor" after desktop click 24,24 \(its window is unknown; shown on the focused window\) — /,
+		);
+		expect(report).not.toContain('window "43"');
+	});
+
+	it("ignores a window the platform cannot place in global coordinates", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		native.captureFrame = doubledFrame;
+		new ComputerWorkerCore(transport, () => native);
+		native.windows = [
+			{
+				...windowFixture,
+				id: "6",
+				title: "Panel",
+				x: 0,
+				y: 0,
+				width: 64,
+				height: 32,
+				focused: false,
+				positionKnown: false,
+			},
+			windowFixture,
+		];
+
+		await readCell(transport, "read");
+		await runWorker(transport, "look", "await desktop.screenshot({ silent: true })");
+		await runWorker(transport, "click", "await desktop.click(24, 24)");
+		const header = String(await settleWorker(transport, "settle-click")).split("\n")[0];
+		expect(header).toMatch(/^window "42" Code "Editor" after desktop click 24,24 — /);
+		expect(header).not.toContain("unknown");
+	});
+
+	it("names an input it cannot attribute when no window holds focus", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+		native.windows = [{ ...windowFixture, focused: false }];
+
+		await runWorker(transport, "root", 'await desktop.press("cmd+e")');
+		const report = String(await settleWorker(transport, "settle-root"));
+		expect(report).toContain("could not attribute desktop press cmd+e to a window");
+		expect(report).not.toContain('window "42"');
+	});
+
+	it("reports a window a control mutation changed", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		await readCell(transport, "read");
+		await runWorker(transport, "maximize", 'await (await desktop.window("42")).maximize()');
+		const header = String(await settleWorker(transport, "settle-maximize")).split("\n")[0];
+		expect(header).toMatch(/^window "42" Code "Editor" after maximize — /);
+	});
+
+	it("records a desktop workspace switch on the window focused when it was sent", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		await readCell(transport, "read");
+		await runWorker(transport, "workspace", 'await desktop.focusWorkspace({ workspaceId: "fake-workspace:2" })');
+		const header = String(await settleWorker(transport, "settle-workspace")).split("\n")[0];
+		expect(header).toMatch(
+			/^window "42" Code "Editor" after desktop focusWorkspace fake-workspace:2 \(its window is unknown; shown on the focused window\) — /,
+		);
+	});
+
+	it("names windows the cell's input opened and focused", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		await runWorker(transport, "read", 'return await (await desktop.window("42")).ax()');
+		const dialog: DesktopWindow = { ...windowFixture, id: "43", title: "Save", width: 30, height: 12, focused: true };
+		native.axPerform = async () => {
+			native.windows = [{ ...windowFixture, focused: false }, dialog];
+		};
+		await runWorker(transport, "open", 'await (await desktop.ref("e2")).press()');
+		const report = await settleWorker(transport, "settle-open");
+		expect(report).toMatch(/\n\nnew window "43" Code "Save" 30×12 \(focused\)$/);
+	});
+
+	it("repeats a screenshot for a window worked by pixels, even without AX", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		// Screenshot, then a tree read, then pixel input: the window is worked by pixels.
+		await runWorker(
+			transport,
+			"look",
+			'const win = await desktop.window("42"); await win.screenshot(); await win.ax()',
+		);
+		await runWorker(transport, "click", 'await (await desktop.window("42")).click(3, 4)');
+		const pixels = await settledPayload(transport, "settle-pixels");
+		expect(String(pixels.returnValue).split("\n")[0]).toEndWith("; screenshot below:");
+		expect(imageBlocks(pixels)).toHaveLength(1);
+		expect(pixels.screenshots).toEqual([expect.objectContaining({ target: "42" })]);
+		// The automatic frame is the capped one, saved and shown as the very same pixels.
+		expect(native.captureCaps.at(-1)).toEqual({ maxWidth: 1280, maxHeight: 896 });
+		expect(imageBlocks(pixels)[0]?.data).toBe(
+			Buffer.from(await Bun.file(pixels.screenshots[0]!.path).arrayBuffer()).toString("base64"),
+		);
+
+		// Keys leave the mode as it is.
+		await runWorker(transport, "key", 'await (await desktop.window("42")).press("shift")');
+		expect(imageBlocks(await settledPayload(transport, "settle-key"))).toHaveLength(1);
+
+		// An AX failure still leaves the frame.
+		native.axFails = true;
+		await runWorker(transport, "click-2", 'await (await desktop.window("42")).click(5, 6)');
+		const blind = await settledPayload(transport, "settle-blind");
+		expect(String(blind.returnValue)).toContain("could not be read back through AX: AxFailed");
+		expect(imageBlocks(blind)).toHaveLength(1);
+		native.axFails = false;
+
+		// A silent capture is no frame the model saw, but the pointer input that follows is evidence.
+		await runWorker(transport, "silent", 'await (await desktop.window("42")).screenshot({ silent: true })');
+		await runWorker(transport, "click-3", 'await (await desktop.window("42")).click(7, 8)');
+		expect(imageBlocks(await settledPayload(transport, "settle-silent-click"))).toHaveLength(1);
+
+		// A screenshot shown in an earlier cell does not keep the mode through this cell's element action.
+		await runWorker(transport, "look-only", 'await (await desktop.window("42")).screenshot()');
+		expect(await settleWorker(transport, "settle-look-only")).toBeUndefined();
+		await runWorker(transport, "read", 'return await (await desktop.window("42")).ax()');
+		const button = native.editing ? "Done" : "Edit";
+		await runWorker(
+			transport,
+			"press",
+			`const [el] = (await (await desktop.window("42")).ax()).match(/button "${button}" \\[ref=(e\\d+)\\]/).slice(1); await (await desktop.ref(el)).press()`,
+		);
+		const ax = await settledPayload(transport, "settle-ax");
+		expect(String(ax.returnValue)).not.toContain("screenshot below");
+		expect(imageBlocks(ax)).toHaveLength(0);
+
+		// A displayed screenshot taken after the input already answers it: no read-back at all.
+		await runWorker(
+			transport,
+			"click-look",
+			'const win = await desktop.window("42"); await win.click(1, 1); await win.screenshot()',
+		);
+		const looked = await settleRun(transport, "settle-looked");
+		if (!looked.ok) throw new Error(`settle-looked failed: ${looked.error.message}`);
+		expect(looked.payload.returnValue).toBeUndefined();
+		expect(looked.payload.displays).toEqual([]);
+	});
+
+	it("adds a desktop screenshot while the desktop root is worked by pixels", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		// A displayed desktop screenshot, then a click at its pixels: the root is worked by pixels.
+		await readCell(transport, "read");
+		await runWorker(transport, "look", "await desktop.screenshot()");
+		await runWorker(transport, "root-click", "await desktop.click(7, 8)");
+		const click = await settledPayload(transport, "settle-root-click");
+		// The frame the model clicks in is the desktop's, not the window's.
+		expect(click.screenshots).toEqual([expect.objectContaining({ target: "desktop" })]);
+		expect(imageBlocks(click)).toHaveLength(1);
+
+		// Keys at the root keep the mode.
+		await runWorker(transport, "root-key", 'await desktop.press("shift")');
+		const key = await settledPayload(transport, "settle-root-key");
+		expect(key.screenshots).toEqual([expect.objectContaining({ target: "desktop" })]);
+		expect(imageBlocks(key)).toHaveLength(1);
+
+		// An element action in a cell without root pixel input ends it.
+		const ref = String(key.returnValue).match(/button "(?:Edit|Done)" \[ref=(e\d+)\]/)![1];
+		await runWorker(transport, "press", `await (await desktop.ref("${ref}")).press()`);
+		await settleRun(transport, "settle-press");
+		await runWorker(transport, "root-key-2", 'await desktop.press("shift")');
+		const after = await settledPayload(transport, "settle-root-key-2");
+		expect(String(after.returnValue)).not.toContain("screenshot below");
+		expect(after.screenshots).toEqual([]);
+		expect(imageBlocks(after)).toHaveLength(0);
+	});
+
+	it("elides a large report tree to its budget and keeps the rows the input changed", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		native.filler = 2_000;
+		new ComputerWorkerCore(transport, () => native);
+
+		await readCell(transport, "read");
+		await runWorker(transport, "press", 'await (await desktop.ref("e3")).press()');
+		const [header, ...tree] = String(await settleWorker(transport, "settle-large")).split("\n");
+		expect(header).toMatch(/ \d+ rows elided to fit \(every changed row kept\)/);
+		expect(Buffer.byteLength(tree.join("\n"), "utf-8")).toBeLessThanOrEqual(16 * 1024);
+		expect(tree).toContainEqual(expect.stringMatching(/^ {4}~ button "Done" \[ref=e\d+\] \(was: button "Edit"\)$/));
+		expect(tree).toContainEqual(expect.stringMatching(/^ {4}\+ textfield "Phone" \[ref=e\d+\]: "555"$/));
+		expect(tree).toContainEqual(expect.stringMatching(/^ {4}… \d+ rows elided$/));
+
+		// An explicit read is the model's own choice of size: it is never elided.
+		const whole = await runWorker(transport, "read-whole", 'return await (await desktop.window("42")).ax()');
+		if (!whole.ok) throw new Error(`read-whole failed: ${whole.error.message}`);
+		expect(String(whole.payload.returnValue).length).toBeGreaterThan(16 * 1024);
+	});
+
+	it("counts the changed rows elision had to drop when the changes alone exceed the budget", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		native.filler = 2_000;
+		new ComputerWorkerCore(transport, () => native);
+
+		await readCell(transport, "read");
+		native.status = "Busy";
+		await runWorker(transport, "press", 'await (await desktop.ref("e3")).press()');
+		const [header, ...tree] = String(await settleWorker(transport, "settle-flood")).split("\n");
+		const counts = header.match(
+			/ — (\d+) changed, (\d+) added, .* (\d+) rows elided to fit \((\d+) changed rows among them\)/,
+		);
+		expect(counts).not.toBeNull();
+		const [changed, added, , lost] = counts!.slice(1).map(Number);
+		const kept = tree.filter(line => /^(?: {2})*[+~] /.test(line)).length;
+		expect(changed + added).toBe(2_003);
+		expect(lost).toBe(changed + added - kept);
+		expect(kept).toBeGreaterThan(0);
+		expect(Buffer.byteLength(tree.join("\n"), "utf-8")).toBeLessThanOrEqual(16 * 1024);
+	});
+
+	it("fails closed when a settle is cancelled mid-read", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		// A read that never answers: only cancellation can end the settle.
+		const { promise } = Promise.withResolvers<{ text: string }>();
+		native.axSnapshot = () => promise;
+		new ComputerWorkerCore(transport, () => native);
+
+		await runWorker(transport, "press", 'await (await desktop.window("42")).press("shift")');
+		transport.inbound({
+			type: "settle",
+			id: "settle-cancel",
+			timeoutMs: 5_000,
+			session: snapshot(true),
+			output: "",
+		} as unknown as ComputerWorkerInbound);
+		transport.inbound({ type: "abort", id: "settle-cancel" });
+		const result = await transport.waitFor(message => message.type === "result" && message.id === "settle-cancel");
+		if (result.type !== "result" || result.ok) throw new Error("cancelled settle must fail");
+		expect(result.error.isAbort).toBe(true);
+		expect(result.error.name).toBe("ToolAbortError");
+	});
+
+	it("waits out the settle delay after a slow gesture ends, not from where it started", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		// A paced gesture: the native call only returns once the harness releases it.
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		native.drag = async () => {
+			started.resolve();
+			await release.promise;
+		};
+		new ComputerWorkerCore(transport, () => native);
+
+		await runWorker(transport, "look", 'await (await desktop.window("42")).screenshot({ silent: true })');
+		const dragging = runWorker(
+			transport,
+			"slow-drag",
+			'await (await desktop.window("42")).drag([[3, 4], [8, 9]])',
+			false,
+			10_000,
+		);
+		await started.promise;
+		release.resolve();
+		await dragging;
+		const endedAt = Date.now();
+		await settledPayload(transport, "settle-slow");
+
+		// Real elapsed time, because the settle's delay is a wait on the platform clock
+		// inside the worker; no fake timer can cover it.
+		expect(Date.now() - endedAt).toBeGreaterThanOrEqual(400);
+	});
+
+	it("drops an oversized row or trailer whole instead of printing half of it", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		// One row and one prose line, each larger than the whole report budget.
+		native.status = "x".repeat(20_000);
+		native.trailer = "… ".repeat(10_000);
+		new ComputerWorkerCore(transport, () => native);
+
+		await readCell(transport, "read");
+		await runWorker(transport, "press", 'await (await desktop.ref("e3")).press()');
+		const [header, ...tree] = String(await settleWorker(transport, "settle-oversized")).split("\n");
+		expect(Buffer.byteLength(tree.join("\n"), "utf-8")).toBeLessThanOrEqual(16 * 1024);
+		// Neither oversized line survives in part: no fragment of their text, and no
+		// row left without the ref that makes it addressable.
+		expect(tree.join("\n")).not.toContain("xxxx");
+		for (const line of tree.filter(candidate => /^\s*[-+~] /.test(candidate))) {
+			expect(line).toMatch(/ \[ref=e\d+\]/);
+		}
+		expect(header).toMatch(/rows elided to fit/);
+	});
+
+	it("drops the pending input of a cancelled cell instead of reporting it in the next one", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		// The cancelled cell's input is still in flight when the turn aborts.
+		const started = Promise.withResolvers<void>();
+		const held = Promise.withResolvers<void>();
+		native.keyChord = async () => {
+			started.resolve();
+			await held.promise;
+		};
+		new ComputerWorkerCore(transport, () => native);
+
+		await readCell(transport, "read");
+		transport.inbound({
+			type: "run",
+			id: "cancelled",
+			code: 'await (await desktop.window("42")).press("shift")',
+			timeoutMs: 5_000,
+			session: { ...snapshot(false), cellId: "cell-cancelled" },
+		});
+		await started.promise;
+		transport.inbound({ type: "abort", id: "cancelled" });
+		held.resolve();
+		const cancelled = await transport.waitFor(message => message.type === "result" && message.id === "cancelled");
+		if (cancelled.type !== "result" || cancelled.ok) throw new Error("cancelled run must fail");
+		expect(cancelled.error.isAbort).toBe(true);
+
+		// No settle ever runs for that cell; the next cell answers for its own input alone.
+		await runWorker(transport, "next", 'await (await desktop.window("42")).type("hi")', false, 10_000, "cell-next");
+		const report = String(await settleWorker(transport, "settle-next", "", "cell-next"));
+		expect(report).toContain('after type "hi"');
+		expect(report).not.toContain("press shift");
+	});
+
+	it("gives overlapping cells only their own input feedback", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		// Two cells interleave on one worker: A's keystroke is still pending when B types.
+		const a = await runWorker(
+			transport,
+			"a-run",
+			'await (await desktop.window("42")).press("shift")',
+			false,
+			10_000,
+			"cell-a",
+		);
+		expect(a.ok).toBe(true);
+		const b = await runWorker(
+			transport,
+			"b-run",
+			'await (await desktop.window("42")).type("hi")',
+			false,
+			10_000,
+			"cell-b",
+		);
+		expect(b.ok).toBe(true);
+
+		const bReport = String(await settleWorker(transport, "b-settle", "", "cell-b"));
+		expect(bReport).toContain('after type "hi"');
+		expect(bReport).not.toContain("press shift");
+		const aReport = String(await settleWorker(transport, "a-settle", "", "cell-a"));
+		expect(aReport).toContain("after press shift");
+		expect(aReport).not.toContain('type "hi"');
+	});
+
+	it("answers every settle waiting behind an active cell instead of refusing the later ones", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		native.keyChord = async () => {
+			started.resolve();
+			await release.promise;
+		};
+		new ComputerWorkerCore(transport, () => native);
+
+		for (let index = 0; index < 4; index++) {
+			const typed = await runWorker(
+				transport,
+				`type-${index}`,
+				'await (await desktop.window("42")).type("x")',
+				false,
+				10_000,
+				`cell-${index}`,
+			);
+			expect(typed.ok).toBe(true);
+		}
+		// The fifth cell's key input still holds the worker when they all settle.
+		transport.inbound({
+			type: "run",
+			id: "hold",
+			code: 'await (await desktop.window("42")).press("shift")',
+			timeoutMs: 10_000,
+			session: { ...snapshot(false), cellId: "cell-4" },
+		});
+		await started.promise;
+
+		const waiting = Array.from({ length: 5 }, (_, index) =>
+			settleRun(transport, `settle-${index}`, "", `cell-${index}`),
+		);
+		release.resolve();
+		const settled = await Promise.all(waiting);
+		for (const [index, result] of settled.entries()) {
+			if (!result.ok) throw new Error(`settle ${index} was refused: ${result.error.message}`);
+			const report = String(result.payload.returnValue);
+			expect(report).toContain(index === 4 ? "after press shift" : 'after type "x"');
+			expect(report).not.toContain(index === 4 ? 'type "x"' : "press shift");
+		}
+	});
+
+	it("forgets a cell cancelled after its input finished, with no capture and no report", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		await readCell(transport, "read");
+		// The cell's input is done; the cell is cancelled while it runs the rest of its
+		// own code, so no native request is active to abort.
+		await runWorker(
+			transport,
+			"done",
+			'await (await desktop.window("42")).press("shift")',
+			false,
+			10_000,
+			"cell-cancelled",
+		);
+		const before = transport.outbound.length;
+		transport.inbound({ type: "discard", cellId: "cell-cancelled" } as unknown as ComputerWorkerInbound);
+
+		// Nothing of that cell is left: no report, no captured frame.
+		expect(await settleWorker(transport, "settle-cancelled", "", "cell-cancelled")).toBeUndefined();
+		const shown = transport.outbound
+			.slice(before)
+			.filter(message => message.type === "result" && message.ok)
+			.flatMap(message => message.payload.displays);
+		expect(shown).toEqual([]);
+
+		await runWorker(transport, "next", 'await (await desktop.window("42")).type("hi")', false, 10_000, "cell-next");
+		const report = String(await settleWorker(transport, "settle-next", "", "cell-next"));
+		expect(report).toContain('after type "hi"');
+		expect(report).not.toContain("press shift");
+	});
+
+	it("settles an untagged call's own input whatever request ids it used", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+
+		await readCell(transport, "read");
+		// No `cellId`: a host that batches calls is one logical cell, so its settle
+		// still finds its input whatever the request id says.
+		await runWorker(transport, "batch", 'await (await desktop.window("42")).type("hi")');
+		expect(String(await settleWorker(transport, "batch-settle"))).toContain('after type "hi"');
+	});
+
+	it("does not enable later automatic frames from a cancelled screenshot that finishes late", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+		await readCell(transport, "read");
+
+		const started = Promise.withResolvers<void>();
+		const held = Promise.withResolvers<void>();
+		const written = Promise.withResolvers<void>();
+		const originalWrite = Bun.write;
+		let first = true;
+		const write = spyOn(Bun, "write").mockImplementation(async (file, data, options) => {
+			if (typeof file !== "string" || !(data instanceof Uint8Array)) {
+				throw new Error("Screenshot fixture expected a PNG byte write to a path");
+			}
+			if (!first) return originalWrite(file, data, options);
+			first = false;
+			started.resolve();
+			await held.promise;
+			try {
+				return await originalWrite(file, data, options);
+			} finally {
+				written.resolve();
+			}
+		});
+		try {
+			const cancelled = runWorker(
+				transport,
+				"frame",
+				'await (await desktop.window("42")).screenshot()',
+				false,
+				10_000,
+				"cell-frame",
+			);
+			await started.promise;
+			transport.inbound({ type: "discard", cellId: "cell-frame" });
+			expect((await cancelled).ok).toBe(false);
+			await runWorker(
+				transport,
+				"next",
+				'await (await desktop.window("42")).type("hi")',
+				false,
+				10_000,
+				"cell-next",
+			);
+			held.resolve();
+			await written.promise;
+			// The completed write's promise callbacks drain before the next event-loop turn.
+			await scheduler.yield();
+			const before = transport.outbound.length;
+			const report = String(await settleWorker(transport, "settle-next", "", "cell-next"));
+			expect(report).toContain('after type "hi"');
+			const images = transport.outbound
+				.slice(before)
+				.filter(message => message.type === "result" && message.ok)
+				.flatMap(message => message.payload.displays)
+				.filter(display => display.type === "image");
+			expect(images).toEqual([]);
+		} finally {
+			held.resolve();
+			write.mockRestore();
+		}
 	});
 });

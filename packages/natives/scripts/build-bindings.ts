@@ -7,6 +7,8 @@
  *
  * `OMP_NATIVE_CARGO_PROFILE` selects the cargo profile (default `local`:
  * incremental, unstripped). Image builds set `ci` for a stripped addon.
+ * `OMP_NATIVE_FEATURES` adds comma- or space-separated Cargo features without
+ * removing the default Wayland PipeWire capture feature.
  */
 
 import * as fsSync from "node:fs";
@@ -227,6 +229,7 @@ const napiBin = path.join(path.dirname(napiManifestPath), napiBinEntry);
 // Profiles live in the root Cargo.toml; `local` trades size for iteration
 // speed, `ci` strips and drops incremental state.
 const cargoProfile = Bun.env.OMP_NATIVE_CARGO_PROFILE?.trim() || "local";
+const extraFeatures = Bun.env.OMP_NATIVE_FEATURES?.trim();
 
 const napiArgs = [
 	"build",
@@ -246,7 +249,7 @@ const napiArgs = [
 	// addons build with `crate_features = []`, so `capture()` is compiled down to
 	// a hard error and desktop capture can never work on a Wayland session.
 	"--features",
-	"wayland-pipewire",
+	extraFeatures ? `wayland-pipewire,${extraFeatures}` : "wayland-pipewire",
 ];
 
 // napi-rs / cargo route much failure detail to stdout (e.g. `cargo metadata`

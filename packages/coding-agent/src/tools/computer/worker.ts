@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as os from "node:os";
 import * as path from "node:path";
+import { scheduler } from "node:timers/promises";
 
 import type {
 	AxNode,
@@ -28,6 +29,22 @@ import {
 	waitForRun,
 } from "../run-scope";
 import { ToolAbortError, throwIfAborted } from "../tool-errors";
+import {
+	type AxReadOptions,
+	DESKTOP_WINDOW_ID,
+	desktopPoint,
+	describeRosterChanges,
+	diffTree,
+	type InputKind,
+	type InputWindow,
+	ObservationLedger,
+	renderGone,
+	renderReadBack,
+	renderUnattributed,
+	renderUnreadable,
+	windowAt,
+} from "./observation";
+import { describeWindowMiss } from "./window-miss";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type {
 	ComputerScreenshot,
@@ -53,6 +70,8 @@ export interface NativeDesktopSession {
 		sourceWidth: number;
 		sourceHeight: number;
 		target: string;
+		/** Display regions in the capture's own pixels; desktop captures carry them, window captures do not. */
+		displays?: DesktopDisplay[];
 	}>;
 	click(target: string, x: number, y: number, opts?: PointerOptions | null): Promise<void>;
 	moveMouse(target: string, x: number, y: number, opts?: PointerOptions | null): Promise<void>;
@@ -90,6 +109,25 @@ type ClickOptions = InputOptions & { button?: string; count?: number; modifiers?
 type DragOptions = InputOptions & { modifiers?: string[] };
 type ScrollOptions = InputOptions & { dx?: number; dy?: number };
 type AxOptions = Pick<AxSnapshotOptions, "all" | "maxDepth">;
+
+/** Target id of desktop-root input: keys reach the focused window, pointer input the window under it. */
+const DESKTOP_TARGET = DESKTOP_WINDOW_ID;
+/** Window input aimed at screenshot pixels; the rest of a window's input is keys. */
+const POINTER_METHODS: Record<string, true> = { click: true, doubleClick: true, move: true, drag: true, scroll: true };
+/**
+ * A settling cell reads windows back no sooner than this after its last
+ * input, so the app can react. One read per window: a second would retire the
+ * refs the model held before the cell.
+ */
+const SETTLE_DELAY_MS = 500;
+/** Past this much of the settle's own budget, remaining windows are named instead of read. */
+const SETTLE_READ_BUDGET_MS = 10_000;
+
+/**
+ * The lane for callers that are not eval cells (a host batching calls, the SDK):
+ * one logical batch, so a run and its settle agree without a per-request id.
+ */
+const UNTAGGED_CELL_ID = "unbatched";
 
 type MoveOptions = { x: number; y: number };
 type MoveByOptions = { dx: number; dy: number };
@@ -269,6 +307,7 @@ async function sendControl(
 async function captureScreenshot(
 	session: NativeDesktopSession,
 	getContext: RunContextAccessor,
+	observer: InputObserver,
 	target: string,
 	options?: ScreenshotOptions,
 ): Promise<{ path: string; width: number; height: number }> {
@@ -281,6 +320,8 @@ async function captureScreenshot(
 	);
 	const destination = path.join(os.tmpdir(), `omp-computer-${Snowflake.next()}.png`);
 	await Bun.write(destination, frame.data);
+	throwIfAborted(context.signal);
+	if (target === DESKTOP_TARGET) observer.noteDesktopCapture(frame.displays ?? []);
 	const scaled = frame.width !== frame.sourceWidth || frame.height !== frame.sourceHeight;
 	context.screenshots.push({
 		path: destination,
@@ -317,10 +358,12 @@ class El {
 	readonly childCount: number;
 	readonly #session: NativeDesktopSession;
 	readonly #getContext: RunContextAccessor;
+	readonly #observer: InputObserver;
 
-	constructor(session: NativeDesktopSession, getContext: RunContextAccessor, node: AxNode) {
+	constructor(session: NativeDesktopSession, getContext: RunContextAccessor, observer: InputObserver, node: AxNode) {
 		this.#session = session;
 		this.#getContext = getContext;
+		this.#observer = observer;
 		this.ref = node.ref;
 		this.role = node.role;
 		this.nativeRole = node.nativeRole;
@@ -331,69 +374,65 @@ class El {
 		this.childCount = node.childCount;
 	}
 
-	async value(): Promise<string | undefined> {
-		const { signal } = this.#getContext();
-		return (await nativeCall(signal, () => this.#session.axNode(this.ref))).value;
+	/** A read of this element; a failure (an expired ref) has the settle renew the window's tree. */
+	#read<T>(method: string, call: () => Promise<T>): Promise<T> {
+		return this.#observer.read(this.#getContext().signal, this.ref, `${method} ${this.ref}`, call);
 	}
 
-	async setValue(value: string): Promise<void> {
+	/** An input on this element, recorded for the cell's post-input read-back. */
+	#input(method: string, label: string, dispatch: () => Promise<void>): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "setValue");
-		await nativeCall(context.signal, () => this.#session.axSetValue(this.ref, value));
+		guardRun(context, method);
+		return this.#observer.input(context.signal, this.#observer.windowOf(this.ref), label, "element", dispatch);
+	}
+
+	async value(): Promise<string | undefined> {
+		return (await this.#read("value", () => this.#session.axNode(this.ref))).value;
+	}
+
+	setValue(value: string): Promise<void> {
+		return this.#input("setValue", `setValue ${this.ref}`, () => this.#session.axSetValue(this.ref, value));
 	}
 
 	async bounds(): Promise<{ x: number; y: number; width: number; height: number } | null> {
-		const { signal } = this.#getContext();
-		const node = await nativeCall(signal, () => this.#session.axNode(this.ref));
+		const node = await this.#read("bounds", () => this.#session.axNode(this.ref));
 		if (node.x === undefined || node.y === undefined || node.width === undefined || node.height === undefined)
 			return null;
 		return { x: node.x, y: node.y, width: node.width, height: node.height };
 	}
 
 	async attributes(): Promise<Record<string, string>> {
-		const { signal } = this.#getContext();
-		return Object.fromEntries(await nativeCall(signal, () => this.#session.axAttributes(this.ref)));
+		return Object.fromEntries(await this.#read("attributes", () => this.#session.axAttributes(this.ref)));
 	}
 
 	async actions(): Promise<string[]> {
-		const { signal } = this.#getContext();
-		return (await nativeCall(signal, () => this.#session.axNode(this.ref))).actions ?? [];
+		return (await this.#read("actions", () => this.#session.axNode(this.ref))).actions ?? [];
 	}
 
-	async perform(action: string): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "perform");
-		await nativeCall(context.signal, () => this.#session.axPerform(this.ref, action));
+	perform(action: string): Promise<void> {
+		return this.#input("perform", `perform ${this.ref} ${action}`, () => this.#session.axPerform(this.ref, action));
 	}
 
-	async press(): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "press");
-		await nativeCall(context.signal, () => this.#session.axPerform(this.ref, "press"));
+	press(): Promise<void> {
+		return this.#input("press", `press ${this.ref}`, () => this.#session.axPerform(this.ref, "press"));
 	}
 
-	async click(options?: InputOptions): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "click");
-		await nativeCall(context.signal, () => this.#session.axClick(this.ref, pointerOptions(options)));
+	click(options?: InputOptions): Promise<void> {
+		return this.#input("click", `click ${this.ref}`, () => this.#session.axClick(this.ref, pointerOptions(options)));
 	}
 
-	async focus(): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "focus");
-		await nativeCall(context.signal, () => this.#session.axFocus(this.ref));
+	focus(): Promise<void> {
+		return this.#input("focus", `focus ${this.ref}`, () => this.#session.axFocus(this.ref));
 	}
 
 	async parent(): Promise<El | null> {
-		const { signal } = this.#getContext();
-		const node = await nativeCall(signal, () => this.#session.axParent(this.ref));
-		return node ? new El(this.#session, this.#getContext, node) : null;
+		const node = await this.#read("parent", () => this.#session.axParent(this.ref));
+		return node ? this.#observer.element(this.#getContext, node, this.#observer.windowOf(this.ref)) : null;
 	}
 
 	async children(): Promise<El[]> {
-		const { signal } = this.#getContext();
-		return (await nativeCall(signal, () => this.#session.axChildren(this.ref))).map(
-			node => new El(this.#session, this.#getContext, node),
+		return (await this.#read("children", () => this.#session.axChildren(this.ref))).map(node =>
+			this.#observer.element(this.#getContext, node, this.#observer.windowOf(this.ref)),
 		);
 	}
 }
@@ -408,10 +447,17 @@ class Win {
 	readonly focused: boolean;
 	readonly #session: NativeDesktopSession;
 	readonly #getContext: RunContextAccessor;
+	readonly #observer: InputObserver;
 
-	constructor(session: NativeDesktopSession, getContext: RunContextAccessor, window: DesktopWindow) {
+	constructor(
+		session: NativeDesktopSession,
+		getContext: RunContextAccessor,
+		observer: InputObserver,
+		window: DesktopWindow,
+	) {
 		this.#session = session;
 		this.#getContext = getContext;
+		this.#observer = observer;
 		this.id = window.id;
 		this.app = window.app;
 		this.title = window.title;
@@ -421,8 +467,11 @@ class Win {
 		this.focused = window.focused;
 	}
 
-	screenshot(options?: ScreenshotOptions): Promise<{ path: string; width: number; height: number }> {
-		return captureScreenshot(this.#session, this.#getContext, this.id, options);
+	async screenshot(options?: ScreenshotOptions): Promise<{ path: string; width: number; height: number }> {
+		const frame = await captureScreenshot(this.#session, this.#getContext, this.#observer, this.id, options);
+		// A silent capture is no frame the model saw: it does not put the window in pixel mode.
+		if (!options?.silent) this.#observer.recordCapture({ id: this.id, pid: this.pid });
+		return frame;
 	}
 
 	async state(): Promise<DesktopWindowState> {
@@ -432,204 +481,413 @@ class Win {
 		return await nativeCall(signal, () => this.#session.windowState(this.id));
 	}
 
-	async click(x: number, y: number, options?: ClickOptions): Promise<void> {
+	/**
+	 * An input on this window, recorded for the cell's read-back. Desktop-root
+	 * input is recorded on the window it reaches when sent: the one under
+	 * `point` for pointer input, the focused one for keys; it stays
+	 * unattributed when neither is a single, certain answer.
+	 */
+	#input(
+		method: string,
+		label: string,
+		dispatch: () => Promise<void>,
+		point?: { x: number; y: number },
+	): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "click");
-		await nativeCall(context.signal, () => this.#session.click(this.id, x, y, pointerOptions(options)));
+		guardRun(context, method);
+		const kind: InputKind = POINTER_METHODS[method] === true ? "pixel" : "key";
+		if (this.id === DESKTOP_TARGET)
+			return this.#observer.input(context.signal, undefined, `desktop ${label}`, kind, dispatch, { point });
+		return this.#observer.input(context.signal, { id: this.id, pid: this.pid }, label, kind, dispatch);
 	}
 
-	async doubleClick(x: number, y: number, options?: Omit<ClickOptions, "count">): Promise<void> {
+	/** A window/workspace/display mutation, recorded like any other input. */
+	#control(method: string, dispatch: () => Promise<void>): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "doubleClick");
-		await nativeCall(context.signal, () =>
-			this.#session.click(this.id, x, y, pointerOptions({ ...options, count: 2 })),
+		guardRun(context, method);
+		return this.#observer.control(context.signal, { id: this.id, pid: this.pid }, method, dispatch);
+	}
+
+	click(x: number, y: number, options?: ClickOptions): Promise<void> {
+		return this.#input(
+			"click",
+			`click ${x},${y}`,
+			() => this.#session.click(this.id, x, y, pointerOptions(options)),
+			{ x, y },
 		);
 	}
 
-	async move(x: number, y: number): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "move");
-		await nativeCall(context.signal, () => this.#session.moveMouse(this.id, x, y));
-	}
-
-	async drag(points: Array<[number, number]>, options?: DragOptions): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "drag");
-		await nativeCall(context.signal, () =>
-			this.#session.drag(
-				this.id,
-				points.map(([x, y]) => ({ x, y })),
-				pointerOptions(options),
-			),
+	doubleClick(x: number, y: number, options?: Omit<ClickOptions, "count">): Promise<void> {
+		return this.#input(
+			"doubleClick",
+			`doubleClick ${x},${y}`,
+			() => this.#session.click(this.id, x, y, pointerOptions({ ...options, count: 2 })),
+			{ x, y },
 		);
 	}
 
-	async scroll(x: number, y: number, options: ScrollOptions = {}): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "scroll");
-		await nativeCall(context.signal, () =>
-			this.#session.scroll(this.id, x, y, options.dx ?? 0, options.dy ?? 0, pointerOptions(options)),
+	move(x: number, y: number): Promise<void> {
+		return this.#input("move", `move ${x},${y}`, () => this.#session.moveMouse(this.id, x, y), { x, y });
+	}
+
+	drag(points: Array<[number, number]>, options?: DragOptions): Promise<void> {
+		const [start] = points;
+		return this.#input(
+			"drag",
+			"drag",
+			() =>
+				this.#session.drag(
+					this.id,
+					points.map(([x, y]) => ({ x, y })),
+					pointerOptions(options),
+				),
+			start && { x: start[0], y: start[1] },
 		);
 	}
 
-	async type(text: string, options?: InputOptions): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "type");
-		await nativeCall(context.signal, () => this.#session.typeText(this.id, text, pointerOptions(options)));
-	}
-
-	async press(chord: string | string[], options?: InputOptions): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "press");
-		await nativeCall(context.signal, () =>
-			this.#session.keyChord(this.id, chordKeys(chord), pointerOptions(options)),
+	scroll(x: number, y: number, options: ScrollOptions = {}): Promise<void> {
+		return this.#input(
+			"scroll",
+			`scroll ${x},${y}`,
+			() => this.#session.scroll(this.id, x, y, options.dx ?? 0, options.dy ?? 0, pointerOptions(options)),
+			{ x, y },
 		);
 	}
 
-	async focus(): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "focus");
-		await sendControl(this.#session, context, { operation: "focusWindow", windowId: this.id });
+	type(text: string, options?: InputOptions): Promise<void> {
+		const shown = text.length > 24 ? `${text.slice(0, 23)}…` : text;
+		return this.#input("type", `type ${JSON.stringify(shown)}`, () =>
+			this.#session.typeText(this.id, text, pointerOptions(options)),
+		);
 	}
 
-	async close(): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "close");
-		await sendControl(this.#session, context, { operation: "closeWindow", windowId: this.id });
+	press(chord: string | string[], options?: InputOptions): Promise<void> {
+		const keys = chordKeys(chord);
+		return this.#input("press", `press ${keys.join("+")}`, () =>
+			this.#session.keyChord(this.id, keys, pointerOptions(options)),
+		);
 	}
 
-	async moveTo(options: MoveOptions): Promise<void> {
+	focus(): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "moveTo");
-		await sendControl(this.#session, context, {
-			operation: "moveWindow",
-			windowId: this.id,
-			x: controlNumber("moveTo", "x", options?.x),
-			y: controlNumber("moveTo", "y", options?.y),
+		return this.#control("focus", () =>
+			sendControl(this.#session, context, { operation: "focusWindow", windowId: this.id }),
+		);
+	}
+
+	close(): Promise<void> {
+		const context = this.#getContext();
+		return this.#control("close", () =>
+			sendControl(this.#session, context, { operation: "closeWindow", windowId: this.id }),
+		);
+	}
+
+	moveTo(options: MoveOptions): Promise<void> {
+		const context = this.#getContext();
+		return this.#control("moveTo", () =>
+			sendControl(this.#session, context, {
+				operation: "moveWindow",
+				windowId: this.id,
+				x: controlNumber("moveTo", "x", options?.x),
+				y: controlNumber("moveTo", "y", options?.y),
+			}),
+		);
+	}
+
+	moveBy(options: MoveByOptions): Promise<void> {
+		const context = this.#getContext();
+		return this.#control("moveBy", () =>
+			sendControl(this.#session, context, {
+				operation: "moveWindowBy",
+				windowId: this.id,
+				dx: controlNumber("moveBy", "dx", options?.dx),
+				dy: controlNumber("moveBy", "dy", options?.dy),
+			}),
+		);
+	}
+
+	resize(options: ResizeOptions): Promise<void> {
+		const context = this.#getContext();
+		return this.#control("resize", () => {
+			const width = controlSize("resize", "width", options?.width);
+			const height = controlSize("resize", "height", options?.height);
+			if (width === undefined && height === undefined) throw new ToolError("resize requires width, height, or both");
+			const action: DesktopControlAction = { operation: "resizeWindow", windowId: this.id };
+			if (width !== undefined) action.width = width;
+			if (height !== undefined) action.height = height;
+			return sendControl(this.#session, context, action);
 		});
 	}
 
-	async moveBy(options: MoveByOptions): Promise<void> {
+	maximize(): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "moveBy");
-		await sendControl(this.#session, context, {
-			operation: "moveWindowBy",
-			windowId: this.id,
-			dx: controlNumber("moveBy", "dx", options?.dx),
-			dy: controlNumber("moveBy", "dy", options?.dy),
-		});
+		return this.#control("maximize", () =>
+			sendControl(this.#session, context, { operation: "maximizeWindow", windowId: this.id }),
+		);
 	}
 
-	async resize(options: ResizeOptions): Promise<void> {
+	minimize(): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "resize");
-		const width = controlSize("resize", "width", options?.width);
-		const height = controlSize("resize", "height", options?.height);
-		if (width === undefined && height === undefined) throw new ToolError("resize requires width, height, or both");
-		const action: DesktopControlAction = { operation: "resizeWindow", windowId: this.id };
-		if (width !== undefined) action.width = width;
-		if (height !== undefined) action.height = height;
-		await sendControl(this.#session, context, action);
+		return this.#control("minimize", () =>
+			sendControl(this.#session, context, { operation: "minimizeWindow", windowId: this.id }),
+		);
 	}
 
-	async maximize(): Promise<void> {
+	restore(): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "maximize");
-		await sendControl(this.#session, context, { operation: "maximizeWindow", windowId: this.id });
+		return this.#control("restore", () =>
+			sendControl(this.#session, context, { operation: "restoreWindow", windowId: this.id }),
+		);
 	}
 
-	async minimize(): Promise<void> {
+	toggleMaximized(): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "minimize");
-		await sendControl(this.#session, context, { operation: "minimizeWindow", windowId: this.id });
+		return this.#control("toggleMaximized", () =>
+			sendControl(this.#session, context, { operation: "toggleMaximized", windowId: this.id }),
+		);
 	}
 
-	async restore(): Promise<void> {
+	toggleFullscreen(): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "restore");
-		await sendControl(this.#session, context, { operation: "restoreWindow", windowId: this.id });
+		return this.#control("toggleFullscreen", () =>
+			sendControl(this.#session, context, { operation: "toggleFullscreen", windowId: this.id }),
+		);
 	}
 
-	async toggleMaximized(): Promise<void> {
+	toggleWindowedFullscreen(): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "toggleMaximized");
-		await sendControl(this.#session, context, { operation: "toggleMaximized", windowId: this.id });
+		return this.#control("toggleWindowedFullscreen", () =>
+			sendControl(this.#session, context, { operation: "toggleWindowedFullscreen", windowId: this.id }),
+		);
 	}
 
-	async toggleFullscreen(): Promise<void> {
+	setFullscreen(options: EnabledOptions): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "toggleFullscreen");
-		await sendControl(this.#session, context, { operation: "toggleFullscreen", windowId: this.id });
+		return this.#control("setFullscreen", () =>
+			sendControl(this.#session, context, {
+				operation: "setFullscreen",
+				windowId: this.id,
+				enabled: controlEnabled("setFullscreen", options?.enabled),
+			}),
+		);
 	}
 
-	async toggleWindowedFullscreen(): Promise<void> {
+	setFloating(options: EnabledOptions): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "toggleWindowedFullscreen");
-		await sendControl(this.#session, context, { operation: "toggleWindowedFullscreen", windowId: this.id });
+		return this.#control("setFloating", () =>
+			sendControl(this.#session, context, {
+				operation: "setFloating",
+				windowId: this.id,
+				enabled: controlEnabled("setFloating", options?.enabled),
+			}),
+		);
 	}
 
-	async setFullscreen(options: EnabledOptions): Promise<void> {
+	center(): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "setFullscreen");
-		await sendControl(this.#session, context, {
-			operation: "setFullscreen",
-			windowId: this.id,
-			enabled: controlEnabled("setFullscreen", options?.enabled),
-		});
+		return this.#control("center", () =>
+			sendControl(this.#session, context, { operation: "centerWindow", windowId: this.id }),
+		);
 	}
 
-	async setFloating(options: EnabledOptions): Promise<void> {
+	moveToWorkspace(options: WorkspaceOptions): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "setFloating");
-		await sendControl(this.#session, context, {
-			operation: "setFloating",
-			windowId: this.id,
-			enabled: controlEnabled("setFloating", options?.enabled),
-		});
+		return this.#control("moveToWorkspace", () =>
+			sendControl(this.#session, context, {
+				operation: "moveWindowToWorkspace",
+				windowId: this.id,
+				workspaceId: controlId("moveToWorkspace", "workspaceId", options?.workspaceId),
+				focus: controlFocus("moveToWorkspace", options?.focus),
+			}),
+		);
 	}
 
-	async center(): Promise<void> {
+	moveToDisplay(options: DisplayOptions): Promise<void> {
 		const context = this.#getContext();
-		guardRun(context, "center");
-		await sendControl(this.#session, context, { operation: "centerWindow", windowId: this.id });
-	}
-
-	async moveToWorkspace(options: WorkspaceOptions): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "moveToWorkspace");
-		await sendControl(this.#session, context, {
-			operation: "moveWindowToWorkspace",
-			windowId: this.id,
-			workspaceId: controlId("moveToWorkspace", "workspaceId", options?.workspaceId),
-			focus: controlFocus("moveToWorkspace", options?.focus),
-		});
-	}
-
-	async moveToDisplay(options: DisplayOptions): Promise<void> {
-		const context = this.#getContext();
-		guardRun(context, "moveToDisplay");
-		await sendControl(this.#session, context, {
-			operation: "moveWindowToDisplay",
-			windowId: this.id,
-			displayId: controlId("moveToDisplay", "displayId", options?.displayId),
-		});
+		return this.#control("moveToDisplay", () =>
+			sendControl(this.#session, context, {
+				operation: "moveWindowToDisplay",
+				windowId: this.id,
+				displayId: controlId("moveToDisplay", "displayId", options?.displayId),
+			}),
+		);
 	}
 
 	async ax(options?: AxOptions): Promise<string> {
 		const { signal } = this.#getContext();
-		return (await nativeCall(signal, () => this.#session.axSnapshot(this.id, options))).text;
+		const text = (await nativeCall(signal, () => this.#session.axSnapshot(this.id, options))).text;
+		this.#observer.recordRead({ id: this.id, pid: this.pid }, text, axReadOptions(options));
+		return text;
 	}
 
 	async find(query: AxQuery): Promise<El[]> {
 		const { signal } = this.#getContext();
-		return (await nativeCall(signal, () => this.#session.axQuery(this.id, query))).map(
-			node => new El(this.#session, this.#getContext, node),
+		const window = { id: this.id, pid: this.pid };
+		return (await nativeCall(signal, () => this.#session.axQuery(this.id, query))).map(node =>
+			this.#observer.element(this.#getContext, node, window),
 		);
 	}
 
 	async ref(ref: string): Promise<El> {
-		const { signal } = this.#getContext();
-		return new El(this.#session, this.#getContext, await nativeCall(signal, () => this.#session.axNode(ref)));
+		const node = await this.#observer.read(this.#getContext().signal, ref, `ref ${ref}`, () =>
+			this.#session.axNode(ref),
+		);
+		return this.#observer.element(this.#getContext, node, this.#observer.windowOf(ref));
+	}
+}
+
+/** The comparable part of `ax()` options: what a read-back must repeat to match the model's tree. */
+function axReadOptions(options: AxOptions | undefined): AxReadOptions {
+	return { all: options?.all, maxDepth: options?.maxDepth };
+}
+
+/** Routes one native session's inputs and element reads through its observation ledger. */
+class InputObserver {
+	readonly ledger = new ObservationLedger();
+	readonly #session: NativeDesktopSession;
+	/** Display regions of the latest desktop screenshot, whose pixels desktop pointer input is given in. */
+	#desktopDisplays: DesktopDisplay[] = [];
+	readonly #getContext: RunContextAccessor;
+
+	/** A tree the cell's own code read. */
+	recordRead(window: InputWindow, text: string, options: AxReadOptions): void {
+		this.ledger.recordRead(this.cellId, window, text, options);
+	}
+
+	/** A frame the model was shown of a target. */
+	recordCapture(window: InputWindow): void {
+		this.ledger.recordCapture(this.cellId, window);
+	}
+
+	/** Async callbacks keep their own run's identity, and an ended run cannot record. */
+	get cellId(): string {
+		const context = this.#getContext();
+		throwIfAborted(context.signal);
+		return context.snapshot.cellId ?? UNTAGGED_CELL_ID;
+	}
+
+	constructor(session: NativeDesktopSession, getContext: RunContextAccessor) {
+		this.#session = session;
+		this.#getContext = getContext;
+	}
+
+	windowOf(ref: string): InputWindow | undefined {
+		return this.ledger.windowOf(ref);
+	}
+
+	/** A desktop screenshot was taken: desktop pointer input is given in its pixels. */
+	noteDesktopCapture(displays: DesktopDisplay[]): void {
+		this.#desktopDisplays = displays;
+	}
+
+	/** Wrap a resolved node, remembering the window it was read from. */
+	element(getContext: RunContextAccessor, node: AxNode, window: InputWindow | undefined): El {
+		if (window) this.ledger.recordRefs(window.id, [node.ref]);
+		return new El(this.#session, getContext, this, node);
+	}
+
+	/** A read addressed by ref. When it fails, the settle prints the ref's window afresh. */
+	async read<T>(signal: AbortSignal, ref: string, label: string, call: () => Promise<T>): Promise<T> {
+		const cellId = this.cellId;
+		try {
+			return await nativeCall(signal, call);
+		} catch (error) {
+			const window = this.ledger.windowOf(ref);
+			if (!signal.aborted && window && !(error instanceof ToolAbortError))
+				this.ledger.noteFailure(cellId, window, label, error instanceof Error ? error.message : String(error));
+			throw error;
+		}
+	}
+
+	/**
+	 * Dispatch one input, capturing the roster first when it opens the cell's
+	 * input. Desktop-root input (`root`) is recorded on the window it reaches:
+	 * the single window under `root.point` (desktop-screenshot pixels), or the
+	 * focused window for keys; it stays unattributed when no listing makes that
+	 * answer certain.
+	 */
+	async input(
+		signal: AbortSignal,
+		window: InputWindow | undefined,
+		label: string,
+		kind: InputKind,
+		dispatch: () => Promise<void>,
+		root?: { point?: { x: number; y: number } },
+	): Promise<void> {
+		let roster: DesktopWindow[] | undefined;
+		if (this.ledger.wantsRoster(this.cellId)) {
+			// Claimed before the await, so concurrent inputs take one roster, the earliest.
+			const claim = this.ledger.claimRoster(this.cellId);
+			roster = await this.#optional(signal, () => this.#session.listWindows());
+			claim.resolve(roster);
+		}
+		if (root) {
+			const at = root.point && desktopPoint(this.#desktopDisplays, root.point);
+			if (!root.point || at) window = await this.windowReached(signal, at, roster);
+		}
+		return await this.#dispatch(signal, window, label, kind, dispatch, root !== undefined);
+	}
+
+	/** A window/workspace/display mutation, recorded for the cell's read-back. */
+	async control(
+		signal: AbortSignal,
+		window: InputWindow | undefined,
+		label: string,
+		dispatch: () => Promise<void>,
+	): Promise<void> {
+		if (this.ledger.wantsRoster(this.cellId)) {
+			const claim = this.ledger.claimRoster(this.cellId);
+			claim.resolve(await this.#optional(signal, () => this.#session.listWindows()));
+		}
+		await this.#dispatch(signal, window, label, "control", dispatch, false);
+	}
+
+	async #dispatch(
+		signal: AbortSignal,
+		window: InputWindow | undefined,
+		label: string,
+		kind: InputKind,
+		dispatch: () => Promise<void>,
+		root: boolean,
+	): Promise<void> {
+		throwIfAborted(signal);
+		const cellId = this.cellId;
+		this.ledger.noteInput(cellId, window, label, kind, root);
+		try {
+			await nativeCall(signal, dispatch);
+		} catch (error) {
+			if (!signal.aborted && window && !(error instanceof ToolAbortError))
+				this.ledger.noteFailure(cellId, window, label, error instanceof Error ? error.message : String(error));
+			throw error;
+		} finally {
+			if (!signal.aborted) this.ledger.noteInputEnded(cellId);
+		}
+	}
+
+	/**
+	 * The window a desktop point lies in, or without a point the focused one;
+	 * undefined when the listing does not answer with exactly one window.
+	 * `roster` is a window list read just before, if any.
+	 */
+	async windowReached(
+		signal: AbortSignal,
+		point?: { x: number; y: number },
+		roster?: DesktopWindow[],
+	): Promise<InputWindow | undefined> {
+		roster ??= await this.#optional(signal, () => this.#session.listWindows());
+		if (!roster) return undefined;
+		const window = point ? windowAt(roster, point) : roster.find(candidate => candidate.focused);
+		return window && { id: window.id, pid: window.pid };
+	}
+
+	/** A native read, or undefined when it fails; a cancellation still throws. */
+	async #optional<T>(signal: AbortSignal, call: () => Promise<T>): Promise<T | undefined> {
+		try {
+			return await nativeCall(signal, call);
+		} catch (error) {
+			if (error instanceof ToolAbortError) throw error;
+			return undefined;
+		}
 	}
 }
 
@@ -639,6 +897,8 @@ export class ComputerWorkerCore {
 	readonly #createSession?: NativeDesktopSessionFactory;
 	readonly #unsubscribe: () => void;
 	#session?: NativeDesktopSession;
+	/** What the model saw of each window and what input touched since; lives and dies with `#session`. */
+	#observer?: InputObserver;
 	/** In-flight lazy session creation, shared so concurrent run/capabilities requests never double-create. */
 	#sessionInit?: Promise<NativeDesktopSession>;
 	#runtime?: JsRuntime;
@@ -649,6 +909,14 @@ export class ComputerWorkerCore {
 	 * context instead of borrowing the next run's signal and read-only policy.
 	 */
 	readonly #runContexts = new AsyncLocalStorage<ComputerRunContext>();
+	/**
+	 * Requests waiting for `#active`: one cell's settle can queue behind another
+	 * cell's run, so overlapping cells keep their own state instead of losing it
+	 * to a busy answer. Each entry's own host deadline bounds how long it waits.
+	 */
+	#queue: Array<{ message: Extract<ComputerWorkerInbound, { type: "run" | "settle" }>; ac: AbortController }> = [];
+	/** The cell the active request belongs to; `discard` matches against it. */
+	#activeCellId: string | undefined;
 	#closed = false;
 
 	constructor(transport: ComputerWorkerTransport, createSession?: NativeDesktopSessionFactory) {
@@ -665,13 +933,38 @@ export class ComputerWorkerCore {
 				this.#transport.send({ type: "pong", id: message.id });
 				return;
 			case "run":
-				void this.#run(message);
+			case "settle":
+				if (!this.#active) {
+					void this.#run(message);
+					return;
+				}
+				// Queued, never refused: the host's own deadline for this request is
+				// the bound, and an abort drains its slot at once.
+				this.#queue.push({ message, ac: new AbortController() });
 				return;
 			case "capabilities":
 				void this.#capabilities(message);
 				return;
-			case "abort":
-				if (this.#active?.id === message.id) this.#active.ac.abort(new ToolAbortError());
+			case "abort": {
+				if (this.#active?.id === message.id) {
+					this.#active.ac.abort(new ToolAbortError());
+					return;
+				}
+				// A queued request that never started: answer it now, do not run it.
+				const index = this.#queue.findIndex(queued => queued.message.id === message.id);
+				if (index < 0) return;
+				const [queued] = this.#queue.splice(index, 1);
+				queued!.ac.abort(new ToolAbortError());
+				this.#transport.send({
+					type: "result",
+					id: message.id,
+					ok: false,
+					error: errorPayload(new ToolAbortError()),
+				});
+				return;
+			}
+			case "discard":
+				this.#discardCell(message.cellId);
 				return;
 			case "tool-reply":
 				this.#deliverToolReply(message.id, message.reply);
@@ -713,7 +1006,11 @@ export class ComputerWorkerCore {
 		return this.#runtime;
 	}
 
-	async #run(message: Extract<ComputerWorkerInbound, { type: "run" }>): Promise<void> {
+	/** Runs desktop code, or settles the cell that just ended (`settle`), as one abortable run. */
+	async #run(
+		message: Extract<ComputerWorkerInbound, { type: "run" | "settle" }>,
+		queued?: AbortController,
+	): Promise<void> {
 		if (this.#closed) {
 			this.#transport.send({
 				type: "result",
@@ -723,21 +1020,15 @@ export class ComputerWorkerCore {
 			});
 			return;
 		}
-		if (this.#active) {
-			this.#transport.send({
-				type: "result",
-				id: message.id,
-				ok: false,
-				error: errorPayload(new ToolError("Computer worker is busy")),
-			});
-			return;
-		}
 		const timeoutSignal = AbortSignal.timeout(message.timeoutMs);
-		const ac = new AbortController();
+		// A queued request starts its own clock here, not while it waited.
+		const ac = queued ?? new AbortController();
 		const runAc = new AbortController();
 		const signal = AbortSignal.any([timeoutSignal, ac.signal, runAc.signal]);
+		const cellId = this.#cellIdOf(message);
 		const active: ActiveRun = { id: message.id, ac, signal, pendingTools: new Map() };
 		this.#active = active;
+		this.#activeCellId = cellId;
 		const output = new RunOutput();
 		const screenshots: ComputerScreenshot[] = [];
 		const runContext: ComputerRunContext = {
@@ -753,25 +1044,37 @@ export class ComputerWorkerCore {
 		try {
 			throwIfAborted(signal);
 			const session = await this.#ensureSession(message.session);
-			const runtime = this.#ensureRuntime(message.session);
-			runtime.setCwd(message.session.cwd);
-			const desktop = this.#createDesktopScope(session);
-			runtime.setRunScope({
-				desktop: bindRunFacade(desktop, signal),
-				assert: (condition: unknown, text?: string): void => {
-					if (!condition) throw new ToolError(text ?? "Assertion failed");
-				},
-				wait: (msOrPredicate: number | (() => unknown), options?: WaitPredicateOptions): Promise<unknown> => {
-					const resolved =
-						typeof msOrPredicate === "number"
-							? undefined
-							: {
-									timeout: resolvePredicateTimeout(message.timeoutMs, options?.timeout),
-									interval: options?.interval,
-								};
-					return markHandled(waitForRun(msOrPredicate, signal, resolved));
-				},
-			});
+			const observer = (this.#observer ??= new InputObserver(session, this.#currentRunContext));
+			let body: () => Promise<unknown>;
+			if (message.type === "settle") {
+				body = () => this.#settle(session, observer, cellId, signal, message.output);
+			} else {
+				const code = message.code;
+				const runtime = this.#ensureRuntime(message.session);
+				runtime.setCwd(message.session.cwd);
+				const desktop = this.#createDesktopScope(session, observer);
+				runtime.setRunScope({
+					desktop: bindRunFacade(desktop, signal),
+					assert: (condition: unknown, text?: string): void => {
+						if (!condition) throw new ToolError(text ?? "Assertion failed");
+					},
+					wait: (msOrPredicate: number | (() => unknown), options?: WaitPredicateOptions): Promise<unknown> => {
+						const resolved =
+							typeof msOrPredicate === "number"
+								? undefined
+								: {
+										timeout: resolvePredicateTimeout(message.timeoutMs, options?.timeout),
+										interval: options?.interval,
+									};
+						return markHandled(waitForRun(msOrPredicate, signal, resolved));
+					},
+				});
+				body = () =>
+					runtime.run(code, `computer-run-${message.id}.js`, this.#runtimeHooks(active, output), {
+						runId: message.id,
+						cwd: message.session.cwd,
+					});
+			}
 			const { promise: cancelRejection, reject: rejectCancel } = Promise.withResolvers<never>();
 			const onCancel = (): void => {
 				const abortError =
@@ -792,15 +1095,7 @@ export class ComputerWorkerCore {
 			if (signal.aborted) onCancel();
 			else signal.addEventListener("abort", onCancel, { once: true });
 			try {
-				returnValue = await Promise.race([
-					this.#runContexts.run(runContext, () =>
-						runtime.run(message.code, `computer-run-${message.id}.js`, this.#runtimeHooks(active, output), {
-							runId: message.id,
-							cwd: message.session.cwd,
-						}),
-					),
-					cancelRejection,
-				]);
+				returnValue = await Promise.race([this.#runContexts.run(runContext, body), cancelRejection]);
 				completed = true;
 			} finally {
 				signal.removeEventListener("abort", onCancel);
@@ -808,8 +1103,16 @@ export class ComputerWorkerCore {
 		} catch (error) {
 			failure = { error };
 		} finally {
+			const cancelled = timeoutSignal.aborted || ac.signal.aborted;
 			runAc.abort(postmortem.markExpectedCleanupError(new ToolAbortError("Computer run ended")));
-			if (this.#active?.id === message.id) this.#active = null;
+			if (this.#active?.id === message.id) {
+				this.#active = null;
+				this.#activeCellId = undefined;
+			}
+			// A cancelled run never settles, so its input belongs to no report; a run
+			// that merely failed still settles, with `failed` set.
+			if (message.type === "run" && cancelled) this.#observer?.ledger.discard(cellId);
+			this.#drain();
 		}
 		if (failure !== undefined) {
 			this.#transport.send({ type: "result", id: message.id, ok: false, error: errorPayload(failure.error) });
@@ -835,6 +1138,141 @@ export class ComputerWorkerCore {
 				payload: { displays: output.finish(), returnValue: cloneSafe(returnValue), screenshots, capabilities },
 			});
 		}
+	}
+
+	/** The cell a request belongs to: its eval cell, or the shared untagged lane. */
+	#cellIdOf(message: Extract<ComputerWorkerInbound, { type: "run" | "settle" }>): string {
+		return message.session.cellId ?? UNTAGGED_CELL_ID;
+	}
+
+	/**
+	 * A cancelled eval cell will never settle: forget what it left, stop the work it
+	 * still has in flight, and answer its queued requests with the abort. Another
+	 * cell's pending state and queued work are untouched.
+	 */
+	#discardCell(cellId: string): void {
+		this.#observer?.ledger.discard(cellId);
+		if (this.#activeCellId === cellId) this.#active?.ac.abort(new ToolAbortError());
+		for (let index = this.#queue.length - 1; index >= 0; index--) {
+			const queued = this.#queue[index]!;
+			if (this.#cellIdOf(queued.message) !== cellId) continue;
+			this.#queue.splice(index, 1);
+			queued.ac.abort(new ToolAbortError());
+			this.#transport.send({
+				type: "result",
+				id: queued.message.id,
+				ok: false,
+				error: errorPayload(new ToolAbortError()),
+			});
+		}
+	}
+
+	/** Start the next queued request, answering any cancelled while it waited. */
+	#drain(): void {
+		while (this.#queue.length > 0) {
+			const next = this.#queue[0]!;
+			if (!next.ac.signal.aborted) {
+				this.#queue.shift();
+				void this.#run(next.message, next.ac);
+				return;
+			}
+			this.#queue.shift();
+			this.#transport.send({
+				type: "result",
+				id: next.message.id,
+				ok: false,
+				error: errorPayload(new ToolAbortError()),
+			});
+		}
+	}
+
+	/**
+	 * Re-reads every window the cell's input touched and says, once, what it
+	 * left behind: each window's current tree marked against the last tree the
+	 * model received, a fresh screenshot of windows it works from pixels, then
+	 * windows the input opened, closed or focused. Each window is read once, so
+	 * refs from the tree the model held before the cell stay valid (the native
+	 * registry keeps one previous generation) and the printed refs are live. A
+	 * window the cell read with `ax()` after its input is skipped only when
+	 * `output`, what the cell printed, carries that tree. Input whose window is
+	 * unknown is reported on the focused window, or named on its own when none
+	 * has focus. Nothing when the cell sent no input and no ref failed.
+	 */
+	async #settle(
+		session: NativeDesktopSession,
+		observer: InputObserver,
+		cellId: string,
+		signal: AbortSignal,
+		output: string,
+	): Promise<string | undefined> {
+		const pending = observer.ledger.take(cellId, output);
+		if (!pending) return undefined;
+		const deadline = Date.now() + SETTLE_READ_BUDGET_MS;
+		const settleIn = pending.lastInputAt + SETTLE_DELAY_MS - Date.now();
+		if (settleIn > 0) await scheduler.wait(settleIn, { signal });
+		// Loaded here, like the desktop session above: the readiness handshake must not load the addon.
+		const { diffLineRuns } = await import("@oh-my-pi/pi-natives");
+		const failure = (error: unknown): string => {
+			if (signal.aborted) throw error;
+			return error instanceof Error ? error.message : String(error);
+		};
+		let roster: DesktopWindow[] | undefined;
+		try {
+			roster = await nativeCall(signal, () => session.listWindows());
+		} catch (error) {
+			failure(error);
+		}
+		const focused = roster?.find(window => window.focused);
+		if (focused) observer.ledger.attributeToFocused(pending, focused);
+		const sections: string[] = [];
+		if (pending.unattributed.length > 0) sections.push(renderUnattributed(pending.unattributed));
+		for (const touched of pending.touched) {
+			const window = roster?.find(candidate => candidate.id === touched.id);
+			if (roster && !window) {
+				sections.push(renderGone(touched));
+				continue;
+			}
+			if (Date.now() > deadline) {
+				sections.push(
+					`window ${JSON.stringify(touched.id)} was not read back: the report's time budget is spent; read it yourself`,
+				);
+				continue;
+			}
+			try {
+				const text = (await nativeCall(signal, () => session.axSnapshot(touched.id, touched.options))).text;
+				const change = touched.baseline === undefined ? undefined : diffTree(touched.baseline, text, diffLineRuns);
+				observer.ledger.recordShown(cellId, { id: touched.id, pid: window?.pid }, text, touched.options);
+				sections.push(
+					renderReadBack({ touched, window, text, change, sinceInputMs: Date.now() - pending.lastInputAt }),
+				);
+			} catch (error) {
+				sections.push(renderUnreadable(touched, window, failure(error)));
+			}
+			// Pixels do not depend on AX: an unreadable surface still gets its frame.
+			// The capture also becomes the window's coordinate frame, so the next
+			// pixel input maps against the image the model now sees.
+			if (touched.screenshot) {
+				try {
+					await captureScreenshot(session, this.#currentRunContext, observer, touched.id);
+				} catch (error) {
+					sections.push(`window ${JSON.stringify(touched.id)}: screenshot failed: ${failure(error)}`);
+				}
+			}
+		}
+		if (pending.desktopScreenshot) {
+			try {
+				await captureScreenshot(session, this.#currentRunContext, observer, DESKTOP_TARGET);
+				sections.push("desktop screenshot below (you last worked the desktop root from pixels)");
+			} catch (error) {
+				sections.push(`desktop screenshot failed: ${failure(error)}`);
+			}
+		}
+		if (roster && pending.rosterBefore) {
+			const reported = new Set(pending.touched.map(touched => touched.id));
+			const changes = describeRosterChanges(pending.rosterBefore, roster, pending.pids, reported);
+			if (changes.length > 0) sections.push(changes.join("\n"));
+		}
+		return sections.length > 0 ? sections.join("\n\n") : undefined;
 	}
 
 	/**
@@ -904,12 +1342,11 @@ export class ComputerWorkerCore {
 		return context;
 	};
 
-	#createDesktopScope(session: NativeDesktopSession): object {
+	#createDesktopScope(session: NativeDesktopSession, observer: InputObserver): object {
 		const getContext = this.#currentRunContext;
-		const makeWin = (window: DesktopWindow): Win => new Win(session, getContext, window);
-		const el = (node: AxNode): El => new El(session, getContext, node);
-		const desktopTarget = new Win(session, getContext, {
-			id: "desktop",
+		const makeWin = (window: DesktopWindow): Win => new Win(session, getContext, observer, window);
+		const desktopTarget = new Win(session, getContext, observer, {
+			id: DESKTOP_TARGET,
 			app: "desktop",
 			title: "desktop",
 			x: 0,
@@ -941,7 +1378,13 @@ export class ComputerWorkerCore {
 					typeof selector === "string" || typeof selector === "number"
 						? windows.filter(window => window.id === String(selector))
 						: windows.filter(window => matchesFilter(window, selector));
-				if (matches.length === 0) throw new ToolError(`no window matches ${JSON.stringify(selector)}`);
+				if (matches.length === 0) {
+					// Scripts are untyped: `window(null)` reaches here when no window is open.
+					const app = typeof selector === "object" ? selector?.app : undefined;
+					throw new ToolError(
+						`no window matches ${JSON.stringify(selector)}\n${describeWindowMiss(windows, app)}`,
+					);
+				}
 				if (matches.length > 1) {
 					const candidates = matches
 						.map(window => `${window.id} ${window.app} ${JSON.stringify(window.title)}`)
@@ -964,29 +1407,32 @@ export class ComputerWorkerCore {
 			focusWorkspace: async (options: WorkspaceOptions): Promise<void> => {
 				const context = getContext();
 				guardRun(context, "focusWorkspace");
-				await sendControl(session, context, {
-					operation: "focusWorkspace",
-					workspaceId: controlId("focusWorkspace", "workspaceId", options?.workspaceId),
-				});
+				const workspaceId = controlId("focusWorkspace", "workspaceId", options?.workspaceId);
+				await observer.control(context.signal, undefined, `desktop focusWorkspace ${workspaceId}`, () =>
+					sendControl(session, context, { operation: "focusWorkspace", workspaceId }),
+				);
 			},
 			focusDisplay: async (options: DisplayOptions): Promise<void> => {
 				const context = getContext();
 				guardRun(context, "focusDisplay");
-				await sendControl(session, context, {
-					operation: "focusDisplay",
-					displayId: controlId("focusDisplay", "displayId", options?.displayId),
-				});
+				const displayId = controlId("focusDisplay", "displayId", options?.displayId);
+				await observer.control(context.signal, undefined, `desktop focusDisplay ${displayId}`, () =>
+					sendControl(session, context, { operation: "focusDisplay", displayId }),
+				);
 			},
 			moveWorkspaceToDisplay: async (options: WorkspaceDisplayOptions): Promise<void> => {
 				const context = getContext();
 				guardRun(context, "moveWorkspaceToDisplay");
-				await sendControl(session, context, {
-					operation: "moveWorkspaceToDisplay",
-					workspaceId: controlId("moveWorkspaceToDisplay", "workspaceId", options?.workspaceId),
-					displayId: controlId("moveWorkspaceToDisplay", "displayId", options?.displayId),
-				});
+				const workspaceId = controlId("moveWorkspaceToDisplay", "workspaceId", options?.workspaceId);
+				const displayId = controlId("moveWorkspaceToDisplay", "displayId", options?.displayId);
+				await observer.control(
+					context.signal,
+					undefined,
+					`desktop moveWorkspaceToDisplay ${workspaceId} to ${displayId}`,
+					() => sendControl(session, context, { operation: "moveWorkspaceToDisplay", workspaceId, displayId }),
+				);
 			},
-			screenshot: (options?: ScreenshotOptions) => captureScreenshot(session, getContext, "desktop", options),
+			screenshot: (options?: ScreenshotOptions) => desktopTarget.screenshot(options),
 			click: desktopTarget.click.bind(desktopTarget),
 			doubleClick: desktopTarget.doubleClick.bind(desktopTarget),
 			move: desktopTarget.move.bind(desktopTarget),
@@ -996,17 +1442,17 @@ export class ComputerWorkerCore {
 			press: desktopTarget.press.bind(desktopTarget),
 			elementAt: async (x: number, y: number): Promise<El | null> => {
 				const { signal } = getContext();
-				const node = await nativeCall(signal, () => session.axElementAt("desktop", x, y));
-				return node ? el(node) : null;
+				const node = await nativeCall(signal, () => session.axElementAt(DESKTOP_TARGET, x, y));
+				return node ? observer.element(getContext, node, await observer.windowReached(signal, { x, y })) : null;
 			},
 			focusedElement: async (): Promise<El | null> => {
 				const { signal } = getContext();
 				const node = await nativeCall(signal, () => session.axFocused());
-				return node ? el(node) : null;
+				return node ? observer.element(getContext, node, await observer.windowReached(signal)) : null;
 			},
 			ref: async (ref: string): Promise<El> => {
-				const { signal } = getContext();
-				return el(await nativeCall(signal, () => session.axNode(ref)));
+				const node = await observer.read(getContext().signal, ref, `ref ${ref}`, () => session.axNode(ref));
+				return observer.element(getContext, node, observer.windowOf(ref));
 			},
 			clipboard: {
 				read: async (): Promise<string> => {
@@ -1042,6 +1488,7 @@ export class ComputerWorkerCore {
 			// Closing is best-effort; the worker is exiting and has no request to report this against.
 		} finally {
 			this.#session = undefined;
+			this.#observer = undefined;
 			this.#sessionInit = undefined;
 			this.#unsubscribe();
 			this.#transport.send({ type: "closed" });

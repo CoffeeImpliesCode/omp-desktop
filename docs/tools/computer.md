@@ -22,7 +22,7 @@ User setup, permissions, safety guidance, examples, and platform limitations: [S
 
 - `computer.enabled` gates the Eval prelude and defaults to `false`. `/computer` toggles it for the current session without persisting settings.
 - The prelude is available only through enabled Eval runtimes; it is not an AgentTool.
-- The worker permits one active run; concurrent direct helpers/runs fail with `Computer worker is busy`. Capability inspection remains available during a run. The active Eval documentation and globals update with the current enabled state.
+- The worker queues direct helpers, runs, and per-cell observation settlement in FIFO order. Capability inspection remains available during a run. Concurrent JS/Python cells keep their own observation and cancellation state. The active Eval documentation and globals update with the current enabled state.
 - Unlike `browser`, this prelude can operate IDEs, terminals, native applications, browser windows, and system dialogs. It has no browser DOM or web ARIA surface; its accessibility methods use the host OS.
 
 ## Settings
@@ -76,7 +76,7 @@ The same surface is reachable as `computer.*` directly and as `desktop.*` inside
 ### Discovery
 
 - `desktop.windows({ app?, title? })` returns matching `DesktopWindow[]`; app/title matching is case-insensitive substring matching.
-- `desktop.window(id | { id?, app?, title? })` returns one persistent window facade. An id may be a string or a number (`74` is the id `"74"`, never matched against app or title). Zero matches throw; multiple matches throw with the candidates.
+- `desktop.window(id | { id?, app?, title? })` returns one persistent window facade. An id may be a string or a number (`74` is the id `"74"`, never matched against app or title). Zero matches throw with a bounded list of available windows; multiple matches throw with the candidates.
 - `desktop.focusedWindow()` returns a window facade or `null`.
 - `desktop.displays()` returns `DesktopDisplay[]`.
 - `desktop.workspaces()` returns `DesktopWorkspace[]` entries with `{ id, index, name, displayId, active, focused, urgent, activeWindowId }`. Workspace IDs are opaque and stable (`niri-workspace:<n>` on niri, `x11-workspace:<n>` on X11).
@@ -101,7 +101,7 @@ A window also exposes `focus()`, the control helpers below, `ax(...)`, `find(...
 
 Window metadata and handles expose `positionKnown`. If it is false, `bounds.x` and `bounds.y` are not global coordinates. Exact native window capture can still succeed. Input that needs the window's global origin fails with `InvalidCoordinateFrame`; an AT-SPI window-relative position is not a safe replacement. AX actions do not require that coordinate mapping.
 
-Screenshots are PNGs written under the OS temp directory. Native capture is resized to the effective capture caps before both saving and displaying; the saved PNG and model-visible image share the same pixel frame. Unless `silent: true`, each capture emits a status text block and an image block. Details record captured dimensions, original source dimensions, and target.
+Screenshots are PNGs written under the OS temp directory. Native capture is resized to the effective capture caps before both saving and displaying; the saved PNG and model-visible image share the same pixel frame, without another generic image-output resize. Unless `silent: true`, each capture emits a status text block and an image block and enables automatic after-input screenshots for that target. Silent capture does not enable this mode. Details record captured dimensions, original source dimensions, and target.
 
 ### Window and workspace control
 
@@ -160,15 +160,26 @@ Direct helpers and `computer.run(...)` return the worker's structured value dire
 
 Result details contain the resolved `code`, `readOnly`, `screenshots`, optional structured `value`, and capability metadata (`backend`, `capturePermission`, `inputPermission`, `axPermission`). Each screenshot detail contains `path`, `width`, `height`, optional `sourceWidth`/`sourceHeight`, and `target`. Provider delivery uses ordinary text/image content with image detail `original`; it does not use provider Files or native `computer_call_output` metadata.
 
+After input, Eval waits until 500 ms after the last input completes, then appends
+fresh AX feedback for affected windows and window-roster changes. Explicitly
+printed AX reads take precedence over older automatic baselines. Targets whose
+screenshots have been shown also receive after-input images. Automatic full
+window/root AX trees use a 16 KiB UTF-8 budget, retain complete rows, and mark
+truncation.
+
+The usage guide appears once per prelude session after the first direct window
+lookup, even if the cell catches a lookup failure. Cancelled cells discard only
+their pending observations; late callbacks cannot contribute to another cell.
+
 ## Flow and lifecycle
 
 1. `createComputerPrelude(session)` defines the enabled-only global and its host-side invoker.
 2. A direct helper renders its allowlisted call chain, and `computer.run(fnOrCode, options)` serializes a function when needed; the host resolves the JavaScript, clamps the timeout, computes effective image caps, creates the per-run snapshot (read-only for inspection chains), and asks the supervisor to execute it.
-3. The supervisor lazily starts one crash-isolated Bun worker (10-second startup deadline) and forwards aborts. The worker rejects overlapping runs instead of queueing them.
+3. The supervisor lazily starts one crash-isolated Bun worker (10-second startup deadline), queues execution and observation settlement in FIFO order, and forwards cancellation to the owning cell.
 4. The worker lazily creates one native `DesktopSession` and one persistent `JsRuntime`. Handles, screenshot coordinate frames, runtime variables, and recent AX refs survive successful calls.
 5. Each run installs a run-scoped `desktop` facade plus `wait`/`assert`. AsyncLocalStorage prevents leaked asynchronous work from borrowing a later run's signal or read-only policy.
 6. Native operations execute in the worker. Runtime `tool.*` calls cross back through the supervisor into the owning session tool bridge and inherit cancellation.
-7. At run end, pending work is aborted, clone-safe displays/return value and capabilities return to the host, and the worker remains alive.
+7. At run end, pending work is aborted, clone-safe displays/return value and capabilities return to the host, and the worker remains alive. Observation settlement is tied to the Eval cell and cannot consume another cell's feedback.
 8. A run timeout is followed by a 750 ms supervisor grace period. If the worker does not finish, it is terminated with `computer worker restarted; captures and ax refs were reset`; a later call starts a fresh worker.
 9. Session cleanup sends `close`, waits up to 1.5 seconds, then force-terminates as a bounded fallback. Owner-scoped cleanup closes every registered computer controller.
 
@@ -189,7 +200,7 @@ Native errors are surfaced as `ToolError` text prefixed by the stable code name:
 - `WindowNotFound`, `InvalidTarget`, `InvalidKey`, `InvalidCoordinateFrame`, `ControlUnsupported`, `ControlFailed`
 - `StaleRef`, `AxUnsupported`, `AxFailed`, `Timeout`, `Closed`, `Internal`
 
-Prelude/worker errors include `Computer session is closed`, `Computer worker is busy`, `Timed out starting computer worker`, `Computer code execution timed out after <ms>ms`, read-only mutation errors, and the worker-restart message above.
+Prelude/worker errors include `Computer session is closed`, `Timed out starting computer worker`, `Computer code execution timed out after <ms>ms`, read-only mutation errors, and the worker-restart message above.
 
 Recover by refreshing the exact target screenshot after coordinate-frame errors, taking a new AX snapshot after `StaleRef`, and inspecting `desktop.capabilities()` for platform/permission failures. After `BackgroundUnavailable`, prefer AX. Use `takeover: true` only for the refused call when supported. After partial-delivery or restoration errors, inspect the target before retrying because input may already have landed. After `ControlUnsupported`, check `windowControl.operations` and change approach. After a control call returns `ControlFailed` or `Timeout`, read `state()` or capture a screenshot before deciding. The request may already have been applied.
 
@@ -198,6 +209,11 @@ Recover by refreshing the exact target screenshot after coordinate-frame errors,
 Current native backends support macOS, Linux X11, Linux Wayland portal capture/input where available, and Windows; other targets depend on native-addon support. Capabilities and permission state are runtime facts—inspect `desktop.capabilities()` rather than assuming them. Wayland compositors do not permit per-window native input delivery; use AX actions, or desktop input after focusing the target yourself. Window control is a separate surface: niri answers focus, close, move, resize, and workspace helpers over its IPC socket, while X11 answers only what its window manager really supports. See [Scriptable computer use: Platforms](../computer-use.md#platforms) for prerequisites and permission details.
 
 Builds with `wayland-pipewire` capture all authorized monitor streams and map screenshot pixels through their logical display bounds. On niri, IPC supplies connector display IDs, window IDs, and metadata before capture. Exact `niri:<id>` window capture uses the compositor's native ScreenCast service without focus or clipboard changes and without a portal selection dialog. Normal computer read approval remains in force. Missing global window positions remain unknown; they do not prevent exact capture or make per-window native input available.
+
+Startup can fall back to X11 with `DISPLAY` when the configured or inherited
+Wayland socket is definitively stale. Live, permission-blocked, resource-limited,
+and otherwise ambiguous Wayland endpoints stay on Wayland. Capture-feature and
+portal-permission failures do not cause fallback after selection.
 
 On niri, `windowControl` advertises focus, close, floating move and resize, centering, `setFloating`, the three toggles, and window, workspace, and display moves. It does not advertise minimize, restore, idempotent maximize, or idempotent fullscreen, and `focusMayWarpPointer` is `true` there.
 

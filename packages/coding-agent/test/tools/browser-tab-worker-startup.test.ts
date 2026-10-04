@@ -316,6 +316,100 @@ describe("OMP-owned browser evaluation", () => {
 		},
 		45_000,
 	);
+
+	// Puppeteer attributes evaluation failures from the structured stack Bun
+	// hands its `Error.prepareStackTrace` hook, and a compiled binary can expose
+	// fewer than the three frames that hook assumes. Unhardened, every raw
+	// evaluation dies inside `PuppeteerURL.fromCallSite` with
+	// "undefined is not an object" before the page callback ever runs.
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"keeps raw collection evaluation usable when the callsite stack is one frame deep",
+		async () => {
+			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
+			const page = await browser.browser.newPage();
+			const stackTraceLimit = Error.stackTraceLimit;
+			try {
+				await page.goto(
+					`data:text/html,${encodeURIComponent('<button id="first">First</button><button id="second">Second</button>')}`,
+				);
+				Error.stackTraceLimit = 1;
+				const collected = await page.$$eval("button", elements => elements.map(element => element.textContent));
+				const frameCount = await page.mainFrame().$$eval("button", elements => elements.length);
+				const single = await page.$eval("button", element => element.textContent);
+				const direct = await page.evaluate(() => document.querySelectorAll("button").length);
+				Error.stackTraceLimit = stackTraceLimit;
+				expect({ collected, frameCount, single, direct }).toEqual({
+					collected: ["First", "Second"],
+					frameCount: 2,
+					single: "First",
+					direct: 2,
+				});
+			} finally {
+				Error.stackTraceLimit = stackTraceLimit;
+				await page.close().catch(() => undefined);
+				if (browser.browser.connected) await releaseBrowser(browser, { kill: true });
+			}
+		},
+		45_000,
+	);
+
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"returns computed DOM collections through raw page and frame evaluation",
+		async () => {
+			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
+			const name = `collection-evaluate-${process.pid}`;
+			const session = {
+				cwd: process.cwd(),
+				hasUI: false,
+				settings: Settings.isolated(),
+				getSessionFile: () => null,
+			} as unknown as ToolSession;
+			try {
+				await acquireTab(name, browser, {
+					url: `data:text/html,${encodeURIComponent('<button id="first">First</button><button id="second">Second</button>')}`,
+					timeoutMs: 30_000,
+				});
+				const result = await runInTab(name, {
+					code: `
+						const handles = await page.$$("button");
+						const viaHandles = [];
+						for (const handle of handles) {
+							viaHandles.push(await handle.evaluate(element => element.textContent));
+						}
+						await Promise.all(handles.map(handle => handle.dispose()));
+						return {
+							viaHandles,
+							pageCollection: await page.$$eval("button", elements => elements.map(element => element.textContent)),
+							frameCollection: await page.mainFrame().$$eval("button", elements => elements.map(element => element.textContent)),
+							collectionWithArg: await page.$$eval(
+								"button",
+								(elements, suffix) => elements.map(element => String(element.textContent) + suffix),
+								"!",
+							),
+							single: await page.$eval("button", element => element.textContent),
+							direct: await page.evaluate(() => document.querySelectorAll("button").length),
+						};
+					`,
+					timeoutMs: 20_000,
+					session,
+				});
+				expect(result.returnValue).toEqual({
+					viaHandles: ["First", "Second"],
+					pageCollection: ["First", "Second"],
+					frameCollection: ["First", "Second"],
+					collectionWithArg: ["First!", "Second!"],
+					single: "First",
+					direct: 2,
+				});
+			} finally {
+				await releaseTab(name, { kill: true });
+				if (browser.browser.connected) await releaseBrowser(browser, { kill: true });
+			}
+		},
+		45_000,
+	);
 });
 
 describe("OMP-owned browser input", () => {

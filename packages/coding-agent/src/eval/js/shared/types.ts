@@ -14,5 +14,5 @@ export interface JsStatusEvent {
  */
 export type JsDisplayOutput =
 	| { type: "json"; data: unknown }
-	| { type: "image"; data: string; mimeType: string }
+	| { type: "image"; data: string; mimeType: string; detail?: "auto" | "low" | "high" | "original" }
 	| { type: "status"; event: JsStatusEvent };

@@ -66,7 +66,7 @@ For multi-step sequences, `computer.run(fnOrCode, { args?, read_only?, timeout? 
 
 Direct inspection helpers run read-only automatically. In `computer.run`, use `read_only: true` to declare an inspection-only call for approval and to block mutation through the `desktop` facade: screenshots and AX reads work, while facade input and clipboard-write methods reject the call. This is **not a sandbox**. The evaluated code still has full Bun/Node host access, including `process`, `require`, and `fs`, so `read_only` does not prevent mutation through arbitrary host APIs.
 
-One lazy worker accepts one active run; overlapping runs fail with `Computer worker is busy`. Run/direct-call timeout defaults to 120 seconds, clamped to 1–300 seconds and a positive `tools.maxTimeout` ceiling; `0` does not disable it. Cancellation normally interrupts the active run without discarding the desktop session. An unresponsive worker is terminated after the timeout plus 750 ms grace, and crashes also reset it; the next call starts fresh and must reacquire frames and AX refs. `computer.close()` permanently closes this prelude session: later action calls fail and `capabilities()` returns `undefined` (`None` in Python).
+One lazy worker queues runs, direct calls, and per-cell observation settlement in FIFO order. Concurrent JS/Python cells keep separate observation and cancellation state. Run/direct-call timeout defaults to 120 seconds, clamped to 1–300 seconds and a positive `tools.maxTimeout` ceiling; `0` does not disable it. Cancellation normally interrupts only the owning cell without discarding the desktop session. An unresponsive worker is terminated after the timeout plus 750 ms grace, and crashes also reset it; the next call starts fresh and must reacquire frames and AX refs. `computer.close()` permanently closes this prelude session: later action calls fail and `capabilities()` returns `undefined` (`None` in Python).
 
 ## Discover targets
 
@@ -76,7 +76,7 @@ display(await computer.displays());
 display(await computer.capabilities());
 ```
 
-`computer.windows({ app?, title? })` returns window IDs, app/title, PID, logical bounds, and focus state. Select exactly one target with `computer.window(idOrFilter)`; an ambiguous filter throws and lists candidates. `computer.focusedWindow()` returns the current target or `null`.
+`computer.windows({ app?, title? })` returns window IDs, app/title, PID, logical bounds, and focus state. Select exactly one target with `computer.window(idOrFilter)`; an ambiguous filter throws and lists candidates. A missing target reports a bounded list of available windows so you can correct the filter. `computer.focusedWindow()` returns the current target or `null`.
 
 ## Window, workspace and display control
 
@@ -169,13 +169,29 @@ Window methods include:
 
 `computer` itself (and `desktop` inside `computer.run`) exposes the same screenshot and input surface for the all-displays composite.
 
-Pixel coordinates always belong to the most recent screenshot of the same target. Coordinate input before that capture is rejected. A resized/closed target or changed display layout invalidates the frame; capture again instead of guessing. Screenshots display automatically and are also saved at the captured resolution, subject to `computer.maxWidth` / `computer.maxHeight` and any effective model-transport cap. The screenshot helper returns `{ path, width, height }` for the saved capture. When scaled, its emitted text also reports the native source dimensions. `{ silent: true }` suppresses both the image and screenshot text in loops.
+Pixel coordinates always belong to the most recent screenshot of the same target. Coordinate input before that capture is rejected. A resized/closed target or changed display layout invalidates the frame; capture again instead of guessing. Screenshots display automatically and are also saved at the captured resolution, subject to `computer.maxWidth` / `computer.maxHeight` and any effective model-transport cap. The model receives the same PNG pixels as the saved frame; the generic image-output resizer does not scale computer screenshots again. The screenshot helper returns `{ path, width, height }` for that frame. When scaled, its emitted text also reports the native source dimensions. `{ silent: true }` suppresses both the image and screenshot text in loops and does not enable automatic screenshots.
 
 Window input defaults to background routes that do not move the user's pointer or deliberately activate the target. Known unsupported routes throw `BackgroundUnavailable`; use AX or retry that call with `{ takeover: true }`. Takeover temporarily activates the exact target and posts real input, then attempts to restore focus and pointer position without overriding a newer user focus choice. OS activation restrictions can still refuse takeover. Desktop-root pointer helpers (`computer.click`, …) always drive the user's real pointer.
 
 Applications and window managers can react to background events by changing focus; background support is conditional, not an isolation boundary. macOS contains target self-activation during a bounded observation window. X11 detects focus changes and disables reuse of the affected virtual input pair rather than stealing focus back. A partial-delivery or restoration error means the action may already have happened: inspect its effects before retrying, including with takeover. A successful native enqueue alone does not prove an application acted.
 
 Wayland per-window native input remains unavailable without compositor-specific integration; use AX actions, or desktop input after focusing the target yourself. Window control is a separate surface: niri answers focus, close, move, resize, and workspace helpers over its IPC socket, as described above.
+
+## Automatic feedback
+
+After input, Eval appends fresh accessibility feedback for affected windows and
+reports window-roster changes. It waits until 500 ms after the latest input
+finishes before reading the new state. An explicitly printed AX read in the same
+cell takes precedence over the older automatic baseline.
+
+Once a window or desktop screenshot has been shown, later input also returns
+after-input screenshots for affected pixel-enabled targets. Automatic full AX
+trees have a 16 KiB UTF-8 budget, retain complete rows, and mark truncation.
+Cancelled cells discard their pending observations without cancelling another
+cell or allowing late callbacks to leak into its output.
+
+The usage guide is attached once per prelude session after the first direct
+`computer.window()` lookup, including a lookup failure caught by the cell.
 
 ## Accessibility-first automation
 
@@ -226,7 +242,7 @@ Inside `computer.run`, `wait(milliseconds)` sleeps and `wait(predicate, { timeou
 
 X11 background input uses an independent XI2 pointer/keyboard and requires writable `/dev/uinput`, working udev/libinput hotplug, and a compatible toolkit/window manager. Core-only clients and popup grabs may require AX or takeover. Windows uses physical screen coordinates throughout capture, AX and input, converting only at the target window's DPI-aware message boundary; mixed-DPI monitor origins are never divided by individual display scales.
 
-Inspect `computer.capabilities()` rather than assuming capture, input, AX, or permission state. On Wayland, input reports `prompt-or-granted` before first native input without opening a RemoteDesktop session. Released builds are compiled without the `wayland-pipewire` feature, so `capabilities()` reports `capture: false`; where the feature is present, a missing portal/PipeWire feature or denied RemoteDesktop portal is reported as a capture/input/permission failure rather than falling back to X11.
+Inspect `computer.capabilities()` rather than assuming capture, input, AX, or permission state. On Wayland, input reports `prompt-or-granted` before first native input without opening a RemoteDesktop session. Local Cargo builds enable `wayland-pipewire`; artifacts built without it report `capture: false`. At startup, a definitively stale Wayland socket permits X11 fallback when `DISPLAY` is set. A live or ambiguously inaccessible Wayland endpoint, denied portal permission, or missing capture support does not trigger that fallback.
 
 With `wayland-pipewire`, desktop capture retains every monitor stream authorized by the ScreenCast portal. Display bounds use the portal's logical geometry and each stream's pixel size; capture refuses ambiguous multi-monitor placement rather than inventing offsets. A display selector chooses an authorized stream, not whichever stream the portal returns first.
 

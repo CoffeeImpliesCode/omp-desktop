@@ -208,6 +208,84 @@ describe("RelayBridge target discovery", () => {
 	});
 });
 
+describe("RelayBridge borrowed-tab protection", () => {
+	it("rejects root, tab, page, and session-scoped closes of a borrowed user tab", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2, windowId: 2 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		await claimTab(bridge, ext, cdp, connId, 1);
+
+		// A claimed tab is still the user's tab: adopting it proves only that omp
+		// drives it, never that omp may destroy it. Every route a raw CDP client
+		// could take to the close — browser-level page and tab ids, the page
+		// session's own `Page.close`, and a session-scoped target close aimed at a
+		// tab in another window — must refuse rather than reach `chrome.tabs.remove`.
+		const commands: Array<{ route: string; command: Record<string, unknown> }> = [
+			{ route: "root page id", command: { method: "Target.closeTarget", params: { targetId: `PAGE${ANON}.1` } } },
+			{ route: "root tab id", command: { method: "Target.closeTarget", params: { targetId: `TAB${ANON}.2` } } },
+			{ route: "page session", command: { method: "Page.close", sessionId } },
+			{
+				route: "session-scoped target id",
+				command: { method: "Target.closeTarget", sessionId, params: { targetId: `PAGE${ANON}.2` } },
+			},
+		];
+		for (const { route, command } of commands) {
+			const id = ++msgSeq;
+			bridge.cdpMessage(connId, JSON.stringify({ id, ...command }));
+			await flush();
+			expect(cdp.messages.find(message => message.id === id)?.error, route).toEqual({
+				code: -32000,
+				message: "Refusing to close a borrowed user tab",
+			});
+		}
+
+		expect(ext.rpcs("removeTab")).toEqual([]);
+		expect(
+			ext.rpcs("send").filter(command => command.method === "Page.close" || command.method === "Target.closeTarget"),
+		).toEqual([]);
+	});
+
+	it("lets any connection close a relay-created tab while still refusing a borrowed one", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const creator = new FakeCdpSocket();
+		const creatorId = bridge.cdpConnected(creator);
+		bridge.cdpMessage(creatorId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 9 }) });
+		await flush();
+
+		// Ownership cleanup runs on its own supervisor connection (the one whose
+		// worker died), so the created tab must stay closable from a peer that
+		// never created it — while the user's pre-existing tab stays refused.
+		const cleanup = new FakeCdpSocket();
+		const cleanupId = bridge.cdpConnected(cleanup);
+		const borrowedId = ++msgSeq;
+		bridge.cdpMessage(
+			cleanupId,
+			JSON.stringify({ id: borrowedId, method: "Target.closeTarget", params: { targetId: `PAGE${ANON}.1` } }),
+		);
+		await flush();
+		expect(cleanup.messages.find(message => message.id === borrowedId)?.error).toEqual({
+			code: -32000,
+			message: "Refusing to close a borrowed user tab",
+		});
+
+		const ownedId = ++msgSeq;
+		bridge.cdpMessage(
+			cleanupId,
+			JSON.stringify({ id: ownedId, method: "Target.closeTarget", params: { targetId: `PAGE${ANON}.9` } }),
+		);
+		ack(bridge, ext, "removeTab");
+		await flush();
+		expect(cleanup.messages.find(message => message.id === ownedId)?.result).toEqual({ success: true });
+		expect(ext.rpcs("removeTab").map(command => command.tabId)).toEqual([9]);
+	});
+});
+
 describe("RelayBridge tab grouping", () => {
 	it("groups nothing on hello or tab lifecycle events — only claimed tabs join the omp group", () => {
 		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });

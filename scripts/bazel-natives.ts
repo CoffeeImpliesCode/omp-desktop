@@ -390,6 +390,11 @@ async function main(): Promise<void> {
 		backend === "cargo" ||
 		host.platform === "win32" ||
 		(backend !== "bazel" && hostOnly && options.bazelArgs.length === 0);
+	if (Bun.env.OMP_NATIVE_FEATURES?.trim() && (!cargoBackend || !hostOnly || options.source)) {
+		throw new Error(
+			"OMP_NATIVE_FEATURES requires a local Cargo/N-API build; Bazel targets and prebuilt addons cannot apply it.",
+		);
+	}
 	if (cargoBackend && !options.source) {
 		if (!hostOnly) {
 			if (host.platform === "win32") {

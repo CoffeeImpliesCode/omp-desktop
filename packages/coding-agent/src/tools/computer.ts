@@ -1,11 +1,12 @@
 import { type Type, type } from "@oh-my-pi/omptype";
 import type { AgentToolResult, ToolApprovalDecision } from "@oh-my-pi/pi-agent-core";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { classifyModel } from "@oh-my-pi/pi-catalog/identity";
 import type { DesktopCapabilities } from "@oh-my-pi/pi-natives";
-import { once } from "@oh-my-pi/pi-utils";
+import { logger, once } from "@oh-my-pi/pi-utils";
 import { callSessionTool } from "../eval/js/tool-bridge";
-import type { EvalPreludeContext, EvalPreludeDefinition } from "../eval/preludes";
+import type { EvalPreludeCell, EvalPreludeContext, EvalPreludeDefinition } from "../eval/preludes";
+import computerGuideDeliveryPrompt from "../prompts/system/computer-guide-delivery.md" with { type: "text" };
 import computerUsePrompt from "../prompts/system/computer-use.md" with { type: "text" };
 import { enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { type ComputerCallStep, isReadOnlyComputerCall, renderComputerCall } from "./computer/call";
@@ -129,11 +130,86 @@ export function createComputerPrelude(
 	// JavaScript or Python kernel actually asks for its enabled preludes.
 	const { computerPreludeAssets } = require("./computer/prelude-definition");
 	let closed = false;
+	// Conversations (by session id) that already received the guide. The
+	// prelude outlives `/new` and session switches, so this is per id.
+	const taught = new Set<string | null>();
+	const teachGuide = (): string | undefined => {
+		// A session that cannot `read` has the guide inline in the eval description.
+		if (session.isToolActive?.("read") === false) return undefined;
+		const conversation = session.getSessionId?.() ?? null;
+		if (taught.has(conversation)) return undefined;
+		taught.add(conversation);
+		return computerPreludeAssets.documentation;
+	};
+	/** The post-input report of a cell that reached the desktop. */
+	const settleReport = async (
+		cell: EvalPreludeCell,
+		output: string,
+	): Promise<{ text?: string; images?: ImageContent[] } | undefined> => {
+		if (closed || !controller.settle) return undefined;
+		try {
+			const report = await controller.settle(
+				buildComputerSnapshot(session, true, cellIdFor(cell)),
+				output,
+				cell.signal,
+			);
+			if (!report) return undefined;
+			// Every computer frame is already the capped capture saved on disk.
+			return { text: report.text, images: report.images?.map(image => ({ ...image, detail: "original" })) };
+		} catch (error) {
+			// Cancellation of the turn needs no report; anything else leaves the
+			// model without its post-input observation, so it is told to look.
+			if (cell.signal.aborted) return undefined;
+			const message = error instanceof Error ? error.message : String(error);
+			logger.debug("Computer cell settle failed", { error: message });
+			return {
+				text: `No post-input report for this cell (${message}); read the windows it touched before continuing.`,
+			};
+		}
+	};
+	// Cells whose cancellation must discard what they left pending, and the
+	// handles that release those listeners: a settled or closed prelude leaves none.
+	const watching = new Set<() => void>();
+	const detachers = new WeakMap<EvalPreludeCell, () => void>();
+	const watched = new WeakSet<EvalPreludeCell>();
+	const watchCell = (cell: EvalPreludeCell): void => {
+		const cellId = cellIdFor(cell);
+		if (!cellId) return;
+		if (cell.signal.aborted) {
+			controller.discardCell?.(cellId);
+			return;
+		}
+		const onAbort = (): void => {
+			detachCell(cell);
+			controller.discardCell?.(cellId);
+		};
+		const detach = (): void => {
+			cell.signal.removeEventListener("abort", onAbort);
+			watching.delete(detach);
+			detachers.delete(cell);
+		};
+		cell.signal.addEventListener("abort", onAbort, { once: true });
+		watching.add(detach);
+		detachers.set(cell, detach);
+	};
+	const detachCell = (cell: EvalPreludeCell): void => {
+		detachers.get(cell)?.();
+	};
+	const detachAll = (): void => {
+		for (const detach of watching) detach();
+	};
+	// Cells whose code reached the desktop; only these are settled.
+	const cells = new WeakSet<EvalPreludeCell>();
+	// Cells that looked a window up directly: the conversation's first to settle
+	// carries the guide after its output, whether the lookup hit, missed or was
+	// caught, so the next call is not a guess.
+	const lookups = new WeakSet<EvalPreludeCell>();
 	const lifetime: ComputerLifetime = {
 		isClosed: () => closed,
 		close: async () => {
 			if (closed) return;
 			closed = true;
+			detachAll();
 			unregisterOwner();
 			await controller.close();
 		},
@@ -142,6 +218,7 @@ export function createComputerPrelude(
 	return {
 		name: "computer",
 		documentation: computerPreludeAssets.documentation,
+		documentationDelivery: computerGuideDeliveryPrompt.trim(),
 		javascript: computerPreludeAssets.javascript,
 		python: computerPreludeAssets.python,
 		exports: ["computer"],
@@ -154,9 +231,34 @@ export function createComputerPrelude(
 			if (parsed instanceof type.errors) {
 				throw new ToolError(`computer received invalid arguments: ${parsed.summary}`);
 			}
+			if (context.cell && (parsed.action === "run" || parsed.action === "call")) {
+				cells.add(context.cell);
+				if (!watched.has(context.cell)) {
+					watched.add(context.cell);
+					watchCell(context.cell);
+				}
+				const [first, ...rest] = parsed.action === "call" ? parsed.chain : [];
+				if (rest.length === 0 && (first?.method === "window" || first?.method === "focusedWindow")) {
+					lookups.add(context.cell);
+				}
+			}
 			return await invokeComputer(session, controller, parsed, context, lifetime);
 		},
 		status: describeComputerCall,
+		settleCell: async (cell, { output }) => {
+			if (!cells.has(cell)) return undefined;
+			cells.delete(cell);
+			try {
+				const report = await settleReport(cell, output);
+				// Taught only once the turn will carry it.
+				const guide = lookups.has(cell) && !cell.signal.aborted ? teachGuide() : undefined;
+				if (guide === undefined) return report;
+				return report?.text ? { ...report, text: `${guide}\n\n${report.text}` } : { text: guide };
+			} finally {
+				// Settled either way: the cell owes no more work, so its listener goes.
+				detachCell(cell);
+			}
+		},
 	};
 }
 
@@ -180,6 +282,22 @@ interface ComputerLifetime {
 	close(): Promise<void>;
 }
 
+/** Opaque identity per eval cell, stable for as long as the prelude lives. */
+const cellIdentities = new WeakMap<EvalPreludeCell, string>();
+let mintedCells = 0;
+
+/**
+ * The worker's identity of an eval cell, shared by that cell's native runs and
+ * its settle. Never a native request or run id: those are per call, and two
+ * cells overlap on the same worker.
+ */
+function cellIdFor(cell: EvalPreludeCell | undefined): string | undefined {
+	if (!cell) return undefined;
+	let id = cellIdentities.get(cell);
+	if (id === undefined) cellIdentities.set(cell, (id = `eval-cell-${++mintedCells}`));
+	return id;
+}
+
 async function invokeComputer(
 	session: ToolSession,
 	controller: ComputerController,
@@ -193,7 +311,7 @@ async function invokeComputer(
 		case "run":
 		case "call":
 			if (lifetime.isClosed()) throw new ToolError("Computer session is closed");
-			return await runComputer(session, controller, params, context.signal);
+			return await runComputer(session, controller, params, context.signal, cellIdFor(context.cell));
 		case "capabilities": {
 			const capabilities = lifetime.isClosed()
 				? undefined
@@ -235,7 +353,7 @@ function resolveComputerRunCode(params: ComputerRunParams | ComputerCallParams):
 }
 
 /** Freezes the current session settings into the snapshot every worker command carries. */
-function buildComputerSnapshot(session: ToolSession, readOnly: boolean): ComputerSessionSnapshot {
+function buildComputerSnapshot(session: ToolSession, readOnly: boolean, cellId?: string): ComputerSessionSnapshot {
 	const coordinateSafe = usesCoordinateSafeImageSizing(session.getActiveModel?.());
 	const configuredMaxWidth = cfgComputerMaxWidth.get(session.settings);
 	const configuredMaxHeight = cfgComputerMaxHeight.get(session.settings);
@@ -250,6 +368,7 @@ function buildComputerSnapshot(session: ToolSession, readOnly: boolean): Compute
 			: configuredMaxHeight,
 		display: cfgComputerDisplay.get(session.settings),
 		readOnly,
+		cellId,
 	};
 }
 
@@ -258,12 +377,12 @@ async function runComputer(
 	controller: ComputerController,
 	params: ComputerRunParams | ComputerCallParams,
 	signal?: AbortSignal,
+	cellId?: string,
 ): Promise<AgentToolResult<unknown>> {
 	const code = resolveComputerRunCode(params);
-	// Direct inspection calls run read-only so the desktop guard backs the read approval tier.
-	const readOnly = params.action === "call" ? isReadOnlyComputerCall(params.chain) : (params.read_only ?? false);
+	const readOnly = params.action === "call" ? isReadOnlyComputerCall(params.chain) : params.read_only === true;
 	const timeoutSeconds = clampTimeout("computer", params.timeout, cfgToolsMaxTimeout.get(session.settings));
-	const snapshot = buildComputerSnapshot(session, readOnly);
+	const snapshot = buildComputerSnapshot(session, readOnly, cellId);
 	const run = await controller.run(code, timeoutSeconds * 1000, snapshot, signal);
 	throwIfAborted(signal);
 
