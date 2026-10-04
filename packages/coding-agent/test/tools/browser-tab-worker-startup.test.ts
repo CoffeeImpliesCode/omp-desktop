@@ -337,7 +337,7 @@ describe("OMP-owned browser evaluation", () => {
 				const collected = await page.$$eval("button", elements => elements.map(element => element.textContent));
 				const frameCount = await page.mainFrame().$$eval("button", elements => elements.length);
 				const single = await page.$eval("button", element => element.textContent);
-				const direct = await page.evaluate(() => document.querySelectorAll("button").length);
+				const direct = await page.evaluate("document.querySelectorAll('button').length");
 				Error.stackTraceLimit = stackTraceLimit;
 				expect({ collected, frameCount, single, direct }).toEqual({
 					collected: ["First", "Second"],
