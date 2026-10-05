@@ -28,6 +28,17 @@
 - Fixed Wayland text input using keymaps whose shared file descriptor is at EOF or whose groups have numeric labels, and kept Enter mapped to its control key ([#13848](https://github.com/can1357/oh-my-pi/issues/13848)).
 - Kept libei input waiting for every granted device to become ready and bounded discovery even under continuous events ([#13210](https://github.com/can1357/oh-my-pi/pull/13210) by [@Komzpa](https://github.com/Komzpa)).
 - Allowed X11 startup when inherited Wayland sockets are stale without falling back on permission or live-session failures ([#10752](https://github.com/can1357/oh-my-pi/pull/10752) by [@jake8302](https://github.com/jake8302)).
+## [18.6.2] - 2026-10-04
+
+### Fixed
+
+- Fixed short snapcompact PNGs being emitted below the minimum dimensions accepted by some vision backends ([#14355](https://github.com/can1357/oh-my-pi/issues/14355)).
+
+## [18.6.1] - 2026-10-04
+
+### Fixed
+
+- Fixed concurrent searches through host-provided filesystem callbacks so they no longer starve other asynchronous filesystem operations, and ensured canceled searches release promptly.
 
 ## [18.5.1] - 2026-10-03
 
