@@ -316,9 +316,8 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay page ownership across worker recover
 			ownsPage: true,
 			recover: true,
 			emulateFocus: true,
-			timeoutMs: 10_000,
 		};
-		const failed = startWorker({ ...payload, url: "omp-invalid-scheme://recovery" });
+		const failed = startWorker(payload);
 		let retried: TestWorker | undefined;
 		try {
 			// A retry adopts this same target, so a failed init must not destroy

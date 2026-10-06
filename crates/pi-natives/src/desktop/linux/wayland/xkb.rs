@@ -62,11 +62,9 @@ pub(super) struct KeyboardLayout {
 }
 
 impl KeyboardLayout {
-	/// Compiles the keymap behind a libei keymap fd. That fd is a duplicate of
-	/// the compositor's own descriptor, so both share one open file description
-	/// and therefore one offset, which the compositor leaves at EOF once it has
-	/// serialized the keymap. Read positionally: a relative read would find
-	/// nothing there and would move the compositor's offset while doing it.
+	/// Compiles the keymap behind a libei keymap fd. The fd shares its file
+	/// offset with the compositor's copy, which may sit at EOF, so the keymap is
+	/// read positionally from offset 0.
 	pub(super) fn from_fd(fd: OwnedFd, size: usize) -> Option<Self> {
 		let mut bytes = vec![0; size];
 		File::from(fd).read_exact_at(&mut bytes, 0).ok()?;
@@ -74,7 +72,7 @@ impl KeyboardLayout {
 		Self::compile(std::str::from_utf8(text).ok()?)
 	}
 
-	fn compile(source: &str) -> Option<Self> {
+	pub(super) fn compile(source: &str) -> Option<Self> {
 		let keycodes = parse_keycodes(extract_section(source, "xkb_keycodes")?);
 		let symbols_section = extract_section(source, "xkb_symbols")?;
 		let keys = parse_keys(symbols_section, &keycodes);
@@ -277,27 +275,26 @@ fn parse_keys(section: &str, keycodes: &HashMap<String, u32>) -> Vec<ParsedKey> 
 	keys
 }
 
-/// Finds the next `label` group index at or after `from`, returning the
-/// zero-based group and the byte offset past its `]`. xkbcomp labels groups
-/// `symbols[Group1]`; libxkbcommon's keymap serializer labels the same group
-/// `symbols[1]`, and only the numeric spelling reaches a compositor that hands
-/// the serialized keymap over as a keymap fd.
+/// Finds the next group index and byte offset past its closing bracket.
+/// xkbcomp writes `Group1`; libxkbcommon may serialize the numeric `1`.
 fn next_group_label(body: &str, label: &str, from: usize) -> Option<(usize, usize)> {
 	let start = from + body[from..].find(label)? + label.len();
 	let end = start + body[start..].find(']')?;
 	let index = body[start..end].trim();
-	let label_index = index.strip_prefix("Group").unwrap_or(index);
-	let group = label_index.parse::<usize>().ok()?.checked_sub(1)?;
+	let group = index
+		.strip_prefix("Group")
+		.unwrap_or(index)
+		.parse::<usize>()
+		.ok()?
+		.checked_sub(1)?;
 	Some((group, end + 1))
 }
 
-/// The first double-quoted name in `section`, borrowed.
 fn quoted_name(section: &str) -> Option<&str> {
 	let start = section.find('"')? + 1;
 	let len = section[start..].find('"')?;
 	Some(&section[start..start + len])
 }
-
 fn parse_group_types(body: &str) -> HashMap<usize, String> {
 	let mut types = HashMap::new();
 	let mut offset = 0;
@@ -569,7 +566,6 @@ mod tests {
 		io::{Seek, SeekFrom, Write},
 		os::fd::{FromRawFd, OwnedFd},
 	};
-
 	use super::{KeyStroke, KeyboardLayout};
 
 	const FR: &str = include_str!("testdata/fr.xkb");

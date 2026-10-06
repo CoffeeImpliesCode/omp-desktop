@@ -341,6 +341,18 @@ export function adaptDesktopSession(NativeDesktopSession) {
 			await this.#execute({ type: "keypress", keys }, target, this.#capturedTargets.get(target)?.native ?? this.#native);
 		}
 
+		async raiseWindow(windowId) {
+			this.#ensureOpen();
+			if (typeof this.#native.raise_window !== "function") {
+				throw desktopError("ControlUnsupported", "window raise is unavailable in the installed native addon");
+			}
+			try {
+				await this.#native.raise_window(windowId);
+			} catch (error) {
+				throw normalizeError(error, "ControlFailed");
+			}
+		}
+
 		async control() {
 			this.#ensureOpen();
 			throw controlUnsupported("window control");

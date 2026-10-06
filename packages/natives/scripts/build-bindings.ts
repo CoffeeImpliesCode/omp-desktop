@@ -7,8 +7,9 @@
  *
  * `OMP_NATIVE_CARGO_PROFILE` selects the cargo profile (default `local`:
  * incremental, unstripped). Image builds set `ci` for a stripped addon.
- * `OMP_NATIVE_FEATURES` adds comma- or space-separated Cargo features without
- * removing the default Wayland PipeWire capture feature.
+ * `OMP_NATIVE_FEATURES` adds comma- or space-separated Cargo features to the
+ * local napi build while retaining the default Wayland PipeWire capture feature.
+ * Cargo passes them to `napi build --features`; Bazel builds ignore this option.
  */
 
 import * as fsSync from "node:fs";
@@ -251,6 +252,8 @@ const napiArgs = [
 	"--features",
 	extraFeatures ? `wayland-pipewire,${extraFeatures}` : "wayland-pipewire",
 ];
+
+// Optional features accompany the default PipeWire capture feature above.
 
 // napi-rs / cargo route much failure detail to stdout (e.g. `cargo metadata`
 // errors), so a stderr-only error collapses real failures to a bare message.

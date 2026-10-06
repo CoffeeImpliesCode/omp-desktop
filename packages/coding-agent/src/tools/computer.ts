@@ -211,9 +211,13 @@ export function createComputerPrelude(
 			closed = true;
 			detachAll();
 			unregisterOwner();
+			unregisterDisposal?.();
 			await controller.close();
 		},
 	};
+	const unregisterDisposal = session.registerDisposeCallback?.(() => {
+		void lifetime.close();
+	});
 
 	return {
 		name: "computer",
@@ -311,7 +315,7 @@ async function invokeComputer(
 		case "run":
 		case "call":
 			if (lifetime.isClosed()) throw new ToolError("Computer session is closed");
-			return await runComputer(session, controller, params, context.signal, cellIdFor(context.cell));
+			return await runComputer(session, controller, params, context);
 		case "capabilities": {
 			const capabilities = lifetime.isClosed()
 				? undefined
@@ -376,14 +380,14 @@ async function runComputer(
 	session: ToolSession,
 	controller: ComputerController,
 	params: ComputerRunParams | ComputerCallParams,
-	signal?: AbortSignal,
-	cellId?: string,
+	context: EvalPreludeContext,
 ): Promise<AgentToolResult<unknown>> {
+	const signal = context.signal;
 	const code = resolveComputerRunCode(params);
 	const readOnly = params.action === "call" ? isReadOnlyComputerCall(params.chain) : params.read_only === true;
 	const timeoutSeconds = clampTimeout("computer", params.timeout, cfgToolsMaxTimeout.get(session.settings));
-	const snapshot = buildComputerSnapshot(session, readOnly, cellId);
-	const run = await controller.run(code, timeoutSeconds * 1000, snapshot, signal);
+	const snapshot = buildComputerSnapshot(session, readOnly, cellIdFor(context.cell));
+	const run = await controller.run(code, timeoutSeconds * 1000, snapshot, signal, context.context);
 	throwIfAborted(signal);
 
 	const details: ComputerPreludeDetails = {

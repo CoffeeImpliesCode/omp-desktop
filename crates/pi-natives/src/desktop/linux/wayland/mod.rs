@@ -12,7 +12,7 @@ use image::RgbaImage;
 
 use crate::desktop::{
 	backend::{AxBackend, Backend, DeliveryMode, PointerEvent},
-	control::ControlAction,
+	control::{self, ControlAction, OperationToken},
 	error::{CoreResult, DesktopError},
 	frame::FrameGeometry,
 	keys::KeyName,
@@ -74,6 +74,7 @@ impl WaylandBackend {
 		kind: &str,
 		action: impl FnOnce(&mut libei::Libei) -> CoreResult<()>,
 	) -> CoreResult<()> {
+		control::check()?;
 		Self::window_input_error(target, kind)?;
 		if self.input.is_none() {
 			self.input = Some(libei::Libei::new()?);
@@ -118,6 +119,11 @@ impl Backend for WaylandBackend {
 			ax: self.ax.is_some(),
 			background_window_input: false,
 			takeover: false,
+			applications: crate::desktop::applications::supported(),
+			menus: self.ax.is_some(),
+			held_input: true,
+			spaces: false,
+			global_escape: false,
 			capture_permission: if cfg!(feature = "wayland-pipewire") {
 				"prompt-or-granted".to_string()
 			} else {
@@ -140,6 +146,38 @@ impl Backend for WaylandBackend {
 		Ok(self.displays.clone())
 	}
 
+	fn validate_frame_layout(&mut self, frame: &FrameGeometry) -> CoreResult<()> {
+		control::check()?;
+		#[cfg(not(feature = "wayland-pipewire"))]
+		{
+			let _ = frame;
+			Err(DesktopError::invalid_coordinate_frame(
+				"validating Wayland display geometry requires the wayland-pipewire feature",
+			))
+		}
+		#[cfg(feature = "wayland-pipewire")]
+		{
+			// ScreenCast exposes geometry only when opening a stream. Enumeration
+			// can use the last snapshot, but coordinate delivery needs fresh
+			// bounds.
+			let geometry = capture::geometry();
+			control::check()?;
+			let geometry = geometry.map_err(|error| {
+				DesktopError::invalid_coordinate_frame(format!(
+					"could not refresh Wayland display geometry: {error}"
+				))
+			})?;
+			let mut displays = geometry
+				.into_iter()
+				.enumerate()
+				.map(|(index, item)| item.display(index))
+				.collect::<Vec<_>>();
+			geometry::layout(&mut displays)?;
+			self.displays = displays;
+			frame.validate_layout(&self.displays)
+		}
+	}
+
 	fn windows(&mut self) -> CoreResult<Vec<DesktopWindow>> {
 		// niri is the authority on what is open, but its IPC is optional
 		// metadata for a listing: a restarting compositor leaves a
@@ -155,14 +193,30 @@ impl Backend for WaylandBackend {
 			.collect())
 	}
 
+	fn focused_keyboard_window(&mut self) -> CoreResult<DesktopWindow> {
+		let entry = self
+			.atspi_windows()?
+			.into_iter()
+			.find(|entry| entry.window.focused)
+			.ok_or_else(|| DesktopError::invalid_target("no focused Wayland window was found"))?;
+		if !entry.position_known {
+			return Err(DesktopError::invalid_target(
+				"the focused Wayland surface has no known global position; cannot safely target \
+				 display keyboard input",
+			));
+		}
+		Ok(entry.window)
+	}
+
 	fn capture(
 		&mut self,
 		target: &Target,
 		_caps: &CaptureCaps,
+		selector: Option<&DisplaySelector>,
 	) -> CoreResult<(RgbaImage, FrameGeometry)> {
 		#[cfg(not(feature = "wayland-pipewire"))]
 		{
-			let _ = target;
+			let _ = (target, selector);
 			Err(DesktopError::capture_failed("Wayland capture requires the wayland-pipewire feature"))
 		}
 		#[cfg(feature = "wayland-pipewire")]
@@ -174,15 +228,18 @@ impl Backend for WaylandBackend {
 				let frame = FrameGeometry::for_window(&window, image.width(), image.height());
 				return Ok((image, frame));
 			}
-			// Known displays only name and match the streams the portal
-			// authorized, so an unreachable compositor leaves the portal's own
-			// geometry to stand on rather than refusing a screenshot it can
-			// take.
+			// The portal reports the authorized stream geometry. Use niri only
+			// to enrich display names and match known monitors.
 			let known = niri::displays().ok().flatten().unwrap_or_default();
 			let frames = capture::capture()?;
+			self.displays = geometry::metadata(&frames, &known);
+			let explicit = target.display_selector();
+			let selected = selector
+				.or(explicit.as_ref())
+				.unwrap_or(&self.display);
 			match target {
-				Target::Desktop => {
-					let (image, displays) = geometry::compose(frames, &self.display, &known)?;
+				Target::Desktop | Target::Display(_) => {
+					let (image, displays) = geometry::compose(frames, selected, &known)?;
 					let frame = FrameGeometry::for_displays(&displays);
 					self.displays = displays;
 					Ok((image, frame))
@@ -203,7 +260,7 @@ impl Backend for WaylandBackend {
 					}
 					let displays = geometry::metadata(&frames, &known);
 					for ((image, geometry), display) in frames.iter().zip(&displays) {
-						if matches!(&self.display, DisplaySelector::Id(id) if id != &display.id && id != &display.name)
+						if matches!(selected, DisplaySelector::Id(id) if id != &display.id && id != &display.name)
 						{
 							continue;
 						}
@@ -227,11 +284,20 @@ impl Backend for WaylandBackend {
 		ev: PointerEvent,
 		_frame: &FrameGeometry,
 		_mode: DeliveryMode,
+		token: &OperationToken,
 	) -> CoreResult<()> {
+		token.check()?;
 		self.run_input(target, "pointer input", |input| input.pointer(ev))
 	}
 
-	fn type_text(&mut self, target: &Target, text: &str, _mode: DeliveryMode) -> CoreResult<()> {
+	fn type_text(
+		&mut self,
+		target: &Target,
+		text: &str,
+		_mode: DeliveryMode,
+		token: &OperationToken,
+	) -> CoreResult<()> {
+		token.check()?;
 		self.run_input(target, "keyboard input", |input| input.type_text(text))
 	}
 
@@ -240,14 +306,44 @@ impl Backend for WaylandBackend {
 		target: &Target,
 		keys: &[KeyName],
 		_mode: DeliveryMode,
+		token: &OperationToken,
 	) -> CoreResult<()> {
+		token.check()?;
 		self.run_input(target, "keyboard input", |input| input.key_chord(keys))
 	}
 
-	fn raise_window(&mut self, id: &str) -> CoreResult<()> {
-		// niri is the one compositor on this platform that answers "activate
-		// this window"; a generic Wayland session still has no way to move
-		// focus, and that stays a compositor constraint rather than a guess.
+	fn hold_keys(
+		&mut self,
+		target: &Target,
+		keys: &[KeyName],
+		duration: std::time::Duration,
+		_mode: DeliveryMode,
+		token: &OperationToken,
+	) -> CoreResult<()> {
+		token.check()?;
+		self.run_input(target, "held keyboard input", |input| input.hold_keys(keys, duration))
+	}
+
+	fn menu_items(
+		&mut self,
+		window: &DesktopWindow,
+		path: &[String],
+	) -> CoreResult<Vec<crate::desktop::menus::DesktopMenuItem>> {
+		super::menus::items(window, path)
+	}
+
+	fn menu_select(
+		&mut self,
+		window: &DesktopWindow,
+		path: &[String],
+		token: &OperationToken,
+	) -> CoreResult<()> {
+		token.check()?;
+		super::menus::select(window, path)
+	}
+
+	fn raise_window(&mut self, id: &str, token: &OperationToken) -> CoreResult<()> {
+		token.check()?;
 		if id.starts_with(niri::ID_PREFIX) && niri::compatible() {
 			return niri::focus(id);
 		}
@@ -429,7 +525,12 @@ mod tests {
 	#[test]
 	fn desktop_input_connects_to_libei_lazily() {
 		let connected = with_fake_libei(|backend| {
-			let _ = backend.type_text(&Target::Desktop, "hello", DeliveryMode::Foreground);
+			let _ = backend.type_text(
+				&Target::Desktop,
+				"hello",
+				DeliveryMode::Foreground,
+				&control::CancellationSource::default().token(),
+			);
 		});
 		assert!(connected, "desktop input did not connect to libei");
 	}
@@ -445,16 +546,69 @@ mod tests {
 				)
 			};
 			let first = backend
-				.type_text(&Target::Desktop, "hello", DeliveryMode::Foreground)
+				.type_text(
+					&Target::Desktop,
+					"hello",
+					DeliveryMode::Foreground,
+					&control::CancellationSource::default().token(),
+				)
 				.expect_err("missing socket must fail");
 			assert_eq!(first.code.as_str(), "PermissionDenied");
 			let caps = backend.capabilities();
 			assert!(caps.input);
 			assert_eq!(caps.input_permission, "prompt-or-granted");
 			unsafe { std::env::set_var("LIBEI_SOCKET", socket) };
-			let _ = backend.type_text(&Target::Desktop, "hello", DeliveryMode::Foreground);
+			let _ = backend.type_text(
+				&Target::Desktop,
+				"hello",
+				DeliveryMode::Foreground,
+				&control::CancellationSource::default().token(),
+			);
 		});
 		assert!(connected, "a failed input request prevented the next connection attempt");
+	}
+
+	#[test]
+	fn display_enumeration_preserves_last_capture_snapshot() {
+		let mut backend = backend_without_services();
+		backend
+			.displays
+			.push(PortalGeometry::new(None, None, 1920, 1080).display(0));
+		let displays = backend.displays().unwrap();
+		assert_eq!(displays.len(), 1);
+		assert_eq!((displays[0].width, displays[0].height), (1920, 1080));
+	}
+
+	#[test]
+	#[cfg(not(feature = "wayland-pipewire"))]
+	fn display_validation_never_trusts_cached_portal_geometry() {
+		let mut backend = backend_without_services();
+		backend
+			.displays
+			.push(PortalGeometry::new(None, None, 1920, 1080).display(0));
+		let frame = FrameGeometry::for_displays(&backend.displays);
+		let error = backend.validate_frame_layout(&frame).unwrap_err();
+		assert_eq!(error.code.as_str(), "InvalidCoordinateFrame");
+	}
+
+	#[test]
+	fn cancelled_mutations_stop_before_initializing_input() {
+		let mut backend = backend_without_services();
+		let source = control::CancellationSource::default();
+		let token = source.token();
+		source.cancel();
+		assert!(
+			backend
+				.type_text(&Target::Desktop, "hello", DeliveryMode::Foreground, &token)
+				.is_err()
+		);
+		assert!(backend.input.is_none());
+		assert!(
+			backend
+				.key_chord(&Target::Desktop, &[KeyName::Enter], DeliveryMode::Foreground, &token)
+				.is_err()
+		);
+		assert!(backend.input.is_none());
 	}
 
 	#[test]
@@ -462,7 +616,12 @@ mod tests {
 		let mut backend = backend_without_services();
 		let target = Target::Window("w1".to_string());
 		let err = backend
-			.type_text(&target, "hello", DeliveryMode::Foreground)
+			.type_text(
+				&target,
+				"hello",
+				DeliveryMode::Foreground,
+				&control::CancellationSource::default().token(),
+			)
 			.expect_err("window foreground input must fail");
 		assert_eq!(err.code.as_str(), "BackgroundUnavailable");
 	}
@@ -471,7 +630,7 @@ mod tests {
 	fn window_raise_reports_compositor_constraint() {
 		let mut backend = backend_without_services();
 		let err = backend
-			.raise_window("w1")
+			.raise_window("w1", &control::CancellationSource::default().token())
 			.expect_err("Wayland window raise must fail");
 		assert_eq!(err.code.as_str(), "BackgroundUnavailable");
 	}
@@ -492,7 +651,7 @@ mod tests {
 		assert!(!caps.capture, "capture must be false when the pipewire feature is off");
 		assert_eq!(caps.capture_permission, "unavailable");
 		let err = backend
-			.capture(&Target::Desktop, &CaptureCaps::default())
+			.capture(&Target::Desktop, &CaptureCaps::default(), None)
 			.expect_err("capture must fail without the pipewire feature");
 		assert_eq!(err.code.as_str(), "CaptureFailed");
 	}

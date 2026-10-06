@@ -6,10 +6,7 @@
 //! desktops go through EWMH/ICCCM messages on this one connection, never
 //! through synthetic input and never through a client kill.
 
-use std::{
-	thread,
-	time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use x11rb::{
 	COPY_DEPTH_FROM_PARENT, NONE,
@@ -24,7 +21,10 @@ use x11rb::{
 	rust_connection::RustConnection,
 };
 
-use crate::desktop::error::{CoreResult, DesktopError};
+use crate::desktop::{
+	control,
+	error::{CoreResult, DesktopError},
+};
 
 /// Bound on ancestor/descendant walks.
 const TREE_WALK_LIMIT: usize = 32;
@@ -384,8 +384,7 @@ impl Wm<'_> {
 			.query_tree(window)
 			.ok()
 			.and_then(|cookie| cookie.reply().ok())
-			.map(|reply| reply.children)
-			.unwrap_or_default()
+			.map_or_default(|reply| reply.children)
 	}
 
 	/// Whether `window` is `target` or one of its descendants.
@@ -537,13 +536,20 @@ impl Wm<'_> {
 		let deadline = Instant::now() + Duration::from_millis(300);
 		let mut time = x11rb::CURRENT_TIME;
 		while Instant::now() < deadline {
+			if control::check().is_err() {
+				break;
+			}
 			match self.conn.poll_for_event() {
 				Ok(Some(Event::PropertyNotify(event))) if event.window == probe => {
 					time = event.time;
 					break;
 				},
 				Ok(Some(_)) => {},
-				Ok(None) => thread::sleep(Duration::from_millis(2)),
+				Ok(None) => {
+					if control::wait(Duration::from_millis(2)).is_err() {
+						break;
+					}
+				},
 				Err(_) => break,
 			}
 		}
@@ -560,6 +566,20 @@ impl Wm<'_> {
 		window: Window,
 		current: Option<Window>,
 	) -> CoreResult<()> {
+		self.activate(window, current, false)
+	}
+
+	pub(super) fn restore_activation(&self, window: Window, current: Window) -> CoreResult<()> {
+		self.activate(window, Some(current), true)
+	}
+
+	fn activate(&self, window: Window, current: Option<Window>, restoring: bool) -> CoreResult<()> {
+		control::check()?;
+		// Timestamp acquisition can yield to physical input. Re-check the
+		// guard immediately before requesting a restore, not just before it.
+		if restoring && !current.is_some_and(|current| self.is_focused(current, true)) {
+			return Ok(());
+		}
 		let time = self.server_time();
 		self.send_to_root(window, self.atoms.net_active_window, [
 			2,
@@ -568,6 +588,14 @@ impl Wm<'_> {
 			0,
 			0,
 		])?;
+		control::check()?;
+		// Never override a newer focus switch while the WM handles the request.
+		if restoring
+			&& !self.is_focused(window, true)
+			&& !current.is_some_and(|current| self.is_focused(current, true))
+		{
+			return Ok(());
+		}
 		// BadMatch on a not-yet-viewable window is expected; callers confirm.
 		if let Ok(cookie) = self.conn.set_input_focus(InputFocus::PARENT, window, time) {
 			let _ = cookie.check();
@@ -872,6 +900,7 @@ impl FocusSnapshot {
 	pub(super) fn check(&self, wm: Wm<'_>, target: Window) -> CoreResult<()> {
 		let watch_until = Instant::now() + FOCUS_SETTLE_WATCH;
 		loop {
+			control::check()?;
 			if self.changed(wm) {
 				let moved_to_target = (self.active != Some(target)
 					&& wm.active_window() == Some(target))
@@ -892,7 +921,7 @@ impl FocusSnapshot {
 			if Instant::now() >= watch_until {
 				return Ok(());
 			}
-			thread::sleep(FOCUS_POLL);
+			control::wait(FOCUS_POLL)?;
 		}
 	}
 }

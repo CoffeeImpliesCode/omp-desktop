@@ -83,7 +83,7 @@ reproduced verbatim (it contains no secrets or redactable host identifiers; the
 # for interactive/agent use on the runner.
 FROM ghcr.io/actions/actions-runner:latest
 
-ARG RUST_NIGHTLY=nightly-2026-09-14
+ARG RUST_NIGHTLY=nightly-2026-10-06
 ARG BUN_VERSION=1.4.2
 ARG SCCACHE_VERSION=0.18.0
 ARG ZIG_VERSION=0.16.0
@@ -382,9 +382,15 @@ next job's microVM starts cold but with warm dependencies from the local store.
 
 1. **bun:** edit `ARG BUN_VERSION=` in the Dockerfile (or pass
    `--build-arg BUN_VERSION=...`).
-2. **Rust:** edit `ARG RUST_NIGHTLY=` to the `channel` in `rust-toolchain.toml`,
-   and keep the `rustup target add` list a superset of the toml's `targets`, so
-   rustup's per-job install stays a no-op.
+2. **Rust:** `rust-toolchain.toml` pins an exact dated nightly, not the moving
+   `nightly` channel. Rustup installs that exact pin on the first Cargo
+   invocation; `rustup update nightly` updates only the moving channel and does
+   not advance this repo's pin. To update the repo, choose a new dated nightly,
+   set `channel` in `rust-toolchain.toml` and `ARG RUST_NIGHTLY` in
+   `infra/runner.Dockerfile` to the same value, and update the date and
+   checksums in `MODULE.bazel` for Bazel's separately downloaded Rust
+   toolchains. Keep the runner's `rustup target add` list a superset of the
+   toml's `targets`.
 3. **apt set:** edit the `apt-get install` line. No workflow mirrors it any
    more, so nothing else needs changing.
 4. Re-roll:

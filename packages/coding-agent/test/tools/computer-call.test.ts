@@ -204,6 +204,35 @@ describe("allowlist rejection", () => {
 					{ method: "click", args: [1, 2] },
 				]),
 			),
-		).toContain("windows");
+		).toBe(
+			"Only desktop.window(id)/desktop.display(id)/desktop.ref(ref) results accept a chained call; got desktop.windows().",
+		);
+		expect(
+			errorMessage(() =>
+				renderComputerCall([
+					{ method: "window", args: ["42"] },
+					{ method: "setValue", args: ["x"] },
+				]),
+			),
+		).toBe(`Unknown window method "setValue". Window handles support: ${Object.keys(WINDOW_METHODS).join(", ")}.`);
+		expect(
+			errorMessage(() =>
+				renderComputerCall([
+					{ method: "window", args: ["42"] },
+					{ method: "toString", args: [] },
+				]),
+			),
+		).toContain('Unknown window method "toString"');
+		expect(
+			errorMessage(() =>
+				renderComputerCall([
+					{ method: "ref", args: ["e5"] },
+					{ method: "raise", args: [] },
+				]),
+			),
+		).toBe(`Unknown element method "raise". Element handles support: ${Object.keys(ELEMENT_METHODS).join(", ")}.`);
+		expect(errorMessage(() => isReadOnlyComputerCall([{ method: "launch", args: [] }]))).toContain(
+			'Unknown desktop method "launch"',
+		);
 	});
 });

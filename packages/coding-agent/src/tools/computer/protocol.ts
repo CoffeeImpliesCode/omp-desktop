@@ -1,5 +1,5 @@
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import type { DesktopCapabilities } from "@oh-my-pi/pi-natives";
+import type { CaptureRegion, DesktopCapabilities } from "@oh-my-pi/pi-natives";
 
 export { COMPUTER_WORKER_ARG } from "../../cli/worker-selectors";
 
@@ -38,6 +38,7 @@ export type ComputerWorkerInbound =
 	 * `output` is what the cell printed: an `ax()` tree it carries counts as seen by the model.
 	 */
 	| { type: "settle"; id: string; timeoutMs: number; session: ComputerSessionSnapshot; output: string }
+	| { type: "revoke-control"; id: string }
 	| { type: "tool-reply"; id: string; reply: ToolReply }
 	| { type: "close" };
 
@@ -49,11 +50,14 @@ export interface ComputerRunOk {
 	capabilities?: DesktopCapabilities;
 }
 
-/** Full-resolution screenshot emitted during one computer run. */
+/** Screenshot or zoom emitted during one computer run, with its full input coordinate frame. */
 export interface ComputerScreenshot {
 	path: string;
 	width: number;
 	height: number;
+	coordinateWidth: number;
+	coordinateHeight: number;
+	region?: CaptureRegion;
 	sourceWidth?: number;
 	sourceHeight?: number;
 	target: string;
@@ -71,12 +75,14 @@ export interface RunErrorPayload {
 /** Events emitted by the persistent computer worker. */
 export type ComputerWorkerOutbound =
 	| { type: "ready" }
+	| { type: "control-revoked"; id: string }
 	| { type: "pong"; id: string }
 	| { type: "result"; id: string; ok: true; payload: ComputerRunOk }
 	| { type: "result"; id: string; ok: false; error: RunErrorPayload }
 	| { type: "capabilities"; id: string; ok: true; capabilities: DesktopCapabilities }
 	| { type: "capabilities"; id: string; ok: false; error: RunErrorPayload }
 	| { type: "tool-call"; id: string; runId: string; name: string; args: unknown }
+	| { type: "control-request"; id: string; runId: string; reason: string }
 	| { type: "closed" };
 
 /** Transport used by the worker core in Bun workers and tests. */

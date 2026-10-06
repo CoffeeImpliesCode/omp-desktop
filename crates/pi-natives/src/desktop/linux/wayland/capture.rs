@@ -2,7 +2,7 @@ use std::{
 	cell::{Cell, RefCell},
 	os::fd::OwnedFd,
 	rc::Rc,
-	time::Duration,
+	time::{Duration, Instant},
 };
 
 use ashpd::desktop::{
@@ -15,38 +15,22 @@ use pw::{properties::properties, spa};
 
 use super::portal::{read_token, store_token};
 use crate::desktop::{
+	control,
 	error::{CoreResult, DesktopError},
 	frame::MAX_COMPOSITE_PIXELS as MAX_FRAME_PIXELS,
 };
 
 const SCREENCAST_TOKEN: &str = "screencast-token";
-
-/// `PipeWire` stream name of the capture links.
 const STREAM_NAME: &str = "omp-computer-capture";
-
-/// How long every authorized stream gets to deliver its first frame.
-///
-/// A stream whose node disappeared, or that the compositor never granted, stays
-/// connected without data and without an error event, so without a deadline the
-/// loop would wait forever and take the desktop worker down with it.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+const PORTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One monitor the `ScreenCast` response authorized.
 struct MonitorStream {
-	/// `PipeWire` node the frame is read from.
 	node:     u32,
-	/// Logical position of the monitor, when the compositor reports it.
 	position: Option<(i32, i32)>,
-	/// Logical size of the monitor, when the compositor reports it.
 	size:     Option<(i32, i32)>,
 }
 
-/// A granted `ScreenCast` session together with the `PipeWire` remote it
-/// opened.
-///
-/// All three handles have to outlive the frame grab: the remote fd is a live
-/// `PipeWire` connection only while the session that opened it exists, and the
-/// session is a live grant only while its portal proxy does.
 struct ScreenCastSession<'a> {
 	_portal: Screencast<'a>,
 	session: Session<'a, Screencast<'a>>,
@@ -55,11 +39,6 @@ struct ScreenCastSession<'a> {
 }
 
 impl ScreenCastSession<'_> {
-	/// End the session and drop the `PipeWire` remote.
-	///
-	/// The close is best effort and bounded: a compositor that stops answering
-	/// must not turn a finished capture into a stuck desktop worker. Every
-	/// remaining handle is dropped either way.
 	fn close(self, runtime: &tokio::runtime::Runtime) {
 		let _ = runtime.block_on(async {
 			tokio::time::timeout(crate::desktop::CLOSE_TIMEOUT, self.session.close()).await
@@ -67,21 +46,27 @@ impl ScreenCastSession<'_> {
 	}
 }
 
-/// Ask for consent and collect one `PipeWire` node per monitor the user picked.
-///
-/// The restore token round trip is unchanged: a stored token skips the dialog,
-/// a fresh one is stored, and a denial surfaces as an error. Nothing here
-/// widens what the user authorized.
-async fn open_screencast<'a>() -> Result<ScreenCastSession<'a>, String> {
-	let portal = Screencast::new()
-		.await
-		.map_err(|err| format!("ScreenCast portal: {err}"))?;
-	let session = portal
-		.create_session()
-		.await
-		.map_err(|err| format!("ScreenCast CreateSession: {err}"))?;
-	let restore_token = read_token(SCREENCAST_TOKEN);
-	let result = async {
+async fn portal_request<T>(request: impl std::future::Future<Output = Result<T, String>>) -> CoreResult<T> {
+	super::libei::cancellable(tokio::time::timeout(PORTAL_TIMEOUT, request))
+		.await?
+		.map_err(|_| DesktopError::capture_failed("Wayland ScreenCast portal timed out"))?
+		.map_err(DesktopError::capture_failed)
+}
+
+async fn open_screencast<'a>() -> CoreResult<ScreenCastSession<'a>> {
+	let portal = portal_request(async {
+		Screencast::new().await.map_err(|err| format!("ScreenCast portal: {err}"))
+	})
+	.await?;
+	let session = portal_request(async {
+		portal
+			.create_session()
+			.await
+			.map_err(|err| format!("ScreenCast CreateSession: {err}"))
+	})
+	.await?;
+	let opened = portal_request(async {
+		let restore_token = read_token(SCREENCAST_TOKEN);
 		portal
 			.select_sources(
 				&session,
@@ -104,9 +89,9 @@ async fn open_screencast<'a>() -> Result<ScreenCastSession<'a>, String> {
 			.streams()
 			.iter()
 			.map(|stream| MonitorStream {
-				node:     stream.pipe_wire_node_id(),
+				node: stream.pipe_wire_node_id(),
 				position: stream.position(),
-				size:     stream.size(),
+				size: stream.size(),
 			})
 			.collect::<Vec<_>>();
 		if streams.is_empty() {
@@ -117,31 +102,26 @@ async fn open_screencast<'a>() -> Result<ScreenCastSession<'a>, String> {
 			.await
 			.map_err(|err| format!("ScreenCast OpenPipeWireRemote: {err}"))?;
 		Ok((streams, remote))
-	}
+	})
 	.await;
-	match result {
+	match opened {
 		Ok((streams, remote)) => Ok(ScreenCastSession { _portal: portal, session, streams, remote }),
-		Err(err) => {
+		Err(error) => {
 			let _ = tokio::time::timeout(crate::desktop::CLOSE_TIMEOUT, session.close()).await;
-			Err(err)
+			Err(error)
 		},
 	}
 }
 
-/// Channel layout of a raw video format the converter supports.
 struct PixelLayout {
-	/// Bytes per pixel in the source buffer.
 	size:  usize,
-	/// Offset of the red, green and blue component within a pixel.
 	red:   usize,
 	green: usize,
 	blue:  usize,
-	/// Offset of the alpha component, or `None` when the format has none.
 	alpha: Option<usize>,
 }
 
 impl PixelLayout {
-	/// Map a negotiated format onto its component layout.
 	fn new(format: spa::param::video::VideoFormat) -> Result<Self, String> {
 		use spa::param::video::VideoFormat as F;
 		Ok(match format {
@@ -151,14 +131,15 @@ impl PixelLayout {
 			F::RGBx => Self { size: 4, red: 0, green: 1, blue: 2, alpha: None },
 			F::BGRA => Self { size: 4, red: 2, green: 1, blue: 0, alpha: Some(3) },
 			F::BGRx => Self { size: 4, red: 2, green: 1, blue: 0, alpha: None },
-			other => {
-				return Err(format!("PipeWire negotiated unsupported pixel format {other:?}"));
-			},
+			other => return Err(format!("PipeWire negotiated unsupported pixel format {other:?}")),
 		})
 	}
 }
 
-/// Convert one mapped `PipeWire` chunk into a tightly packed RGBA image.
+struct UserData {
+	format: spa::param::video::VideoInfoRaw,
+}
+
 fn rgba_from_buffer(
 	format: &spa::param::video::VideoInfoRaw,
 	data: &mut pw::spa::buffer::Data,
@@ -229,6 +210,7 @@ fn rgba_from_rows(
 	let columns = width as usize;
 	let mut rgba = vec![0; columns * height as usize * 4];
 	for y in 0..height as usize {
+		control::check().map_err(|error| error.to_string())?;
 		let row = &rows[y * stride..y * stride + row_bytes];
 		for x in 0..columns {
 			let pixel = &row[x * layout.size..];
@@ -298,9 +280,10 @@ fn grab_pipewire_frames(nodes: &[u32], remote: Option<OwnedFd>) -> Result<Vec<Rg
 	if nodes.is_empty() {
 		return Err("PipeWire capture needs at least one node".to_string());
 	}
+	control::check().map_err(|error| error.to_string())?;
 	pw::init();
-	let mainloop =
-		pw::main_loop::MainLoopRc::new(None).map_err(|err| format!("PipeWire main loop: {err}"))?;
+	let mainloop = pw::main_loop::MainLoopRc::new(None)
+		.map_err(|err| format!("PipeWire main loop: {err}"))?;
 	let context = pw::context::ContextRc::new(&mainloop, None)
 		.map_err(|err| format!("PipeWire context: {err}"))?;
 	let core = match remote {
@@ -313,6 +296,7 @@ fn grab_pipewire_frames(nodes: &[u32], remote: Option<OwnedFd>) -> Result<Vec<Rg
 	let pending = Rc::new(Cell::new(total));
 	let retained_pixels = Rc::new(Cell::new(0_u64));
 	let timed_out = Rc::new(Cell::new(false));
+	let cancelled = Rc::new(Cell::new(false));
 	let object = spa::pod::object!(
 		spa::utils::SpaTypes::ObjectParamFormat,
 		spa::param::ParamType::EnumFormat,
@@ -430,13 +414,20 @@ fn grab_pipewire_frames(nodes: &[u32], remote: Option<OwnedFd>) -> Result<Vec<Rg
 		attached.push((listener, stream));
 	}
 	let flag = Rc::clone(&timed_out);
+	let cancelled_flag = Rc::clone(&cancelled);
 	let timer_loop = mainloop.clone();
+	let deadline = Instant::now() + CAPTURE_TIMEOUT;
 	let timer = mainloop.loop_().add_timer(move |_| {
-		flag.set(true);
-		timer_loop.quit();
+		if control::check().is_err() {
+			cancelled_flag.set(true);
+			timer_loop.quit();
+		} else if Instant::now() >= deadline {
+			flag.set(true);
+			timer_loop.quit();
+		}
 	});
 	timer
-		.update_timer(Some(CAPTURE_TIMEOUT), None)
+		.update_timer(Some(Duration::from_millis(10)), Some(Duration::from_millis(10)))
 		.into_sync_result()
 		.map_err(|err| format!("PipeWire capture deadline: {err}"))?;
 	mainloop.run();
@@ -450,6 +441,9 @@ fn grab_pipewire_frames(nodes: &[u32], remote: Option<OwnedFd>) -> Result<Vec<Rg
 			pending.get(),
 			CAPTURE_TIMEOUT.as_secs()
 		));
+	}
+	if cancelled.get() {
+		return Err("PipeWire capture cancelled".to_string());
 	}
 	std::mem::take(&mut *frames.borrow_mut())
 		.into_iter()
@@ -478,12 +472,14 @@ pub(super) fn grab_pipewire_frame(node: u32, remote: Option<OwnedFd>) -> Result<
 /// The consent, restore token and denial paths are the portal's: the session is
 /// created, granted, used, and closed exactly once per capture.
 pub(super) fn capture() -> CoreResult<Vec<(RgbaImage, super::PortalGeometry)>> {
+	control::check()?;
 	let runtime = super::portal::portal_runtime()?;
-	let session = runtime.block_on(open_screencast()).map_err(|err| {
-		DesktopError::capture_failed(format!("wayland screencast unavailable: {err}"))
-	})?;
-	capture_streams(runtime, session)
-		.map_err(|err| DesktopError::capture_failed(format!("wayland screencast failed: {err}")))
+	let session = runtime.block_on(open_screencast())?;
+	let outcome = capture_streams(runtime, session);
+	control::check()?;
+	outcome.map_err(|err| {
+		DesktopError::capture_failed(format!("wayland screencast failed: {err}"))
+	})
 }
 
 /// Refuse a multi-monitor capture whose streams cannot be placed.
@@ -672,5 +668,23 @@ mod tests {
 		);
 		let missing_size = MonitorStream { node: 46, position: Some((1920, 0)), size: None };
 		assert!(placeable_monitors(&[monitor(44, Some((0, 0))), missing_size]).is_err());
+	}
+}
+
+pub(super) fn geometry() -> CoreResult<Vec<super::PortalGeometry>> {
+	capture().map(|frames| frames.into_iter().map(|(_, geometry)| geometry).collect())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn cancelled_geometry_refresh_never_opens_a_portal_session() {
+		let source = control::CancellationSource::default();
+		let token = source.token();
+		source.cancel();
+		let result = control::with_token_for_test(&token, geometry);
+		assert_eq!(result.unwrap_err().code, token.check().unwrap_err().code);
 	}
 }

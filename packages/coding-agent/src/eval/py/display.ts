@@ -2,7 +2,10 @@
  * Display bundle rendering shared between the Python runner output and the
  * legacy Jupyter MIME conventions. Pure function, no kernel coupling.
  */
+import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { isRecord } from "@oh-my-pi/pi-utils";
 import { htmlToBasicMarkdown } from "../../web/scrapers/types";
+import { evalImageMetadata } from "../types";
 
 /** Status event emitted by prelude helpers for TUI rendering. */
 export interface PythonStatusEvent {
@@ -14,7 +17,7 @@ export interface PythonStatusEvent {
 
 export type KernelDisplayOutput =
 	| { type: "json"; data: unknown }
-	| { type: "image"; data: string; mimeType: string; detail?: "auto" | "low" | "high" | "original" }
+	| ImageContent
 	| { type: "markdown" }
 	| { type: "status"; event: PythonStatusEvent };
 
@@ -34,9 +37,7 @@ export async function renderKernelDisplay(content: Record<string, unknown>): Pro
 }> {
 	// Accept both raw bundles ({"text/plain": ...}) and Jupyter-style
 	// content envelopes ({ data: {...} }) so callers don't need to unwrap.
-	const data =
-		(content.data as Record<string, unknown> | undefined) ?? (content as Record<string, unknown> | undefined);
-	if (!data) return { text: "", outputs: [] };
+	const data = isRecord(content.data) ? content.data : content;
 
 	const outputs: KernelDisplayOutput[] = [];
 
@@ -49,8 +50,16 @@ export async function renderKernelDisplay(content: Record<string, unknown>): Pro
 		return { text: "", outputs };
 	}
 
-	// An `original` resolution hint rides along: the frame is already the capture saved beside it.
-	const detail = imageDetail(data["detail"]);
+	const detail = imageDetail(data.detail);
+	const image = data["application/x-omp-image"];
+	if (isRecord(image) && typeof image.data === "string" && typeof image.mimeType === "string") {
+		outputs.push({
+			type: "image",
+			data: image.data,
+			mimeType: image.mimeType,
+			...evalImageMetadata(image),
+		});
+	}
 	if (typeof data["image/png"] === "string") {
 		outputs.push({ type: "image", data: data["image/png"] as string, mimeType: "image/png", detail });
 	}

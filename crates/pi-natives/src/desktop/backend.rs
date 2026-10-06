@@ -1,14 +1,17 @@
+use std::time::Duration;
+
 use image::RgbaImage;
 
 use super::{
 	ax::{AxHandle, AxProps},
-	control::ControlAction,
+	control::{ControlAction, OperationToken},
 	error::{CoreResult, DesktopError},
 	frame::FrameGeometry,
 	keys::KeyName,
+	menus::DesktopMenuItem,
 	types::{
 		CaptureCaps, DesktopCapabilities, DesktopControlCapabilities, DesktopDisplay, DesktopWindow,
-		DesktopWindowState, DesktopWorkspace, Target,
+		DisplaySelector, DesktopWindowState, DesktopWorkspace, Target,
 	},
 };
 
@@ -81,6 +84,14 @@ pub enum PointerEvent {
 		path:      Vec<(f64, f64)>,
 		button:    MouseButton,
 		modifiers: Modifiers,
+		keys:      Vec<KeyName>,
+	},
+	Hold {
+		x:        f64,
+		y:        f64,
+		button:   MouseButton,
+		keys:     Vec<KeyName>,
+		duration: Duration,
 	},
 	Scroll {
 		x:  f64,
@@ -94,10 +105,30 @@ pub trait Backend: Send {
 	fn capabilities(&mut self) -> DesktopCapabilities;
 	fn displays(&mut self) -> CoreResult<Vec<DesktopDisplay>>;
 	fn windows(&mut self) -> CoreResult<Vec<DesktopWindow>>;
+	/// Explicit display keyboard input must establish the focused surface's
+	/// real global monitor, not infer it from window-relative coordinates.
+	fn focused_keyboard_window(&mut self) -> CoreResult<DesktopWindow> {
+		self
+			.windows()?
+			.into_iter()
+			.find(|window| window.focused)
+			.ok_or_else(|| {
+				DesktopError::invalid_target("no focused window was found for display keyboard input")
+			})
+	}
+	fn validate_frame_layout(&mut self, frame: &FrameGeometry) -> CoreResult<()> {
+		let displays = self.displays().map_err(|error| {
+			DesktopError::invalid_coordinate_frame(format!(
+				"cannot establish current display layout: {error}"
+			))
+		})?;
+		frame.validate_layout(&displays)
+	}
 	fn capture(
 		&mut self,
 		target: &Target,
 		caps: &CaptureCaps,
+		selector: Option<&DisplaySelector>,
 	) -> CoreResult<(RgbaImage, FrameGeometry)>;
 	fn pointer(
 		&mut self,
@@ -105,12 +136,48 @@ pub trait Backend: Send {
 		ev: PointerEvent,
 		frame: &FrameGeometry,
 		mode: DeliveryMode,
+		token: &OperationToken,
 	) -> CoreResult<()>;
-	fn type_text(&mut self, target: &Target, text: &str, mode: DeliveryMode) -> CoreResult<()>;
-	fn key_chord(&mut self, target: &Target, keys: &[KeyName], mode: DeliveryMode)
-	-> CoreResult<()>;
-	fn raise_window(&mut self, id: &str) -> CoreResult<()>;
-
+	fn type_text(
+		&mut self,
+		target: &Target,
+		text: &str,
+		mode: DeliveryMode,
+		token: &OperationToken,
+	) -> CoreResult<()>;
+	fn key_chord(
+		&mut self,
+		target: &Target,
+		keys: &[KeyName],
+		mode: DeliveryMode,
+		token: &OperationToken,
+	) -> CoreResult<()>;
+	fn hold_keys(
+		&mut self,
+		target: &Target,
+		keys: &[KeyName],
+		duration: Duration,
+		mode: DeliveryMode,
+		token: &OperationToken,
+	) -> CoreResult<()>;
+	fn menu_items(
+		&mut self,
+		window: &DesktopWindow,
+		path: &[String],
+	) -> CoreResult<Vec<DesktopMenuItem>>;
+	fn menu_select(
+		&mut self,
+		window: &DesktopWindow,
+		path: &[String],
+		token: &OperationToken,
+	) -> CoreResult<()>;
+	fn bring_to_current_space(&mut self, _id: &str, _token: &OperationToken) -> CoreResult<()> {
+		Err(DesktopError::new(
+			super::error::ErrorCode::SpaceUnsupported,
+			"moving windows between Spaces is available only on macOS",
+		))
+	}
+	fn raise_window(&mut self, id: &str, token: &OperationToken) -> CoreResult<()>;
 	/// Window-control surface this backend really serves. The default covers a
 	/// platform whose only native focus primitive is `raise_window`; a backend
 	/// with a real control surface overrides this and advertises nothing it
@@ -128,9 +195,10 @@ pub trait Backend: Send {
 	/// dispatched and accepted, not that the application obeyed it.
 	fn control(&mut self, action: &ControlAction) -> CoreResult<()> {
 		match action {
-			// Focusing is the one control every platform backend already
-			// expresses; the rest must be refused rather than faked.
-			ControlAction::FocusWindow(id) => self.raise_window(id),
+			ControlAction::FocusWindow(id) => match super::control::current_token() {
+				Some(token) => self.raise_window(id, &token),
+				None => Err(DesktopError::cancelled("desktop control has no active operation token")),
+			},
 			_ => Err(DesktopError::control_unsupported(format!(
 				"the {} backend does not support the '{}' control",
 				self.control_capabilities().backend,
@@ -147,8 +215,7 @@ pub trait Backend: Send {
 	}
 
 	/// Fresh read of one window. A backend that knows nothing beyond what
-	/// [`DesktopWindow`] already carries leaves every state field absent
-	/// instead of claiming a false.
+	/// [`DesktopWindow`] already carries leaves every state field absent.
 	fn window_state(&mut self, id: &str) -> CoreResult<DesktopWindowState> {
 		let window = self
 			.windows()?
@@ -185,4 +252,10 @@ pub trait AxBackend {
 	fn element_at(&mut self, x: f64, y: f64) -> CoreResult<Option<AxHandle>>;
 	fn focused_element(&mut self) -> CoreResult<Option<AxHandle>>;
 	fn attributes(&mut self, h: &AxHandle) -> CoreResult<Vec<(String, String)>>;
+	/// Whether the element `h` was read from still exists. Backends whose
+	/// identities a later element can take over once the first is gone check
+	/// it, so a ref is never renewed onto the newcomer.
+	fn alive(&mut self, _h: &AxHandle) -> bool {
+		true
+	}
 }

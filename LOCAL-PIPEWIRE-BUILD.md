@@ -9,7 +9,7 @@ empty. Backend selection reads only `WAYLAND_DISPLAY` / `DISPLAY`
 `~/.omp/agent/settings.json` nor `config.yml` turns the feature on. The build
 below compiles both addons with `wayland-pipewire` and embeds them in the
 executable. The fork also keeps every authorized monitor stream, adds exact
-niri window capture, and integrates upstream v18.6.2.
+niri window capture, and integrates upstream v18.7.0.
 
 ## Why a hand-dropped addon is not enough
 
@@ -28,112 +28,85 @@ the next launch, and the feature flag has to live in the binary. The
 - `pkg-config`, Clang, and the PipeWire development libraries.
 - On NixOS, `nix develop path:.` loads the pinned tools and native libraries.
 
-Install the workspace dependencies before any build. `--ignore-scripts` keeps
-install-time scripts from generating assets, so the steps below stay the only
-build:
+On NixOS, enter the development shell first so dependency installation and the
+build use the pinned Bun, Rust toolchain, and PipeWire libraries:
 
 ```sh
+nix develop path:.
 bun install --frozen-lockfile --ignore-scripts
 ```
 
 ## Build
 
-Run every command from the checkout root.
+Run every command from the checkout root. Both native variants are required
+because the executable may run on x64 hosts with different ISA support:
 
 ```sh
 export CARGO_TARGET_DIR="$PWD/target"
 export CARGO_BUILD_JOBS=2
 
-# 1. Check that pkg-config can find PipeWire. The build enables the feature.
+# Check that pkg-config can find PipeWire. The native build enables the feature.
 pkg-config --modversion libpipewire-0.3
 RP="$(pkg-config --variable=libdir libpipewire-0.3)"
 
-# 2. Build BOTH variants. Explicit RUSTFLAGS must include the ISA floor.
+# Build baseline and modern addons. RUSTFLAGS must include the ISA floor.
 cd packages/natives
 RUSTFLAGS="-C target-cpu=x86-64-v2 -C link-arg=-Wl,-rpath,$RP" \
   OMP_NATIVE_X64_VARIANT=baseline bun scripts/build-bindings.ts
 RUSTFLAGS="-C target-cpu=x86-64-v3 -C link-arg=-Wl,-rpath,$RP" \
   OMP_NATIVE_X64_VARIANT=modern bun scripts/build-bindings.ts
-
-# 3. Prepare all binary assets, then compile inside the checkout.
-bun run gen:native
 cd ../..
-bun --cwd=packages/stats run gen:stats
-bun --cwd=packages/coding-agent run gen:tool-views
-bun compile-one.ts
+
+# Builds docs, stats, and tool views, then embeds the matching native addons
+# in memory and writes the standalone binary to packages/coding-agent/dist/omp.
+bun --cwd=packages/coding-agent run build
 ```
 
-The default output is `packages/coding-agent/dist/omp-linux-x64`. Set
-`OMP_LOCAL_OUTFILE` to write somewhere else.
-
-Restore the generated embedding stubs after compilation:
-
-```sh
-bun --cwd=packages/natives run gen:native:reset
-bun --cwd=packages/stats run gen:stats:reset
-```
-
-Do not reset the native stub before compiling. A compile without a preceding
-`gen:native` embeds no addon.
+The coding-agent build script generates and resets the stats asset itself.
+`compile-binary.ts` embeds both addons and the manifest in memory; do not run
+the removed `gen:native` scripts or reset native files before the build.
 
 ### Why `RUSTFLAGS` is set explicitly
 
 `build-bindings.ts` pins the ISA floor only while `RUSTFLAGS` is unset. The Nix
-rpath has to arrive through `RUSTFLAGS`, so setting it for the linker alone
-suppresses that pinning and both addons become the same build under two names.
+rpath must arrive through `RUSTFLAGS`, so include the ISA flag in the same value
+or the baseline and modern files can contain the same host-specific build.
 
 ### Both variants are required
 
-`gen:native` embeds whichever `.node` files are present, and `embed-native.ts`
-rejects any addon whose version stamp does not match `package.json`. The
-published `@oh-my-pi/pi-natives-linux-x64` release can lag `main`, so a `main`
-checkout has no published addon to fall back on. Embedding only `modern` leaves
-hosts without AVX2 loading an AVX2 binary. `OMP_NATIVE_X64_VARIANT` is a fork
-addition: upstream derives the variant from host AVX2 detection, so one machine
-can emit only one of the two. Unset, behaviour matches upstream.
+`embed-native.ts` embeds each available addon and rejects a version stamp that
+does not match `packages/natives/package.json`. Embedding only `modern` leaves
+hosts without AVX2 loading an AVX2 binary. The fork's
+`OMP_NATIVE_X64_VARIANT` override builds both variants on one host.
 
-**Bun runtime.** `target: "bun-linux-x64-baseline"` embeds the compiling bun as
-the runtime, so a binary built with 1.3.13 refuses to start with `error: Bun
-runtime must be >= 1.3.14`. Check `bun --version` before compiling.
+**Bun runtime.** The standalone binary embeds the Bun used to compile it.
+`packages/coding-agent/package.json` declares the minimum version. The project
+Nix development shell supplies Bun 1.4.2; check `bun --version` before building.
 
 ## Verify
 
 ```sh
-packages/coding-agent/dist/omp-linux-x64 --version
-packages/coding-agent/dist/omp-linux-x64 --smoke-test
-PI_NATIVE_VARIANT=modern  packages/coding-agent/dist/omp-linux-x64 --smoke-test
-PI_NATIVE_VARIANT=baseline packages/coding-agent/dist/omp-linux-x64 --smoke-test
+packages/coding-agent/dist/omp --version
+packages/coding-agent/dist/omp --smoke-test
+PI_NATIVE_VARIANT=modern packages/coding-agent/dist/omp --smoke-test
+PI_NATIVE_VARIANT=baseline packages/coding-agent/dist/omp --smoke-test
 ```
 
 `--version` prints the package version compiled into the executable. What is New
 uses the headings of the bundled coding-agent changelog, not that string.
 
-The standalone smoke checks worker startup and bundled assets. It does not
-capture anything. Exercise real capture through the computer interface, and
-resolve the target from discovery instead of a hardcoded name or identifier:
+The standalone smoke checks worker startup and bundled assets, not native
+capture. Exercise capture with one screenshot and without interacting with the
+desktop:
 
-```js
-display(await computer.displays());
-display(await computer.capabilities());
-
-// Discover the windows first, then resolve the one you selected. Replace the
-// app with that window's exact application id; an ambiguous filter throws.
-const selected = { app: "<application id of the window you selected>" };
-const candidates = await computer.windows(selected);
-if (candidates.length !== 1) throw new Error("Select exactly one window");
-
-const win = await computer.window(candidates[0].id);
-display({ id: win.id, bounds: win.bounds, positionKnown: win.positionKnown });
-await win.screenshot();
-await computer.screenshot();
+```sh
+PI_NATIVE_VARIANT=modern packages/coding-agent/dist/omp -p --no-session \
+  'Call computer.capabilities(). If capture is supported, call computer.screenshot() once. Do not click, type, focus, or interact with apps. Do not quote or describe visible content. Report only capture support and screenshot dimensions or the exact failure. If a permission prompt appears, stop.'
 ```
 
-The reported image dimensions have to match the frame metadata, the frame has to
-show the selected window, and capture must not change focus. `computer.displays()`
-reports the desktop's displays and grants no capture authorization on its own.
-The `computer.display` session setting chooses the desktop capture target:
-every authorized stream, or one display by the id that `computer.displays()`
-returned.
+Confirm the reported screenshot dimensions. A screenshot exercises capture but
+does not prove that coordinate mapping is safe; use discovered targets and
+verified geometry before testing input.
 
 ### Permission boundaries
 

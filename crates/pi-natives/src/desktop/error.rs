@@ -5,6 +5,8 @@ pub enum ErrorCode {
 	PermissionDenied,
 	CaptureFailed,
 	InputFailed,
+	InputBusy,
+	Cancelled,
 	BackgroundUnavailable,
 	ControlUnsupported,
 	ControlFailed,
@@ -15,6 +17,9 @@ pub enum ErrorCode {
 	StaleRef,
 	AxUnsupported,
 	AxFailed,
+	Unsupported,
+	SpaceUnsupported,
+	SpaceMoveDenied,
 	Timeout,
 	Closed,
 	Internal,
@@ -26,6 +31,8 @@ impl ErrorCode {
 			Self::PermissionDenied => "PermissionDenied",
 			Self::CaptureFailed => "CaptureFailed",
 			Self::InputFailed => "InputFailed",
+			Self::InputBusy => "InputBusy",
+			Self::Cancelled => "Cancelled",
 			Self::BackgroundUnavailable => "BackgroundUnavailable",
 			Self::ControlUnsupported => "ControlUnsupported",
 			Self::ControlFailed => "ControlFailed",
@@ -36,6 +43,9 @@ impl ErrorCode {
 			Self::StaleRef => "StaleRef",
 			Self::AxUnsupported => "AxUnsupported",
 			Self::AxFailed => "AxFailed",
+			Self::Unsupported => "Unsupported",
+			Self::SpaceUnsupported => "SpaceUnsupported",
+			Self::SpaceMoveDenied => "SpaceMoveDenied",
 			Self::Timeout => "Timeout",
 			Self::Closed => "Closed",
 			Self::Internal => "Internal",
@@ -64,6 +74,14 @@ impl DesktopError {
 
 	pub(crate) fn input_failed(message: impl Into<String>) -> Self {
 		Self::new(ErrorCode::InputFailed, message)
+	}
+
+	pub(crate) fn input_busy(message: impl Into<String>) -> Self {
+		Self::new(ErrorCode::InputBusy, message)
+	}
+
+	pub(crate) fn cancelled(message: impl Into<String>) -> Self {
+		Self::new(ErrorCode::Cancelled, message)
 	}
 
 	pub(crate) fn background_unavailable(message: impl Into<String>) -> Self {
@@ -104,6 +122,11 @@ impl DesktopError {
 
 	pub(crate) fn ax_failed(message: impl Into<String>) -> Self {
 		Self::new(ErrorCode::AxFailed, message)
+	}
+
+	#[cfg(any(target_os = "linux", target_os = "macos"))]
+	pub(crate) fn unsupported(message: impl Into<String>) -> Self {
+		Self::new(ErrorCode::Unsupported, message)
 	}
 
 	pub(crate) fn timeout(message: impl Into<String>) -> Self {
