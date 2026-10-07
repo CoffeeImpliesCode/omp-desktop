@@ -30,6 +30,16 @@
 - Kept libei input waiting for every granted device to become ready and bounded discovery even under continuous events ([#13210](https://github.com/can1357/oh-my-pi/pull/13210) by [@Komzpa](https://github.com/Komzpa)).
 - Allowed X11 startup when inherited Wayland sockets are stale without falling back on permission or live-session failures ([#10752](https://github.com/can1357/oh-my-pi/pull/10752) by [@jake8302](https://github.com/jake8302)).
 
+## [18.8.1] - 2026-10-07
+
+### Added
+
+- Added the `PI_NATIVES_DIR` configuration option to control where compiled native addons are extracted. The version-specific subdirectory remains appended, allowing separate `HOME` environments to share the same native addon copy without sharing other data.
+
+### Fixed
+
+- Fixed background shell builtins and other in-process commands so they terminate when their subshell exits and can be stopped with `kill %N`, matching the behavior of external commands.
+
 ## [18.7.0] - 2026-10-06
 
 ### Breaking Changes

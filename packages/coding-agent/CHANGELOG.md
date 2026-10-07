@@ -30,6 +30,59 @@
 - Concurrent computer Eval cells now queue safely and keep cancellation, screenshots, and AX feedback isolated.
 - Computer screenshots now preserve the saved PNG pixel frame through model delivery.
 
+## [18.8.3] - 2026-10-07
+
+### Fixed
+
+- Fixed repeat opens of the model picker, model hub, or agents views stacking duplicates; the open one is brought forward instead ([#14846](https://github.com/can1357/oh-my-pi/pull/14846) by [@H4vC](https://github.com/H4vC))
+
+## [18.8.2] - 2026-10-07
+
+### Fixed
+
+- Fixed long Anthropic sessions with repeated tool screenshots exceeding the request-size limit; live images are now trimmed by bytes, recoverable 413s may compact older history, and terminal subagent failures reach the parent ([#14453](https://github.com/can1357/oh-my-pi/issues/14453)).
+- Fixed Tern browser tabs opened with a `url` returning before the page loaded, which made the first `observe()` or `title()` read the blank page.
+
+### Removed
+
+- Removed per-call `model` overrides from `task`, eval `agent()`, and `workpool()`; subagents use configured agent models and settings.
+
+## [18.8.1] - 2026-10-07
+
+### Added
+
+- Added account pools for task agents, allowing an agent and its related work—including advisors, title generation, subagents, and resumed sessions—to use only specified OAuth accounts and fail rather than fall back to another account or an API key.
+- Added `omp usage accounts` to list OAuth account provider and identity keys without exposing tokens, making account-pool configuration easier.
+
+### Changed
+
+- Generated session titles now include their card icon and short code, so the `/resume` picker and session listings show this context; `title.icons` applies to newly generated titles.
+- Symlinked routing configurations now reload when an intermediate file or profile-directory link is replaced, without requiring a session restart.
+
+### Fixed
+
+- Improved Tern `ask` questions so the question no longer obscures the transcript and can be answered while reviewing and scrolling through the relevant context.
+- Added warnings for unrecognized `compat` keys in `models.yml` while continuing to load the configuration; warnings identify the file and key path.
+- Fixed `/new` so new sessions reset plan and goal modes, todo state, and related planning configuration instead of carrying stale state forward; fresh prewalk behavior is also restored after handoffs, cancellations, or automatic recovery.
+- Fixed OAuth alias login and logout flows so they refresh the underlying provider's models, report authentication state correctly, and list and remove the accounts associated with that provider.
+- Fixed model speed statistics so throughput from non-default OpenAI or Codex service tiers is kept separate and displayed for the tier used by the session.
+- Fixed stale model catalogs remaining in memory after provider or catalog refreshes.
+- Fixed `write` and `edit` from hanging or exhausting memory when given FIFOs, terminals, device files, or other non-regular targets; unsupported targets are now rejected safely.
+- Fixed long conversations from losing user and tool-result images when the conversation also contained assistant-generated images.
+- Fixed `local://` session paths from escaping their intended storage directory when given `.` or `..` session identifiers.
+- Fixed `omp gc --archive --apply` from leaving orphaned session-title records behind.
+- Fixed `/retry` after an interrupted reopened `ask` prompt when an extension had registered a context handler.
+- Fixed browser relay sessions from missing cross-origin iframe content that loaded before the tab was opened.
+- Fixed browser clicks on invisible native radio and checkbox inputs, including controls commonly used by GOV.UK forms.
+- Fixed `/model` so selecting the model already assigned to a project's default role still switches to that model correctly.
+- Fixed `wait` and background task state when a completion has already been consumed elsewhere, preventing premature interruption and incorrect idle detection.
+- Fixed repeated coding-plan fallback confirmations after declining a fallback in cases involving changing thinking settings, unavailable quota data, or account recovery.
+- Fixed Python evaluation when the shared runner temporary directory was created by another user.
+- Added RPC support for completing multi-select `ask` questions without relying on TUI keyboard navigation.
+- Corrected tool behavior and configuration documentation for `read`, background `bash`, Python evaluation, replace editing, goal removal, and `advisor.immuneTurns`.
+- Fixed custom glob backends from hanging indefinitely; scans now respect the tool deadline and report incomplete results when necessary.
+- Fixed `--resume <path>` from silently creating a new session for a missing path; it now reports the missing path, consistent with `--fork <path>` and `--resume <id>`.
+
 ## [18.8.0] - 2026-10-07
 
 ### Added
