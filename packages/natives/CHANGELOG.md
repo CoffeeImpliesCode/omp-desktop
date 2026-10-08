@@ -31,6 +31,12 @@
 - Kept libei input waiting for every granted device to become ready and bounded discovery even under continuous events ([#13210](https://github.com/can1357/oh-my-pi/pull/13210) by [@Komzpa](https://github.com/Komzpa)).
 - Allowed X11 startup when inherited Wayland sockets are stale without falling back on permission or live-session failures ([#10752](https://github.com/can1357/oh-my-pi/pull/10752) by [@jake8302](https://github.com/jake8302)).
 
+## [18.8.4] - 2026-10-08
+
+### Fixed
+
+- Fixed long output from a failing `jq` command hiding its error message: the output minimizer now shortens `jq` output only when the command succeeded ([#14657](https://github.com/can1357/oh-my-pi/pull/14657) by [@will-bogusz](https://github.com/will-bogusz))
+
 ## [18.8.1] - 2026-10-07
 
 ### Added
