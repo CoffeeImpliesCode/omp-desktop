@@ -4,6 +4,8 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 declare const devicePixelRatio: number;
 
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { buildStealthInjectionScriptForTest } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import {
 	acquireBrowser,
 	type BrowserHandle,
@@ -225,6 +227,114 @@ describe("browser init deadline carry-over", () => {
 });
 
 describe("OMP-owned browser evaluation", () => {
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"keeps stealth bootstraps out of live DOM while patching parser, dynamic, srcdoc, and OOPIF frames",
+		async () => {
+			const project = TempDir.createSync("@stealth-frame-preload-");
+			const name = `stealth-frame-preload-${process.pid}`;
+			const server = Bun.serve({
+				hostname: "0.0.0.0",
+				port: 0,
+				fetch(request) {
+					const { pathname, port } = new URL(request.url);
+					const headers = { "content-type": "text/html" };
+					if (pathname === "/frame") {
+						return new Response("<!doctype html><title>frame</title><p>frame</p>", { headers });
+					}
+					const oopif = `http://localhost:${port}/frame?kind=oopif`;
+					return new Response(
+						`<!doctype html><title>stealth-frame-fixture</title><body>
+							<iframe id="parser" src="/frame?kind=parser"></iframe>
+							<iframe id="srcdoc" srcdoc="<p>srcdoc</p>"></iframe>
+							<iframe id="oopif" src="${oopif}"></iframe>
+							<script>
+								addEventListener("load", () => {
+									const frame = document.createElement("iframe");
+									frame.id = "dynamic";
+									frame.addEventListener("load", () => {
+										document.body.dataset.dynamicReady = "true";
+									}, { once: true });
+									frame.src = "/frame?kind=dynamic";
+									document.body.append(frame);
+								});
+							</script>
+						</body>`,
+						{ headers },
+					);
+				},
+			});
+			let browser: BrowserHandle | undefined;
+			try {
+				browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: project.path() });
+				if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
+				await acquireTab(name, browser, {
+					url: `http://127.0.0.1:${server.port}/page`,
+					timeoutMs: 30_000,
+				});
+				const session = {
+					cwd: project.path(),
+					hasUI: false,
+					settings: Settings.isolated(),
+					getSessionFile: () => null,
+				} as unknown as ToolSession;
+				const bootstrap = JSON.stringify(buildStealthInjectionScriptForTest());
+				const result = await runInTab(name, {
+					code: `
+						await page.waitForFunction(() => document.body?.dataset.dynamicReady === "true", { timeout: 10_000 });
+						const frames = await Promise.all(page.frames().map(async frame => ({
+							url: frame.url(),
+							getterSource: await frame.evaluate(() => {
+								//!world=main
+								const sample = { get status() { return 1; } };
+								const getter = Object.getOwnPropertyDescriptor(sample, "status")?.get;
+								return getter ? Function.prototype.toString.call(getter) : null;
+							}),
+						})));
+						const helperMutations = await tab.evaluate(source => {
+							//!world=main
+							const observer = new MutationObserver(() => {});
+							observer.observe(document.head, { childList: true });
+							(0, eval)(source);
+							const records = observer.takeRecords();
+							observer.disconnect();
+							return {
+								added: records.flatMap(record => Array.from(record.addedNodes)).filter(node => node.nodeName === "IFRAME").length,
+								removed: records.flatMap(record => Array.from(record.removedNodes)).filter(node => node.nodeName === "IFRAME").length,
+							};
+						}, ${bootstrap});
+						return { frames, helperMutations };
+					`,
+					timeoutMs: 30_000,
+					session,
+				});
+				const value = result.returnValue as {
+					frames: Array<{ url: string; getterSource: string | null }>;
+					helperMutations: { added: number; removed: number };
+				};
+				expect(value.frames).toHaveLength(5);
+				expect(value.frames.map(frame => frame.url)).toContain("about:srcdoc");
+				expect(value.frames.some(frame => frame.url.includes("kind=parser"))).toBe(true);
+				expect(value.frames.some(frame => frame.url.includes("kind=dynamic"))).toBe(true);
+				expect(
+					value.frames.some(
+						frame => frame.url.includes("kind=oopif") && frame.url.startsWith("http://localhost:"),
+					),
+				).toBe(true);
+				expect(value.frames.every(frame => frame.getterSource === "function get status() { [native code] }")).toBe(
+					true,
+				);
+				expect(value.helperMutations).toEqual({ added: 0, removed: 0 });
+			} finally {
+				await releaseTab(name, { kill: true });
+				if (browser && "browser" in browser && browser.browser.connected)
+					await releaseBrowser(browser, { kill: true });
+				server.stop(true);
+				await project.remove();
+			}
+		},
+		60_000,
+	);
+
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"adopts isolated element arguments into the main world without consuming caller handles",
 		async () => {

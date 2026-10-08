@@ -26,6 +26,7 @@
 
 - Fixed raw browser `page.$$eval()` calls in local builds with shortened Bun callsite stacks.
 - Closing all browser tabs now continues after individual failures and logs unconfirmed closes without closing borrowed pages.
+- Fixed headless Chromium renderer crashes by removing the stealth bootstrap's temporary iframe, which could recurse while a new frame context initialized; the retained patches still apply to child frames.
 - Missing computer windows now report bounded available-window candidates ([#13655](https://github.com/can1357/oh-my-pi/pull/13655) by [@will-bogusz](https://github.com/will-bogusz)).
 - Concurrent computer Eval cells now queue safely and keep cancellation, screenshots, and AX feedback isolated.
 - Computer screenshots now preserve the saved PNG pixel frame through model delivery.
