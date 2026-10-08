@@ -2926,23 +2926,24 @@ mod control_tests {
 		let state = backend.state();
 		let hits = Arc::clone(&backend.hits);
 		let mut worker = worker_with(backend);
+		let token = CancellationSource::default().token();
 		let edited = Target::Window(WINDOW_ID.to_string());
 		let untouched = Target::Window(SIBLING_ID.to_string());
 		let desktop = Target::Desktop;
 		let fresh = [(&edited, 10.0, 10.0), (&untouched, 5.0, 5.0), (&desktop, 60.0, 20.0)];
 
 		worker
-			.process(&capture_request(edited.clone()))
+			.process(&capture_request(edited.clone()), &token)
 			.expect("edited window capture");
 		worker
-			.process(&capture_request(untouched.clone()))
+			.process(&capture_request(untouched.clone()), &token)
 			.expect("sibling window capture");
 		worker
-			.process(&capture_request(desktop.clone()))
+			.process(&capture_request(desktop.clone()), &token)
 			.expect("desktop capture");
 		for (target, x, y) in fresh {
 			worker
-				.process(&click_request(target.clone(), x, y))
+				.process(&click_request(target.clone(), x, y), &token)
 				.expect("fresh frame accepts pixels");
 		}
 		assert_eq!(
@@ -2953,12 +2954,12 @@ mod control_tests {
 
 		let move_to = ControlAction::MoveWindow { id: WINDOW_ID.to_string(), x: 4.0, y: 8.0 };
 		worker
-			.process(&control_request(move_to))
+			.process(&control_request(move_to), &token)
 			.expect("the advertised move is dispatched");
 		assert_eq!(origin(&state, WINDOW_ID), (4, 8), "the window really moved");
 
 		for (target, x, y) in fresh {
-			let Err(error) = worker.process(&click_request(target.clone(), x, y)) else {
+			let Err(error) = worker.process(&click_request(target.clone(), x, y), &token) else {
 				panic!("{} must refuse pixels from a retired frame", target.key());
 			};
 			assert_eq!(error.code, ErrorCode::InvalidCoordinateFrame);
@@ -2977,17 +2978,18 @@ mod control_tests {
 		let dispatched = Arc::clone(&backend.dispatched);
 		let hits = Arc::clone(&backend.hits);
 		let mut worker = worker_with(backend);
+		let token = CancellationSource::default().token();
 		let target = Target::Window(WINDOW_ID.to_string());
 
 		worker
-			.process(&capture_request(target.clone()))
+			.process(&capture_request(target.clone()), &token)
 			.expect("window capture");
 		worker
-			.process(&click_request(target.clone(), 10.0, 10.0))
+			.process(&click_request(target.clone(), 10.0, 10.0), &token)
 			.expect("click on the fresh frame");
 
 		let move_to = ControlAction::MoveWindow { id: WINDOW_ID.to_string(), x: 40.0, y: 40.0 };
-		let Err(error) = worker.process(&control_request(move_to)) else {
+		let Err(error) = worker.process(&control_request(move_to), &token) else {
 			panic!("an operation the backend does not advertise must be refused");
 		};
 		assert_eq!(error.code, ErrorCode::ControlUnsupported);
@@ -2995,7 +2997,7 @@ mod control_tests {
 		assert_eq!(origin(&state, WINDOW_ID), (0, 0), "a refused move leaves the window alone");
 
 		worker
-			.process(&click_request(target.clone(), 10.0, 10.0))
+			.process(&click_request(target.clone(), 10.0, 10.0), &token)
 			.expect("a refusal that moved nothing keeps the frame");
 		assert_eq!(
 			*hits.lock(),
@@ -3013,24 +3015,25 @@ mod control_tests {
 		let dispatched = Arc::clone(&backend.dispatched);
 		let hits = Arc::clone(&backend.hits);
 		let mut worker = worker_with(backend);
+		let token = CancellationSource::default().token();
 		let alive = Target::Window(SIBLING_ID.to_string());
 
 		worker
-			.process(&capture_request(alive.clone()))
+			.process(&capture_request(alive.clone()), &token)
 			.expect("live window capture");
 		worker
-			.process(&click_request(alive.clone(), 5.0, 5.0))
+			.process(&click_request(alive.clone(), 5.0, 5.0), &token)
 			.expect("click on the fresh frame");
 
 		let close = ControlAction::CloseWindow(WINDOW_ID.to_string());
-		let Err(error) = worker.process(&control_request(close)) else {
+		let Err(error) = worker.process(&control_request(close), &token) else {
 			panic!("a window that no longer exists must be refused");
 		};
 		assert_eq!(error.code, ErrorCode::WindowNotFound);
 		assert!(dispatched.lock().is_empty(), "no close request may be sent for a stale id");
 
 		worker
-			.process(&click_request(alive.clone(), 5.0, 5.0))
+			.process(&click_request(alive.clone(), 5.0, 5.0), &token)
 			.expect("a refusal that closed nothing keeps the live frame");
 		assert_eq!(*hits.lock(), [hit(SIBLING_ID, 105.0, 5.0), hit(SIBLING_ID, 105.0, 5.0)]);
 	}
@@ -3045,23 +3048,24 @@ mod control_tests {
 		let state = backend.state();
 		let hits = Arc::clone(&backend.hits);
 		let mut worker = worker_with(backend);
+		let token = CancellationSource::default().token();
 		let target = Target::Window(WINDOW_ID.to_string());
 
 		worker
-			.process(&capture_request(target.clone()))
+			.process(&capture_request(target.clone()), &token)
 			.expect("window capture");
 		worker
-			.process(&click_request(target.clone(), 10.0, 10.0))
+			.process(&click_request(target.clone(), 10.0, 10.0), &token)
 			.expect("click on the fresh frame");
 
 		let move_to = ControlAction::MoveWindow { id: WINDOW_ID.to_string(), x: 4.0, y: 8.0 };
-		let Err(error) = worker.process(&control_request(move_to)) else {
+		let Err(error) = worker.process(&control_request(move_to), &token) else {
 			panic!("an unconfirmed native request must not report success");
 		};
 		assert_eq!(error.code, ErrorCode::ControlFailed);
 		assert_eq!(origin(&state, WINDOW_ID), (4, 8), "the request reached the compositor anyway");
 
-		let Err(error) = worker.process(&click_request(target.clone(), 10.0, 10.0)) else {
+		let Err(error) = worker.process(&click_request(target.clone(), 10.0, 10.0), &token) else {
 			panic!("a move that may have applied must not keep its pre-move frame");
 		};
 		assert_eq!(error.code, ErrorCode::InvalidCoordinateFrame);
@@ -3083,7 +3087,8 @@ mod control_tests {
 		assert!(raised.lock().is_empty(), "a refused control must not touch the platform");
 
 		let mut worker = worker_with(FakeWaylandBackend::new());
-		let Err(error) = worker.process(&workspaces_request()) else {
+		let token = CancellationSource::default().token();
+		let Err(error) = worker.process(&workspaces_request(), &token) else {
 			panic!("a backend that cannot enumerate workspaces must refuse");
 		};
 		assert_eq!(error.code, ErrorCode::ControlUnsupported);
@@ -3094,7 +3099,9 @@ mod control_tests {
 	#[test]
 	fn default_window_state_reports_the_descriptor_and_leaves_state_unknown() {
 		let mut worker = worker_with(FakeWaylandBackend::new());
-		let Ok(Response::WindowState(state)) = worker.process(&window_state_request(WAYLAND_ID))
+		let token = CancellationSource::default().token();
+		let Ok(Response::WindowState(state)) =
+			worker.process(&window_state_request(WAYLAND_ID), &token)
 		else {
 			panic!("a live window must resolve");
 		};
@@ -3112,7 +3119,7 @@ mod control_tests {
 			"unreadable state must stay absent instead of becoming false",
 		);
 
-		let Err(error) = worker.process(&window_state_request("closed-window")) else {
+		let Err(error) = worker.process(&window_state_request("closed-window"), &token) else {
 			panic!("an unknown window must be refused");
 		};
 		assert_eq!(error.code, ErrorCode::WindowNotFound);

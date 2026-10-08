@@ -451,15 +451,16 @@ mod tests {
 		assert!(matches!(DisplaySelector::parse(Some("active".into())), DisplaySelector::Active));
 		let displays = vec![display("left", -100, true), display("right", 0, false)];
 		let window = DesktopWindow {
-			id:      "window".into(),
-			title:   String::new(),
-			app:     String::new(),
-			pid:     None,
-			x:       -10,
-			y:       10,
-			width:   70,
-			height:  50,
-			focused: true,
+			id:             "window".into(),
+			title:          String::new(),
+			app:            String::new(),
+			pid:            None,
+			x:              -10,
+			y:              10,
+			width:          70,
+			height:         50,
+			position_known: Some(true),
+			focused:        true,
 		};
 		let selected = DisplaySelector::Active
 			.select(displays.clone(), Some(&window))

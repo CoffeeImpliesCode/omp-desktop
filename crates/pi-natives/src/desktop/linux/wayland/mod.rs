@@ -167,13 +167,8 @@ impl Backend for WaylandBackend {
 					"could not refresh Wayland display geometry: {error}"
 				))
 			})?;
-			let mut displays = geometry
-				.into_iter()
-				.enumerate()
-				.map(|(index, item)| item.display(index))
-				.collect::<Vec<_>>();
-			geometry::layout(&mut displays)?;
-			self.displays = displays;
+			let known = niri::displays().ok().flatten().unwrap_or_default();
+			self.displays = geometry::fresh_layout(&geometry, &known)?;
 			frame.validate_layout(&self.displays)
 		}
 	}
@@ -573,7 +568,7 @@ mod tests {
 		let mut backend = backend_without_services();
 		backend
 			.displays
-			.push(PortalGeometry::new(None, None, 1920, 1080).display(0));
+			.push(PortalGeometry::new(None, None, 1920, 1080).display(0, &[]));
 		let displays = backend.displays().unwrap();
 		assert_eq!(displays.len(), 1);
 		assert_eq!((displays[0].width, displays[0].height), (1920, 1080));
@@ -585,7 +580,7 @@ mod tests {
 		let mut backend = backend_without_services();
 		backend
 			.displays
-			.push(PortalGeometry::new(None, None, 1920, 1080).display(0));
+			.push(PortalGeometry::new(None, None, 1920, 1080).display(0, &[]));
 		let frame = FrameGeometry::for_displays(&backend.displays);
 		let error = backend.validate_frame_layout(&frame).unwrap_err();
 		assert_eq!(error.code.as_str(), "InvalidCoordinateFrame");
@@ -679,7 +674,7 @@ mod tests {
 		// 2560x2880 buffer for a 1280x1440 logical region at scale 2 (issue
 		// #11540).
 		let geometry = PortalGeometry::new(Some((0, 0)), Some((1280, 1440)), 2560, 2880);
-		let display = geometry.display(0);
+		let display = geometry.display(0, &[]);
 		assert_eq!((display.width, display.height), (1280, 1440));
 		assert!((display.scale - 2.0).abs() < f64::EPSILON);
 		let frame = FrameGeometry::for_displays(&[display]);
@@ -694,20 +689,20 @@ mod tests {
 	#[test]
 	fn monitor_offset_is_added_to_logical_point() {
 		let geometry = PortalGeometry::new(Some((100, 50)), Some((1280, 1440)), 2560, 2880);
-		let frame = FrameGeometry::for_displays(&[geometry.display(0)]);
+		let frame = FrameGeometry::for_displays(&[geometry.display(0, &[])]);
 		assert_eq!(frame.map_point(1280.0, 1440.0, None).unwrap(), (740.0, 770.0));
 	}
 
 	#[test]
 	fn missing_portal_size_falls_back_to_buffer_scale_one() {
 		let geometry = PortalGeometry::new(None, None, 1920, 1080);
-		let display = geometry.display(0);
+		let display = geometry.display(0, &[]);
 		assert_eq!((display.x, display.y), (0, 0));
 		assert_eq!((display.width, display.height), (1920, 1080));
 		assert!((display.scale - 1.0).abs() < f64::EPSILON);
 		// Degenerate (zero) portal dimensions take the same fallback.
 		let degenerate = PortalGeometry::new(Some((0, 0)), Some((0, 0)), 1920, 1080);
-		assert_eq!(degenerate.display(0).width, 1920);
+		assert_eq!(degenerate.display(0, &[]).width, 1920);
 	}
 
 	#[test]

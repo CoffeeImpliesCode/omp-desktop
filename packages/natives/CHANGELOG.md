@@ -15,6 +15,7 @@
 
 ### Fixed
 
+- Fixed desktop screenshot zoom on niri rejecting an unchanged display layout.
 - Fixed Wayland PipeWire desktop capture dropping all but the first authorized monitor stream. Capture now composes every stream using its logical placement and pixel dimensions and supports selecting an authorized display by ID.
 - Fixed local Linux native builds with PipeWire enabled when validating Wayland display geometry.
 - Refused global coordinate mapping and AX coordinate clicks when a window's global origin is unknown or its AT-SPI bounds cannot be verified.

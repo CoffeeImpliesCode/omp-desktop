@@ -76,10 +76,100 @@ mod tests {
 				.unwrap_err();
 		assert_eq!(err.code.as_str(), "InvalidTarget");
 		let mut displays = vec![
-			PortalGeometry::new(Some((i32::MIN, 0)), Some((4, 3)), 4, 3).display(0),
-			PortalGeometry::new(Some((i32::MAX - 4, 0)), Some((4, 3)), 4, 3).display(1),
+			PortalGeometry::new(Some((i32::MIN, 0)), Some((4, 3)), 4, 3).display(0, &[]),
+			PortalGeometry::new(Some((i32::MAX - 4, 0)), Some((4, 3)), 4, 3).display(1, &[]),
 		];
 		assert!(layout(&mut displays).is_err());
+	}
+
+	fn captured_niri_frame() -> (FrameGeometry, DesktopDisplay, PortalGeometry) {
+		let capture = monitor(0, 0, 4, 3, 1, 11);
+		let portal = capture.1;
+		let mut native = portal.display(0, &[]);
+		native.id = "eDP-1".into();
+		native.name = "Built-in display".into();
+		native.is_primary = false;
+		// Compositor metadata must not replace the portal's native buffer
+		// geometry.
+		native.pixel_width = 8;
+		native.pixel_height = 6;
+		native.scale = 2.0;
+		let mut displays = metadata(&[capture], std::slice::from_ref(&native));
+		layout(&mut displays).unwrap();
+		let mut frame = FrameGeometry::for_displays(&displays);
+		frame.record_layout(&displays).unwrap();
+		(frame, native, portal)
+	}
+
+	#[test]
+	fn portal_refresh_preserves_niri_display_identity() {
+		let (frame, native, portal) = captured_niri_frame();
+		let refreshed = fresh_layout(&[portal], &[native]).unwrap();
+		assert!(
+			frame.validate_layout(&refreshed).is_ok(),
+			"unchanged portal geometry must retain the captured niri identity"
+		);
+		assert_eq!((refreshed[0].pixel_width, refreshed[0].pixel_height), (4, 3));
+		assert_eq!(refreshed[0].scale, 1.0);
+	}
+
+	#[test]
+	fn portal_refresh_rejects_moved_display() {
+		let (frame, mut native, _) = captured_niri_frame();
+		let moved = PortalGeometry::new(Some((4, 0)), Some((4, 3)), 4, 3);
+		native.x = 4;
+		let refreshed = fresh_layout(&[moved], std::slice::from_ref(&native)).unwrap();
+		assert_eq!(refreshed[0].id, native.id);
+		assert_eq!(
+			frame.validate_layout(&refreshed).unwrap_err().code.as_str(),
+			"InvalidCoordinateFrame"
+		);
+	}
+
+	#[test]
+	fn portal_refresh_rejects_resized_display() {
+		let (frame, mut native, _) = captured_niri_frame();
+		let resized = PortalGeometry::new(Some((0, 0)), Some((5, 3)), 5, 3);
+		native.width = 5;
+		let refreshed = fresh_layout(&[resized], std::slice::from_ref(&native)).unwrap();
+		assert_eq!(refreshed[0].id, native.id);
+		assert_eq!(
+			frame.validate_layout(&refreshed).unwrap_err().code.as_str(),
+			"InvalidCoordinateFrame"
+		);
+	}
+
+	#[test]
+	fn portal_refresh_rejects_changed_buffer_scale() {
+		let (frame, native, _) = captured_niri_frame();
+		let scaled = PortalGeometry::new(Some((0, 0)), Some((4, 3)), 8, 6);
+		let refreshed = fresh_layout(&[scaled], std::slice::from_ref(&native)).unwrap();
+		assert_eq!(refreshed[0].id, native.id);
+		assert_eq!(
+			frame.validate_layout(&refreshed).unwrap_err().code.as_str(),
+			"InvalidCoordinateFrame"
+		);
+	}
+
+	#[test]
+	fn portal_refresh_rejects_ambiguous_niri_metadata() {
+		let (frame, native, portal) = captured_niri_frame();
+		let duplicate = DesktopDisplay { id: "HDMI-A-1".into(), ..native.clone() };
+		let refreshed = fresh_layout(&[portal], &[native, duplicate]).unwrap();
+		assert_eq!(
+			frame.validate_layout(&refreshed).unwrap_err().code.as_str(),
+			"InvalidCoordinateFrame"
+		);
+	}
+
+	#[test]
+	fn portal_refresh_rejects_missing_niri_metadata() {
+		let (frame, _, portal) = captured_niri_frame();
+		let refreshed = fresh_layout(&[portal], &[]).unwrap();
+		assert_eq!(
+			frame.validate_layout(&refreshed).unwrap_err().code.as_str(),
+			"InvalidCoordinateFrame"
+		);
 	}
 }
 
@@ -111,20 +201,38 @@ impl PortalGeometry {
 		Self { logical_x, logical_y, logical_width, logical_height, pixel_width, pixel_height }
 	}
 
-	pub(super) fn display(&self, index: usize) -> DesktopDisplay {
+	pub(super) fn display(&self, index: usize, known: &[DesktopDisplay]) -> DesktopDisplay {
+		// Match only unique exact logical bounds. The portal remains
+		// authoritative for native pixels and scale; compositor metadata
+		// supplies identity only.
+		let mut matches = known.iter().filter(|d| {
+			d.x == self.logical_x
+				&& d.y == self.logical_y
+				&& d.width == self.logical_width
+				&& d.height == self.logical_height
+		});
+		let native = matches.next().filter(|_| matches.next().is_none());
+		let (id, name, is_primary) = match native {
+			Some(native) => (native.id.clone(), native.name.clone(), native.is_primary),
+			None => (
+				format!("wayland-portal-{index}"),
+				format!("Wayland portal monitor {}", index + 1),
+				index == 0,
+			),
+		};
 		DesktopDisplay {
-			id:           format!("wayland-portal-{index}"),
-			name:         format!("Wayland portal monitor {}", index + 1),
-			x:            self.logical_x,
-			y:            self.logical_y,
-			width:        self.logical_width,
-			height:       self.logical_height,
-			scale:        f64::from(self.pixel_width) / f64::from(self.logical_width.max(1)),
-			pixel_x:      0,
-			pixel_y:      0,
-			pixel_width:  self.pixel_width,
+			id,
+			name,
+			x: self.logical_x,
+			y: self.logical_y,
+			width: self.logical_width,
+			height: self.logical_height,
+			scale: f64::from(self.pixel_width) / f64::from(self.logical_width.max(1)),
+			pixel_x: 0,
+			pixel_y: 0,
+			pixel_width: self.pixel_width,
 			pixel_height: self.pixel_height,
-			is_primary:   index == 0,
+			is_primary,
 		}
 	}
 
@@ -211,6 +319,20 @@ pub(super) fn layout(displays: &mut [DesktopDisplay]) -> CoreResult<(u32, u32)> 
 }
 
 #[cfg(any(feature = "wayland-pipewire", test))]
+pub(super) fn fresh_layout(
+	geometries: &[PortalGeometry],
+	known: &[DesktopDisplay],
+) -> CoreResult<Vec<DesktopDisplay>> {
+	let mut displays = geometries
+		.iter()
+		.enumerate()
+		.map(|(index, geometry)| geometry.display(index, known))
+		.collect::<Vec<_>>();
+	layout(&mut displays)?;
+	Ok(displays)
+}
+
+#[cfg(any(feature = "wayland-pipewire", test))]
 pub(super) fn metadata(
 	frames: &[(RgbaImage, PortalGeometry)],
 	known: &[DesktopDisplay],
@@ -218,23 +340,7 @@ pub(super) fn metadata(
 	frames
 		.iter()
 		.enumerate()
-		.map(|(index, (_, geometry))| {
-			let mut display = geometry.display(index);
-			let mut matches = known.iter().filter(|d| {
-				d.x == display.x
-					&& d.y == display.y
-					&& d.width == display.width
-					&& d.height == display.height
-			});
-			if let Some(native) = matches.next()
-				&& matches.next().is_none()
-			{
-				display.id.clone_from(&native.id);
-				display.name.clone_from(&native.name);
-				display.is_primary = native.is_primary;
-			}
-			display
-		})
+		.map(|(index, (_, geometry))| geometry.display(index, known))
 		.collect()
 }
 

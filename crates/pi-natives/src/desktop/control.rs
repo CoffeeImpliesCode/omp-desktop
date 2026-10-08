@@ -1011,7 +1011,7 @@ impl Drop for KernelLease {
 }
 
 #[cfg(test)]
-mod tests {
+mod ownership_tests {
 	use super::*;
 
 	static OWNERSHIP_TEST: Mutex<()> = Mutex::new(());

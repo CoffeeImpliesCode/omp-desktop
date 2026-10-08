@@ -1007,6 +1007,7 @@ mod tests {
 			Arc, LazyLock, Mutex, MutexGuard,
 			atomic::{AtomicBool, Ordering},
 		},
+		thread,
 		time::Instant,
 	};
 
