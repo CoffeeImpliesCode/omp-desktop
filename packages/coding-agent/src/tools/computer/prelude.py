@@ -205,9 +205,59 @@ def _make_computer():
         async def _method(self, method, args, kwargs):
             return await _call([_step("window", (self.id,), {}), _step(method, args, kwargs)])
 
-        async def raise_(self, *args, **kwargs):
-            return await self._method("raise", args, kwargs)
+        async def focus(self, *args, **kwargs):
+            return await self._method("focus", args, kwargs)
 
+        async def raise_(self, *args, **kwargs):
+            return await self.focus(*args, **kwargs)
+
+        async def state(self, *args, **kwargs):
+            return await self._method("state", args, kwargs)
+
+        async def close(self, *args, **kwargs):
+            return await self._method("close", args, kwargs)
+
+        async def moveTo(self, *args, **kwargs):
+            return await self._method("moveTo", args, kwargs)
+
+        async def moveBy(self, *args, **kwargs):
+            return await self._method("moveBy", args, kwargs)
+
+        async def resize(self, *args, **kwargs):
+            return await self._method("resize", args, kwargs)
+
+        async def maximize(self, *args, **kwargs):
+            return await self._method("maximize", args, kwargs)
+
+        async def minimize(self, *args, **kwargs):
+            return await self._method("minimize", args, kwargs)
+
+        async def restore(self, *args, **kwargs):
+            return await self._method("restore", args, kwargs)
+
+        async def toggleMaximized(self, *args, **kwargs):
+            return await self._method("toggleMaximized", args, kwargs)
+
+        async def toggleFullscreen(self, *args, **kwargs):
+            return await self._method("toggleFullscreen", args, kwargs)
+
+        async def toggleWindowedFullscreen(self, *args, **kwargs):
+            return await self._method("toggleWindowedFullscreen", args, kwargs)
+
+        async def setFullscreen(self, *args, **kwargs):
+            return await self._method("setFullscreen", args, kwargs)
+
+        async def setFloating(self, *args, **kwargs):
+            return await self._method("setFloating", args, kwargs)
+
+        async def center(self, *args, **kwargs):
+            return await self._method("center", args, kwargs)
+
+        async def moveToWorkspace(self, *args, **kwargs):
+            return await self._method("moveToWorkspace", args, kwargs)
+
+        async def moveToDisplay(self, *args, **kwargs):
+            return await self._method("moveToDisplay", args, kwargs)
         async def ax(self, *args, **kwargs):
             return await self._method("ax", args, kwargs)
 

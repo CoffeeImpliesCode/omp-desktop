@@ -9,7 +9,7 @@ empty. Backend selection reads only `WAYLAND_DISPLAY` / `DISPLAY`
 `~/.omp/agent/settings.json` nor `config.yml` turns the feature on. The build
 below compiles both addons with `wayland-pipewire` and embeds them in the
 executable. The fork also keeps every authorized monitor stream, adds exact
-niri window capture, and integrates upstream v18.8.4.
+niri window capture, and integrates upstream v18.8.6.
 
 ## Why a hand-dropped addon is not enough
 

@@ -255,6 +255,8 @@ class FakeNativeSession implements NativeDesktopSession {
 	readonly inputModes: boolean[] = [];
 	sourceWidth = 64;
 	sourceHeight = 32;
+	coordinateWidth = 64;
+	coordinateHeight = 32;
 	readonly #operations: string[];
 	readonly #displays: DesktopDisplay[];
 	readonly #workspaces: DesktopWorkspace[];
@@ -308,8 +310,8 @@ class FakeNativeSession implements NativeDesktopSession {
 			height: 32,
 			sourceWidth: this.sourceWidth,
 			sourceHeight: this.sourceHeight,
-			coordinateWidth: this.sourceWidth,
-			coordinateHeight: this.sourceHeight,
+			coordinateWidth: this.coordinateWidth,
+			coordinateHeight: this.coordinateHeight,
 			target,
 			displays: [display],
 			backend: "fake",
@@ -1437,7 +1439,6 @@ describe("computer prelude", () => {
 				kernelMode: "per-call",
 			},
 		);
-
 		expect(result.exitCode).toBe(0);
 		expect(result.output.trim().split("\n")).toEqual([
 			"computer inner display",
@@ -2968,7 +2969,7 @@ describe("expanded computer APIs", () => {
 				).toEqual({ active: approved });
 				expect(native.acquireCount).toBe(approved ? 1 : 0);
 				await supervisor.run(
-					"const win = await desktop.window(42); await win.click(1, 2); await win.click(1, 2, { takeover: false });",
+					"const win = await desktop.window(42); await win.screenshot({ silent: true }); await win.click(1, 2); await win.click(1, 2, { takeover: false });",
 					2000,
 					snapshot(),
 				);

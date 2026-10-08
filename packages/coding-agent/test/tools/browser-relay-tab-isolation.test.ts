@@ -279,6 +279,7 @@ function startWorker(payload: WorkerInitPayload): TestWorker {
 		{
 			send(message) {
 				if (message.type === "ready" || message.type === "init-failed") outcome.resolve(message);
+				if (message.type === "closed") closed.resolve();
 			},
 			onMessage(handler) {
 				receive = handler;
@@ -317,7 +318,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay page ownership across worker recover
 			recover: true,
 			emulateFocus: true,
 		};
-		const failed = startWorker(payload);
+		const failed = startWorker({ ...payload, downloadsPath: "/dev/null/notadir" });
 		let retried: TestWorker | undefined;
 		try {
 			// A retry adopts this same target, so a failed init must not destroy
@@ -332,9 +333,13 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay page ownership across worker recover
 			if (ready.type === "ready") expect(ready.info.targetId).toBe(targetId);
 			await retried.close();
 			retried = undefined;
-
 			// Ownership survived the recovery, so the worker's own close still
 			// destroys the page it was told it owns.
+			if (!page.isClosed()) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				page.once("close", () => resolve());
+				await promise;
+			}
 			expect(page.isClosed()).toBe(true);
 		} finally {
 			await retried?.close();
