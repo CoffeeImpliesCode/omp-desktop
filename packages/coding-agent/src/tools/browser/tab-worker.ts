@@ -1077,7 +1077,10 @@ async function createTrackedPage(browser: Browser, reportTarget: (targetId: stri
 	// the creation request must go through that root connection for every
 	// backend, not through a session on a browser target.
 	const cdpBrowser = browser as unknown as CdpBrowser;
-	const { targetId } = await cdpBrowser._connection.send("Target.createTarget", { url: "about:blank" });
+	const { targetId } = await cdpBrowser._connection.send("Target.createTarget", {
+		url: "about:blank",
+		background: true,
+	});
 	reportTarget(targetId);
 	const existing = browser.targets().find(target => privateTargetId(target) === targetId);
 	const target =

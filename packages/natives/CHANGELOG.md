@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+<<<<<<< conflict 1 of 1
++++++++ wzokwrxk 8d13cd12 "chore(desktop): merge upstream v18.8.7"
 ### Added
 
 - Added niri IPC display and window enumeration and exact native window capture, including windows without AT-SPI support.
@@ -31,6 +33,16 @@
 - Kept libei input waiting for every granted device to become ready and bounded discovery even under continuous events ([#13210](https://github.com/can1357/oh-my-pi/pull/13210) by [@Komzpa](https://github.com/Komzpa)).
 - Allowed X11 startup when inherited Wayland sockets are stale without falling back on permission or live-session failures ([#10752](https://github.com/can1357/oh-my-pi/pull/10752) by [@jake8302](https://github.com/jake8302)).
 
+## [18.8.8] - 2026-10-10
+
+### Changed
+
+- Reduced macOS accessibility-tree latency for `ax()` without changing its text output: each element's children are read once, and its bounds, which the tree never shows, are no longer read ([#15159](https://github.com/can1357/oh-my-pi/pull/15159) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed macOS computer use reporting `AxFailed` instead of `StaleRef` for a ref whose element the app had removed ([#15156](https://github.com/can1357/oh-my-pi/pull/15156) by [@will-bogusz](https://github.com/will-bogusz))
+- Fixed macOS `el.press()` and `el.perform()` reporting `AxFailed` when the app did not answer in time, such as a press that opens a modal dialog; they now report `AxUnconfirmed` ([#15156](https://github.com/can1357/oh-my-pi/pull/15156) by [@will-bogusz](https://github.com/will-bogusz))
 ## [18.8.7] - 2026-10-09
 
 ### Added
