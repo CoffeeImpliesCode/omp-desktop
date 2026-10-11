@@ -80,6 +80,8 @@ impl Backend for X11Backend {
 			// The worker attaches the live `control_capabilities()` read; a
 			// literal here would go stale the moment the window manager changes.
 			window_control: None,
+			screen_locked: false,
+			display_asleep: false,
 		}
 	}
 

@@ -82,6 +82,8 @@ impl Backend for Win32Backend {
 			display_count,
 			// Control capabilities are filled in by the core worker.
 			window_control: None,
+			screen_locked: false,
+			display_asleep: false,
 		}
 	}
 

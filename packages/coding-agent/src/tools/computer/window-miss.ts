@@ -10,12 +10,7 @@ const WINDOWS_PER_MATCHED_APP = 10;
 /** Characters of a window title shown in a miss. */
 const MAX_TITLE_CHARS = 80;
 
-/**
- * What a window selector that matched nothing could have meant: the apps with
- * an open window and the windows they have, apps matching the selector's `app`
- * first, so the next call can name an exact id (or conclude the app has no
- * window yet) without listing windows first.
- */
+/** Lists the open windows by app, apps matching `app` first, for a selector that matched nothing. */
 export function describeWindowMiss(windows: readonly DesktopWindow[], app: string | undefined): string {
 	if (windows.length === 0) return "No windows are open.";
 	// An empty `app` filters nothing in `matchesFilter`, so it matches no app here either.
@@ -27,13 +22,13 @@ export function describeWindowMiss(windows: readonly DesktopWindow[], app: strin
 	const apps = [...byApp.keys()].sort((left, right) => rank(left) - rank(right) || left.localeCompare(right));
 	const lines = apps.slice(0, MAX_APPS).map(name => {
 		const group = byApp.get(name)!;
-		const titled = group.filter(window => window.title.trim() !== "");
+		// Titled windows first; untitled ones still list their ids, since macOS without Screen Recording blanks other apps' titles.
+		const ordered = group.toSorted((left, right) => Number(!left.title.trim()) - Number(!right.title.trim()));
 		const limit = matched(name) ? WINDOWS_PER_MATCHED_APP : WINDOWS_PER_APP;
-		const entries = titled
+		const entries = ordered
 			.slice(0, limit)
 			.map(window => `${window.id} ${JSON.stringify(truncate(window.title, MAX_TITLE_CHARS))}`);
-		if (titled.length > limit) entries.push(`${titled.length - limit} more`);
-		if (group.length > titled.length) entries.push(`${group.length - titled.length} untitled`);
+		if (ordered.length > limit) entries.push(`${ordered.length - limit} more`);
 		// App names come from the OS: a newline in one must not start a row of its own.
 		return `- ${name.replace(/[\s\p{Cc}]+/gu, " ")}: ${entries.join(", ")}`;
 	});

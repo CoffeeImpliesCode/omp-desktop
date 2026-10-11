@@ -44,7 +44,7 @@ const displays = await computer.displays();
 const win = await computer.window({ app: "Code" });
 await win.screenshot();
 const tree = await win.ax({ maxDepth: 6 });
-await (await win.ref("e12")).press();
+await win.ref("e12").press();
 await computer.capabilities();
 await computer.close();
 ```
@@ -56,7 +56,7 @@ displays = await computer.displays()
 win = await computer.window(app="Code")
 await win.screenshot(silent=True)
 tree = await win.ax(maxDepth=6)
-await (await win.ref("e12")).press()
+await win.ref("e12").press()
 await win.click(120, 48, button="right")
 ```
 
@@ -78,7 +78,7 @@ display(await computer.displays());
 display(await computer.capabilities());
 ```
 
-`computer.windows({ app?, title? })` returns window IDs, app/title, PID, logical bounds, and focus state. Select exactly one target with `computer.window(idOrFilter)`; an ambiguous filter throws and lists candidates. A missing target reports a bounded list of available windows so you can correct the filter. `computer.focusedWindow()` returns the current target or `null`.
+`computer.windows({ app?, title? })` returns window IDs, app/title, PID, logical bounds, and focus state for up to 48 matching windows. Select exactly one target with `computer.window(idOrFilter)`; an ambiguous filter throws and lists candidates. A missing target reports a bounded list of available windows so you can correct the filter. `computer.focusedWindow()` returns the current target or `null`.
 
 ## Window, workspace and display control
 
@@ -150,6 +150,11 @@ Rules:
 - `focusDisplay` is not advertised, because X11 has no monitor focus concept.
 - State and workspaces are read from `_NET_WM_STATE`, `WM_STATE`, and the desktop and root properties. Minimized windows still appear in `computer.windows()`, so a handle can restore them.
 - A close never force-kills a close-resistant application.
+%%%%%%% diff from: wyrkqrzs fa5ff4a3 "chore: bump version to 18.8.9"
+\\\\\\\        to: mptykzvy a4d6f0ad "chore: bump version to 18.9.1"
+-`computer.windows({ app?, title? })` returns window IDs, app/title, PID, logical bounds, and focus state. Select exactly one target with `computer.window(idOrFilter)`; an ambiguous filter throws and lists candidates. `computer.focusedWindow()` returns the current target or `null`.
++`computer.windows({ app?, title? })` returns window IDs, app/title, PID, logical bounds, and focus state for up to 48 matching windows. Select exactly one target with `computer.window(idOrFilter)`; an ambiguous filter throws and lists candidates. `computer.focusedWindow()` returns the current target or `null`.
+>>>>>>> conflict 1 of 2 ends
 
 ### Applications and live display targets
 
@@ -219,8 +224,8 @@ await buttons[0].press();
 
 - `win.ax({ all?, maxDepth? })` returns a textual tree with `[ref=eN]` references; default depth is 24 and native snapshots visit at most 800 nodes.
 - `win.find({ role?, title?, value?, limit? })` matches case-insensitive substrings and returns up to `limit` elements (default 100, maximum 5000), from a walk bounded to 5000 nodes and depth 24.
-- `await win.ref("e5")`, `computer.elementAt(x, y)`, `computer.focusedElement()`, and `computer.ref("e5")` return live elements.
-- Elements expose `value`, `setValue`, `bounds`, `attributes`, `actions`, `perform`, `press`, `click`, `focus`, `parent`, and `children` operations.
+- `await win.ref("e5")`, `computer.elementAt(x, y)`, `computer.focusedElement()`, and `computer.ref("e5")` return live elements. The handle `ref()` returns also takes element methods directly: `await win.ref("e5").click({ count: 2 })`.
+- Elements expose `value`, `setValue`, `bounds`, `attributes`, `actions`, `perform`, `press`, `click({ button?, count?, modifiers? })`, `focus`, `parent`, and `children` operations.
 
 AX element actions need no screenshot. AX bounds and `computer.elementAt` use platform-native global desktop coordinates, not screenshot pixels: Windows uses physical desktop pixels; macOS uses logical points. Element clicks resolve the live element's owning window and refuse missing or ambiguous ownership rather than clicking an overlapping window. An element keeps the same reference across its window's AX snapshots and `find()` (desktop lookups such as `computer.focusedElement()` keep their own); a reference expires once its element is missing from the window's current and previous AX snapshots. An element whose role or label changes gets a new reference, and the old reference keeps naming the element it was read from until it expires the same way. On Windows, an element that takes over the UI Automation `RuntimeId` of one that is gone also gets a new reference, and an element whose `RuntimeId` cannot be read gets a new one on every read. The registry also caps references at 5000 and can evict a target's oldest generation earlier. Recover from `StaleRef` by taking a new AX snapshot and reacquiring the element.
 
@@ -258,8 +263,8 @@ Inside `computer.run`, `wait(milliseconds)` sleeps and `wait(predicate, { timeou
 
 | Platform                | Current backend                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| macOS x64/arm64         | ScreenCaptureKit in a persistent native event-loop worker on macOS 14+, in-process CoreGraphics on macOS 12/13, plus native AX and input. Grant Screen Recording for capture and Accessibility for input/AX, then restart the launching host.                                                                                                                                                                                                                                                                                      |
-| Linux X11 x64/arm64     | X11 capture/input and AT-SPI accessibility. Requires a readable display plus RandR/XTEST. Window control is advertised per running window manager; see [Window, workspace and display control](#window-workspace-and-display-control).                                                                                                                                                                                                                                                                                                          |
+| macOS x64/arm64         | ScreenCaptureKit in a persistent native event-loop worker on macOS 14+, in-process CoreGraphics on macOS 12/13, plus native AX and input. Grant Screen Recording for capture and Accessibility for input/AX, then restart the launching host. Without Screen Recording, other apps' window titles read as empty. |
+| Linux X11 x64/arm64     | X11 capture/input and AT-SPI accessibility. Requires a readable display plus RandR/XTEST. Window control is advertised per running window manager; see [Window, workspace and display control](#window-workspace-and-display-control). |
 | Linux Wayland x64/arm64 | RemoteDesktop portal or `LIBEI_SOCKET` input and AT-SPI accessibility. ScreenCast portal/PipeWire capture ships only in builds compiled with the `wayland-pipewire` Cargo feature; released binaries omit it, so `capabilities()` reports `capture: false` there. RemoteDesktop permission is requested lazily on first native input, is not persisted, and closes with the desktop session; read-only window/AX inspection does not request it. Compositor restrictions apply; background per-window native input is unavailable. On niri, window, workspace, and display control runs over the compositor IPC socket and is advertised through `capabilities().windowControl`. |
 | Windows x64/arm64       | Native display/window capture, Win32 input, and UI Automation accessibility.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | Other published targets | Unsupported unless the native addon reports capabilities.                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
@@ -275,6 +280,19 @@ With `wayland-pipewire`, desktop capture retains every monitor stream authorized
 On niri, display and window metadata come from its IPC socket, so `displayCount` is available before capture. Window IDs are opaque `niri:<id>` values. Exact window capture uses niri's native Mutter ScreenCast service, including for windows without AT-SPI support. It does not focus the window or change the clipboard. Normal computer read approval still applies, but this path does not open a portal selection dialog. Tiled windows whose global origin niri does not publish report `positionKnown: false`. AX coordinate clicks also refuse unverified global bounds; semantic AX actions remain available where supported. A stream whose dimensions include unlocatable popup or shadow margins fails with `CaptureFailed` instead of producing a misaligned window frame.
 
 Window control is backend-reported, not assumed. Read `computer.capabilities().windowControl` for the advertised `operations`, window movement `coordinateSpace`, and `focusMayWarpPointer`. See [Window, workspace and display control](#window-workspace-and-display-control) for per-backend behavior and error recovery.
+
+### macOS display sleep and the lock screen
+
+While the agent uses the desktop, the macOS session holds a `PreventUserIdleDisplaySleep` power assertion, shown by `pmset -g assertions` as "oh-my-pi computer tool is operating the desktop". Every desktop call except `capabilities()` holds or renews it; it is released five minutes after the last call, or when the session closes. Releasing it restarts the system's display-sleep countdown, so the display, and an idle lock tied to it, can arrive no sooner than five minutes plus your display-sleep setting after the agent's last action.
+
+The assertion does not wake a display that is already asleep or unlock a locked screen. `capabilities()` reports `screenLocked` and `displayAsleep`, a screenshot taken behind the lock screen carries `screenLocked: true` and a note, any failed call names the state, and a run that ends locked or asleep starts with a `Note:` line. Input is never refused because of the lock; measured on macOS 26, it behaves as follows:
+
+| State | Screenshots | Background click | Keystrokes, takeover, AX actions |
+| --- | --- | --- | --- |
+| Locked, display on | A display capture shows the lock screen; a window capture shows the window's last frame behind it. | Reaches the app behind the lock screen. | Fail: apps expose no AX windows or elements while locked. |
+| Locked, display asleep | Fail: no active displays. | Fails: no display layout. | Fail, as above. |
+
+No agent input reached the lock screen's password field.
 
 ## Safety and troubleshooting
 

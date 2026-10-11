@@ -139,6 +139,8 @@ impl Backend for WaylandBackend {
 			// The live window-control surface is attached centrally from
 			// `Backend::control_capabilities`, which probes niri itself.
 			window_control: None,
+			screen_locked: false,
+			display_asleep: false,
 		}
 	}
 

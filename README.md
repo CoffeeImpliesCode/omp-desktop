@@ -2,7 +2,7 @@
 
 This fork of [oh-my-pi](https://github.com/can1357/oh-my-pi) improves desktop computer use specifically for **Linux Wayland**.
 
-Upstream base: [v18.8.9](https://github.com/can1357/oh-my-pi/releases/tag/v18.8.9).
+Upstream base: [v18.9.1](https://github.com/can1357/oh-my-pi/releases/tag/v18.9.1).
 
 ## Linux Wayland improvements
 
@@ -64,6 +64,8 @@ The most capable agent surface that ships. Continuously tuned by real-world use 
 ```sh
 curl -fsSL https://omp.sh/install | sh
 ```
+
+Without a usable bun (or with `--binary`), the install scripts fetch the prebuilt binary from `build.stencil.so` and check its SHA-256 before installing it. Pin a release with `curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v<version>` (PowerShell: `-Binary -Ref v<version>`).
 
 > **Alpine / musl:** the prebuilt musl binary links `libstdc++`/`libgcc` dynamically, which stock Alpine does not ship. Install them first: `apk add libstdc++ libgcc`.
 

@@ -20,6 +20,7 @@ import type {
 	DesktopCapture,
 	DesktopDisplay,
 	DesktopPoint,
+	DesktopScreenState,
 	DesktopSessionOptions,
 	DesktopWindow,
 	DesktopWindowState,
@@ -55,18 +56,22 @@ import {
 } from "./observation";
 import { describeWindowMiss } from "./window-miss";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
-import type {
-	ComputerScreenshot,
-	ComputerSessionSnapshot,
-	ComputerWorkerInbound,
-	ComputerWorkerTransport,
-	RunErrorPayload,
-	ToolReply,
+import {
+	type ComputerScreenshot,
+	type ComputerSessionSnapshot,
+	type ComputerWorkerInbound,
+	type ComputerWorkerTransport,
+	type RunErrorPayload,
+	SCREEN_LOCKED_CAPTURE_NOTE,
+	screenStateNotice,
+	type ToolReply,
 } from "./protocol";
 
 /** Native desktop operations consumed by the script runtime. */
 export interface NativeDesktopSession {
 	readonly capabilities: DesktopCapabilities;
+	/** Lock and display-sleep state, read without waiting behind queued native work. */
+	readonly screenState: DesktopScreenState;
 	listDisplays(): Promise<DesktopDisplay[]>;
 	listWindows(): Promise<DesktopWindow[]>;
 	capture(target: string, caps?: { maxWidth?: number; maxHeight?: number } | null): Promise<DesktopCapture>;
@@ -123,11 +128,13 @@ export type NativeDesktopSessionFactory = (
 ) => NativeDesktopSession | Promise<NativeDesktopSession>;
 
 type WindowFilter = { id?: string | number; app?: string; title?: string };
+/** Window listings are session-transcript payload; `window()` lookups search the whole native list. */
+const MAX_LISTED_WINDOWS = 48;
 type InputOptions = { takeover?: boolean };
 type ScreenshotOptions = { silent?: boolean };
 type ScreenshotResult = Pick<
 	ComputerScreenshot,
-	"path" | "width" | "height" | "coordinateWidth" | "coordinateHeight" | "region"
+	"path" | "width" | "height" | "coordinateWidth" | "coordinateHeight" | "region" | "screenLocked"
 >;
 type ClickOptions = InputOptions & { button?: string; count?: number; modifiers?: string[] };
 type DragOptions = InputOptions & { modifiers?: string[]; keys?: string[] };
@@ -404,6 +411,7 @@ async function emitScreenshot(
 		coordinateHeight: frame.coordinateHeight,
 		...(frame.region ? { region: frame.region } : {}),
 	};
+	if (frame.screenLocked) result.screenLocked = true;
 	const scaled = frame.width !== frame.sourceWidth || frame.height !== frame.sourceHeight;
 	context.screenshots.push({
 		...result,
@@ -414,11 +422,12 @@ async function emitScreenshot(
 	if (!options?.silent) {
 		const dimensions = `${frame.width}×${frame.height}${scaled ? ` (scaled from ${frame.sourceWidth}×${frame.sourceHeight})` : ""}`;
 		const coordinates = `coordinateWidth=${frame.coordinateWidth} coordinateHeight=${frame.coordinateHeight}`;
+		const captured = frame.region
+			? `zoom ${frame.target} ${dimensions}; region=${JSON.stringify(frame.region)}; ${coordinates}; use the base full screenshot coordinates for input, not zoom pixels → ${destination}`
+			: `screenshot ${frame.target} ${dimensions}; ${coordinates} → ${destination}`;
 		context.output.push({
 			type: "text",
-			text: frame.region
-				? `zoom ${frame.target} ${dimensions}; region=${JSON.stringify(frame.region)}; ${coordinates}; use the base full screenshot coordinates for input, not zoom pixels → ${destination}`
-				: `screenshot ${frame.target} ${dimensions}; ${coordinates} → ${destination}`,
+			text: frame.screenLocked ? `${captured}\n${SCREEN_LOCKED_CAPTURE_NOTE}` : captured,
 		});
 		context.output.push({
 			type: "image",
@@ -500,7 +509,7 @@ class El {
 		return this.#input("press", `press ${this.ref}`, () => this.#session.axPerform(this.ref, "press"));
 	}
 
-	click(options?: InputOptions): Promise<void> {
+	click(options?: ClickOptions): Promise<void> {
 		return this.#input("click", `click ${this.ref}`, () => this.#session.axClick(this.ref, pointerOptions(options)));
 	}
 
@@ -517,6 +526,83 @@ class El {
 		return (await this.#read("children", () => this.#session.axChildren(this.ref))).map(node =>
 			this.#observer.element(this.#getContext, node, this.#observer.windowOf(this.ref)),
 		);
+	}
+}
+
+/** `await ref("e5")` resolves the element; its methods chain on the handle and await the lookup first. */
+class ElRef implements PromiseLike<El> {
+	readonly ref: string;
+	readonly #lookup: () => Promise<El>;
+	#element?: Promise<El>;
+
+	constructor(ref: string, lookup: () => Promise<El>) {
+		this.ref = ref;
+		this.#lookup = lookup;
+	}
+
+	#resolve(): Promise<El> {
+		this.#element ??= this.#lookup();
+		return this.#element;
+	}
+
+	// oxlint-disable-next-line unicorn/no-thenable -- the handle is awaitable by design: `await ref("e5")` resolves the element.
+	then<A = El, B = never>(
+		onFulfilled?: ((element: El) => A | PromiseLike<A>) | null,
+		onRejected?: ((reason: unknown) => B | PromiseLike<B>) | null,
+	): Promise<A | B> {
+		return this.#resolve().then(onFulfilled, onRejected);
+	}
+
+	catch<B = never>(onRejected?: ((reason: unknown) => B | PromiseLike<B>) | null): Promise<El | B> {
+		return this.#resolve().catch(onRejected);
+	}
+
+	finally(onFinally?: (() => void) | null): Promise<El> {
+		return this.#resolve().finally(onFinally);
+	}
+
+	async value(): Promise<string | undefined> {
+		return (await this.#resolve()).value();
+	}
+
+	async setValue(value: string): Promise<void> {
+		await (await this.#resolve()).setValue(value);
+	}
+
+	async bounds(): Promise<{ x: number; y: number; width: number; height: number } | null> {
+		return (await this.#resolve()).bounds();
+	}
+
+	async attributes(): Promise<Record<string, string>> {
+		return (await this.#resolve()).attributes();
+	}
+
+	async actions(): Promise<string[]> {
+		return (await this.#resolve()).actions();
+	}
+
+	async perform(action: string): Promise<void> {
+		await (await this.#resolve()).perform(action);
+	}
+
+	async press(): Promise<void> {
+		await (await this.#resolve()).press();
+	}
+
+	async click(options?: ClickOptions): Promise<void> {
+		await (await this.#resolve()).click(options);
+	}
+
+	async focus(): Promise<void> {
+		await (await this.#resolve()).focus();
+	}
+
+	async parent(): Promise<El | null> {
+		return (await this.#resolve()).parent();
+	}
+
+	async children(): Promise<El[]> {
+		return (await this.#resolve()).children();
 	}
 }
 
@@ -885,11 +971,13 @@ class Win {
 		);
 	}
 
-	async ref(ref: string): Promise<El> {
-		const node = await this.#observer.read(this.#getContext().signal, ref, `ref ${ref}`, () =>
-			this.#session.axNode(ref),
-		);
-		return this.#observer.element(this.#getContext, node, this.#observer.windowOf(ref));
+	ref(ref: string): ElRef {
+		return new ElRef(ref, async () => {
+			const node = await this.#observer.read(this.#getContext().signal, ref, `ref ${ref}`, () =>
+				this.#session.axNode(ref),
+			);
+			return this.#observer.element(this.#getContext, node, this.#observer.windowOf(ref));
+		});
 	}
 }
 
@@ -1047,7 +1135,6 @@ class InputObserver {
 		}
 	}
 }
-
 /** Hosts the persistent JavaScript runtime and native desktop session. */
 export class ComputerWorkerCore {
 	readonly #transport: ComputerWorkerTransport;
@@ -1294,7 +1381,12 @@ export class ComputerWorkerCore {
 			this.#drain();
 		}
 		if (failure !== undefined) {
-			this.#transport.send({ type: "result", id: message.id, ok: false, error: errorPayload(failure.error) });
+			this.#transport.send({
+				type: "result",
+				id: message.id,
+				ok: false,
+				error: this.#withScreenState(errorPayload(failure.error)),
+			});
 			return;
 		}
 		if (completed) {
@@ -1452,6 +1544,22 @@ export class ComputerWorkerCore {
 			if (changes.length > 0) sections.push(changes.join("\n"));
 		}
 		return sections.length > 0 ? sections.join("\n\n") : undefined;
+	}
+
+	/**
+	 * A run that fails while the macOS screen is locked or the display asleep
+	 * says so after its own message, which stays first and intact. Aborts and
+	 * sessions that never started are returned unchanged. The state is read
+	 * without queuing, since the failure may be a native request that hangs.
+	 */
+	#withScreenState(payload: RunErrorPayload): RunErrorPayload {
+		if (payload.isAbort || !this.#session) return payload;
+		const notice = screenStateNotice(this.#session.screenState);
+		if (!notice) return payload;
+		const message = payload.message ? `${payload.message}\n${notice}` : notice;
+		const stack =
+			payload.stack && payload.message ? payload.stack.replace(payload.message, () => message) : payload.stack;
+		return { ...payload, message, stack };
 	}
 
 	/**
@@ -1623,9 +1731,9 @@ export class ComputerWorkerCore {
 			},
 			windows: async (filter?: WindowFilter): Promise<DesktopWindow[]> => {
 				const { signal } = getContext();
-				return (await nativeCall(signal, () => session.listWindows())).filter(window =>
-					matchesFilter(window, filter),
-				);
+				return (await nativeCall(signal, () => session.listWindows()))
+					.filter(window => matchesFilter(window, filter))
+					.slice(0, MAX_LISTED_WINDOWS);
 			},
 			window: async (selector: string | number | WindowFilter): Promise<Win> => {
 				const { signal } = getContext();
@@ -1643,9 +1751,12 @@ export class ComputerWorkerCore {
 				}
 				if (matches.length > 1) {
 					const candidates = matches
+						.slice(0, MAX_LISTED_WINDOWS)
 						.map(window => `${window.id} ${window.app} ${JSON.stringify(window.title)}`)
 						.join("\n");
-					throw new ToolError(`multiple windows match ${JSON.stringify(selector)}:\n${candidates}`);
+					const omitted = matches.length - MAX_LISTED_WINDOWS;
+					const more = omitted > 0 ? `\n… ${omitted} more` : "";
+					throw new ToolError(`multiple windows match ${JSON.stringify(selector)}:\n${candidates}${more}`);
 				}
 				return makeWin(matches[0]!);
 			},
@@ -1709,10 +1820,11 @@ export class ComputerWorkerCore {
 				const node = await nativeCall(signal, () => session.axFocused());
 				return node ? observer.element(getContext, node, await observer.windowReached(signal)) : null;
 			},
-			ref: async (ref: string): Promise<El> => {
-				const node = await observer.read(getContext().signal, ref, `ref ${ref}`, () => session.axNode(ref));
-				return observer.element(getContext, node, observer.windowOf(ref));
-			},
+			ref: (ref: string): ElRef =>
+				new ElRef(ref, async () => {
+					const node = await observer.read(getContext().signal, ref, `ref ${ref}`, () => session.axNode(ref));
+					return observer.element(getContext, node, observer.windowOf(ref));
+				}),
 			clipboard: {
 				read: async (): Promise<string> => {
 					const { signal } = getContext();

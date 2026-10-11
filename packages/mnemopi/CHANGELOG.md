@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [18.9.0] - 2026-10-11
+
+### Added
+
+- Exported `clipRecallContent` for applications that need to format content consistently with Mnemopi recall previews.
+
+### Fixed
+
+- Fixed memory-save performance degradation and excessive memory-database growth when date-related terms such as “today” appeared in otherwise unrelated memories.
+
 ## [18.8.8] - 2026-10-10
 
 ### Fixed

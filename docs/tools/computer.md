@@ -46,7 +46,7 @@ The `computer` global exposes the desktop helpers directly. Each helper is one h
 const win = await computer.window({ app: "Code" });
 await win.screenshot();
 const tree = await win.ax({ maxDepth: 6 });
-await (await win.ref("e12")).press();
+await win.ref("e12").press();
 await computer.capabilities();
 await computer.close();
 ```
@@ -57,7 +57,7 @@ Python uses the same helper names; keyword arguments become the trailing options
 win = await computer.window(app="Code")
 await win.screenshot(silent=True)
 tree = await win.ax(maxDepth=6)
-await (await win.ref("e12")).press()
+await win.ref("e12").press()
 await win.click(120, 48, button="right")
 ```
 
@@ -75,12 +75,12 @@ The same surface is reachable as `computer.*` directly and as `desktop.*` inside
 
 ### Discovery
 
-- `desktop.windows({ app?, title? })` returns matching `DesktopWindow[]`; app/title matching is case-insensitive substring matching.
-- `desktop.window(id | { id?, app?, title? })` returns one persistent window facade. An id may be a string or a number (`74` is the id `"74"`, never matched against app or title). Zero matches throw with a bounded list of available windows; multiple matches throw with the candidates.
+- `desktop.windows({ app?, title? })` returns up to 48 matching `DesktopWindow[]`; app/title matching is case-insensitive substring matching.
+- `desktop.window(id | { id?, app?, title? })` returns one persistent window facade. An id may be a string or a number (`74` is the id `"74"`, never matched against app or title). Zero matches throw with the open windows grouped by app as `id "title"`: apps matching the filter's `app` first (up to 10 windows each, titled before untitled), then the focused window's app, then the rest (up to 3 each), at most 12 apps, with overflow and unlisted windows counted, plus a line when no app matches. Multiple matches throw with the candidates.
 - `desktop.focusedWindow()` returns a window facade or `null`.
 - `desktop.displays()` returns `DesktopDisplay[]`.
 - `desktop.workspaces()` returns `DesktopWorkspace[]` entries with `{ id, index, name, displayId, active, focused, urgent, activeWindowId }`. Workspace IDs are opaque and stable (`niri-workspace:<n>` on niri, `x11-workspace:<n>` on X11).
-- `desktop.capabilities()` returns capture/input/AX availability, `backgroundWindowInput` and `takeover` support, permission states, display server, backend, display count, and the optional `windowControl` block `{ backend, operations, coordinateSpace, focusMayWarpPointer }`. A missing block means the session has no window control.
+- `desktop.capabilities()` returns capture/input/AX availability, `backgroundWindowInput` and `takeover` support, permission states, display server, backend, display count, on macOS `screenLocked`/`displayAsleep`, and the optional `windowControl` block `{ backend, operations, coordinateSpace, focusMayWarpPointer }`. A missing block means the session has no window control.
 
 A window facade exposes immutable `id`, `app`, `title`, optional `pid`, `bounds`, `positionKnown`, and `focused` fields.
 
@@ -96,8 +96,8 @@ macOS uses bundle/Launch Services identity, Windows includes registered/Start-me
 
 Both a selected window and `desktop` expose:
 
-- `screenshot({ silent? }) -> { path, width, height, coordinateWidth, coordinateHeight }`
-- `zoom({ x, y, width, height }, { silent? }) -> { path, width, height, coordinateWidth, coordinateHeight, region }`
+- `screenshot({ silent? }) -> { path, width, height, coordinateWidth, coordinateHeight, screenLocked? }`
+- `zoom({ x, y, width, height }, { silent? }) -> { path, width, height, coordinateWidth, coordinateHeight, region, screenLocked? }`
 - `click(x, y, { button?, count?, modifiers?, takeover? })`
 - `doubleClick(x, y, { button?, modifiers?, takeover? })`
 - `move(x, y)`
@@ -121,18 +121,37 @@ Window/workspace controls call the compositor or window manager, not synthetic i
 On niri, movement requires a floating window, tiled resize changes the column or row, and minimize, restore, idempotent maximize, and idempotent fullscreen are not advertised. Focusing may warp the pointer. X11 advertises only operations supported by the running window manager; `focusDisplay` is absent.
 
 `win.observe({ silent?, all?, maxDepth? })` returns screenshot metadata and `{ ax, nodeCount, truncated }`, normally emitting both. A failed observation preserves the prior delivered click frame. Native menu helpers list items and select one enabled, unambiguous path without guessing shortcuts. `holdKeys` and `holdMouse` release held input on every exit. `desktop.control.acquire({ reason })` requires live human confirmation; release it in `finally`. On macOS, `win.bringToCurrentSpace()` verifies movement without switching Spaces or activating the app. Menu/application labels are untrusted, and a takeover grant does not authorize unrelated external effects.
+%%%%%%% diff from: wyrkqrzs fa5ff4a3 "chore: bump version to 18.8.9"
+\\\\\\\        to: mptykzvy a4d6f0ad "chore: bump version to 18.9.1"
+ A window also exposes `raise()`, `ax(...)`, `find(...)`, and `ref(...)`. Window input defaults to background delivery without deliberate activation or pointer movement. `takeover: true` briefly activates the target and posts real input; use it only after that call reports `BackgroundUnavailable` or a screenshot proves a no-op, and AX cannot perform the action. Never replay uncertain input blindly. Desktop-root pointer helpers drive the user's real pointer, so prefer window handles. Pixel coordinates belong to the most recent full screenshot of the same target. Coordinate input before capture, after target/layout changes, or with another target's frame throws.
+ 
+ Screenshots are PNGs written under the OS temp directory. Native capture is resized to the effective capture caps before both saving and displaying; both Eval runtimes preserve the original-detail image bytes and metadata, so Eval does not perform a second resize or encode. Unless `silent: true`, each capture emits a status text block and an image block. Details record captured dimensions, original source dimensions, and target.
+ 
+ Zoom requires a previous full capture of the same target. Its rectangle is in that full frame's pixels; a fresh native image is cropped before applying output caps. Zoom does not replace the stored click frame. `width`/`height` describe the returned image; `coordinateWidth`/`coordinateHeight` describe the unchanged full frame used for later input. Desktop zoom pins the originally captured display even if focus moves to another monitor. Window resizes and display-layout changes reject stale input/zoom with `InvalidCoordinateFrame`.
+ 
+ ### Observation, menus, holds, and control
+ 
+-- `win.observe({ silent?, all?, maxDepth? })` returns screenshot metadata plus `{ ax, nodeCount, truncated }`, normally emitting both image and AX text. Capture/AX failure restores the previous delivered coordinate frame.
++- `win.observe({ silent?, all?, maxDepth? })` returns screenshot metadata plus `{ ax, nodeCount, truncated }`, normally emitting both image and AX text. Capture/AX failure restores the previous delivered coordinate frame. When the AX text was emitted, the returned `ax` stays readable but is left out of the value's display, so a trailing `await win.observe()` shows the tree once: in JavaScript `ax` is non-enumerable (spread, `JSON.stringify` and `console.log` leave it out), and in Python the repr and `display()` omit it. A `silent: true` observation keeps `ax` everywhere; values returned from `computer.run` are unchanged.
+ - `win.menu.items(path?)` lists `{ title, path, enabled, checked, hasSubmenu, shortcut? }[]`; `win.menu.select(path)` invokes one enabled unambiguous command in the target window's context.
+ - `holdKeys(keys, { duration, takeover? })` and `holdMouse(x, y, { duration, button?, keys?, takeover? })` use seconds in `[0, 100]`. `drag` also accepts arbitrary `keys`. Held input is always released within the call.
+ - `desktop.control.acquire({ reason })` needs live human confirmation, returns `{ active }`, and holds native task ownership between calls. `release()` revokes it; `state()` reads live state. Normal run retirement preserves an acquired grant, while interruption, task completion, and disposal revoke it. Omitted takeover follows that live grant; explicit false remains background.
+ - `win.bringToCurrentSpace()` is macOS-only, verifies actual movement without switching Spaces/activating, and invalidates the old frame.
+ 
+ Menu/app labels are untrusted data. A takeover grant does not authorize unrelated external effects. Inspect `applications`, `menus`, `heldInput`, `spaces`, and `globalEscape` capabilities.
+>>>>>>> conflict 3 of 3 ends
 
 ### Accessibility
 
 - `win.ax({ all?, maxDepth? }) -> string` returns the native textual accessibility tree with `[ref=eN]` references.
 - `win.find({ role?, title?, value?, limit? }) -> El[]` returns all native matches within the requested limit.
-- `await win.ref("e5") -> El` and `await desktop.ref("e5") -> El` resolve a live native reference.
+- `await win.ref("e5") -> El` and `await desktop.ref("e5") -> El` resolve a live native reference. The handle `ref()` returns also takes element methods directly, so `win.ref("e5").click()` needs no inner `await`.
 - `desktop.elementAt(x, y)` and `desktop.focusedElement()` return `El | null`.
 
 `El` exposes snapshot fields `ref`, `role`, `nativeRole`, optional `title`/`description`, `enabled`, `focused`, and `childCount`, plus:
 
 - reads: `value()`, `bounds()`, `attributes()`, `actions()`, `parent()`, `children()`;
-- mutations: `setValue(value)`, `perform(action)`, `press()`, `click({ takeover? })`, and `focus()`.
+- mutations: `setValue(value)`, `perform(action)`, `press()`, `click({ button?, count?, modifiers?, takeover? })`, and `focus()`.
 
 On macOS, `setValue` on a date or time control (one whose `AXValue` is a date) takes ISO-8601: `YYYY-MM-DD` changes the day and keeps the control's time of day, `YYYY-MM-DDTHH:MM[:SS]` is local time, and a date-time followed by `Z` or `±HH:MM` is that exact instant. Anything else is refused before a write, naming these forms and the control's current date, as is a local time that daylight saving skips or repeats (add an offset to pick a repeated one).
 
@@ -151,7 +170,9 @@ AX actions need no screenshot. AX bounds and `desktop.elementAt()` use platform-
 
 Direct helpers and `computer.run(...)` return the worker's structured value directly; window and element facades cross the boundary as their identity fields. The outer Eval cell prints nonempty text emitted by inner `display(...)` calls. Non-silent screenshots remain ordinary Eval image output. A run with no display text and no return value emits no placeholder text. Combined display text is subject to the shared inline byte cap; over-cap text is saved as a session artifact.
 
-Result details contain the resolved `code`, `readOnly`, `screenshots`, optional structured `value`, and capability metadata (`backend`, `capturePermission`, `inputPermission`, `axPermission`). Each screenshot detail contains `path`, `width`, `height`, `coordinateWidth`, `coordinateHeight`, optional `sourceWidth`/`sourceHeight` and `region`, and `target`. Provider delivery uses ordinary text/image content with image detail `original`; it does not use provider Files or native `computer_call_output` metadata.
+Result details contain the resolved `code`, `readOnly`, `screenshots`, optional structured `value`, and capability metadata (`backend`, `capturePermission`, `inputPermission`, `axPermission`). Each screenshot detail contains `path`, `width`, `height`, `coordinateWidth`, `coordinateHeight`, optional `sourceWidth`/`sourceHeight`, `region` and `screenLocked`, and `target`. Provider delivery uses ordinary text/image content with image detail `original`; it does not use provider Files or native `computer_call_output` metadata.
+
+On macOS a screenshot taken behind the lock screen sets `screenLocked: true` and adds a note to its status text; a native error raised while the screen is locked or the display asleep ends with that state in parentheses; and a run that ends locked or asleep returns a leading `Note:` text block. None of these refuse input. While it is in use, the native session keeps the display awake with a `PreventUserIdleDisplaySleep` assertion released five minutes after the last desktop call or on close; see [macOS display sleep and the lock screen](../computer-use.md#macos-display-sleep-and-the-lock-screen).
 
 After input, Eval waits until 500 ms after the last input completes, then appends
 fresh AX feedback for affected windows and window-roster changes. Explicitly

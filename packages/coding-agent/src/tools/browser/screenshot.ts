@@ -3,6 +3,7 @@ import { inflateSync } from "node:zlib";
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import type { ElementHandle, ElementScreenshotOptions, Page } from "puppeteer-core";
+import type { ScreenshotArea } from "../../utils/image-resize";
 import { encodeRawPng } from "../../utils/png-encode";
 
 /** Options accepted by tab.screenshot(). */
@@ -101,6 +102,12 @@ export function screenshotScope(opts: ScreenshotOptions): string {
 	return opts.fullPage ? "fullPage" : "page";
 }
 
+/** The CSS pixel space a page, full-page, or selector capture maps to. */
+export function screenshotArea(opts: ScreenshotOptions): ScreenshotArea {
+	if (opts.selector) return "element";
+	return opts.fullPage ? "page" : "viewport";
+}
+
 /** Validate and normalize a changed-pixel ratio threshold. */
 export function screenshotThreshold(value: number | undefined): number {
 	if (value === undefined) return 0;
@@ -122,15 +129,18 @@ export function screenshotQuality(opts: ScreenshotOptions): number | undefined {
 
 async function waitForRenderFrame(page: Page, signal: AbortSignal | undefined): Promise<void> {
 	await untilAborted(signal, () =>
-		page.evaluate(
-			() =>
-				new Promise<void>(resolve => {
-					const pageGlobal = globalThis as unknown as {
-						requestAnimationFrame(callback: () => void): number;
-					};
-					pageGlobal.requestAnimationFrame(resolve);
-				}),
-		),
+		page.evaluate(() => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			const pageGlobal = globalThis as unknown as {
+				requestAnimationFrame(callback: () => void): number;
+			};
+			const timer = setTimeout(resolve, 50);
+			pageGlobal.requestAnimationFrame(() => {
+				clearTimeout(timer);
+				resolve();
+			});
+			return promise;
+		}),
 	);
 }
 
