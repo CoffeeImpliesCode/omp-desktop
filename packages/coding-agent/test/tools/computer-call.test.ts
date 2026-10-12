@@ -52,7 +52,7 @@ describe("renderComputerCall", () => {
 				{ method: "ref", args: ["e5"] },
 				{ method: "setValue", args: ["todo"] },
 			]),
-		).toBe('return await (await desktop.ref("e5")).setValue("todo");');
+		).toBe('return await desktop.ref("e5").setValue("todo");');
 	});
 
 	it("renders control reads and options objects as the bytes the call parser reads back", () => {
@@ -118,14 +118,17 @@ describe("isReadOnlyComputerCall", () => {
 		const windowReads = Object.keys(WINDOW_METHODS)
 			.filter(method => isReadOnlyComputerCall(windowCall(method)))
 			.sort();
-		expect(windowReads).toEqual(["ax", "find", "ref", "screenshot", "state"]);
+		expect(windowReads).toEqual(["ax", "find", "menu.items", "observe", "ref", "screenshot", "state", "zoom"]);
 
 		const desktopReads = Object.keys(DESKTOP_METHODS)
 			.filter(method => isReadOnlyComputerCall([{ method, args: [] }]))
 			.sort();
 		expect(desktopReads).toEqual([
+			"apps.list",
 			"capabilities",
 			"clipboard.read",
+			"control.state",
+			"display",
 			"displays",
 			"elementAt",
 			"focusedElement",
@@ -135,6 +138,7 @@ describe("isReadOnlyComputerCall", () => {
 			"window",
 			"windows",
 			"workspaces",
+			"zoom",
 		]);
 	});
 });

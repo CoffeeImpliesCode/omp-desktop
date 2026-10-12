@@ -31,6 +31,12 @@
 - Kept libei input waiting for every granted device to become ready and bounded discovery even under continuous events ([#13210](https://github.com/can1357/oh-my-pi/pull/13210) by [@Komzpa](https://github.com/Komzpa)).
 - Allowed X11 startup when inherited Wayland sockets are stale without falling back on permission or live-session failures ([#10752](https://github.com/can1357/oh-my-pi/pull/10752) by [@jake8302](https://github.com/jake8302)).
 
+## [18.9.2] - 2026-10-11
+
+### Fixed
+
+- Fixed stalls when highlighting Markdown tool previews containing many inline spans or backslash escapes.
+
 ## [18.9.1] - 2026-10-11
 
 ### Fixed

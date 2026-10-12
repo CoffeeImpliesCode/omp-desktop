@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [18.9.2] - 2026-10-11
+
+### Removed
+
+- Removed `parseCloudflareAiGatewayCredential`, `serializeCloudflareAiGatewayCredential`, and `CloudflareAiGatewayCredential` from `@oh-my-pi/pi-catalog/wire/cloudflare-ai-gateway`. Use the equivalents from `@oh-my-pi/pi-catalog/wire/cloudflare` instead.
+
 ## [18.9.1] - 2026-10-11
 
 ### Added

@@ -18,7 +18,7 @@
 - Clarified computer control guidance: focus can warp the pointer, `Timeout` can leave applied effects, and screenshot frames expire before native dispatch.
 - Clarified computer AX reference lifetime: the current and immediately previous generations remain valid.
 - Local standalone builds now write to `packages/coding-agent/dist/omp-linux-x64` by default. `OMP_LOCAL_OUTFILE` still selects another destination.
-- Updated the desktop fork to upstream 18.9.1 while retaining Linux Wayland desktop controls and portable build instructions.
+- Updated the desktop fork to upstream 18.9.2 while retaining Linux Wayland desktop controls and portable build instructions.
 - Browser relay opens now create dedicated background tabs, and screenshots leave the user's foreground tab in place; `app.target` explicitly borrows an existing tab ([#14060](https://github.com/can1357/oh-my-pi/pull/14060) by [@nnnnoel](https://github.com/nnnnoel)).
 - Automatic computer AX trees now use a 16 KiB UTF-8 budget without splitting rows ([#13692](https://github.com/can1357/oh-my-pi/pull/13692) by [@will-bogusz](https://github.com/will-bogusz)).
 
@@ -30,6 +30,21 @@
 - Missing computer windows now report bounded available-window candidates ([#13655](https://github.com/can1357/oh-my-pi/pull/13655) by [@will-bogusz](https://github.com/will-bogusz)).
 - Concurrent computer Eval cells now queue safely and keep cancellation, screenshots, and AX feedback isolated.
 - Computer screenshots now preserve the saved PNG pixel frame through model delivery.
+
+## [18.9.2] - 2026-10-11
+
+### Fixed
+
+- Improved responsiveness when adding assistant text after tool calls in long transcripts.
+- Fixed `apply_patch` handling of context-free hunks when the target text appears multiple times.
+- Fixed `find` filename ranking and sketch scoring with judge endpoints that limit the number of questions per request.
+- Fixed `omp gc --apply` leaving temporary session files after an interrupted save.
+- Fixed `omp auth-gateway serve` handling of OpenRouter routing variants such as `:floor` and `:nitro`.
+- Improved validation errors for `computer` helpers with missing or non-string text arguments by identifying the helper and argument involved.
+- Fixed `/tan` forks incorrectly inheriting the parent task's subagent spending while preserving token counts.
+- Fixed `omp://` documentation links so they open the corresponding files in source checkouts.
+- Fixed bare model IDs in `models.yml` incorrectly resolving to auto-discovered Ollama, llama.cpp, or LM Studio providers.
+- Added warnings when configured Ollama, llama.cpp, or LM Studio endpoints cannot be reached, identifying the relevant environment variable.
 
 ## [18.9.1] - 2026-10-11
 

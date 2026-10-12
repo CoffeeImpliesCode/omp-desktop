@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [18.9.2] - 2026-10-11
+
+### Changed
+
+- Improved streaming JSON parsing performance for tool arguments containing many string values.
+
+### Fixed
+
+- Fixed parsing of long strings that contain closing delimiters other than double or single quotes.
+
 ## [18.9.0] - 2026-10-11
 
 ### Breaking Changes
