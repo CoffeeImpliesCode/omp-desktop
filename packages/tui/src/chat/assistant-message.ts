@@ -17,9 +17,9 @@ import type { AssistantThinkingRenderer } from "./extension-types";
 import { ensureThemeSync, getMarkdownTheme, getMarkdownThemeWithLinkTargets, getThemeEpoch, theme } from "../theme";
 import { card, col, elapsed, node, span, text } from "../native/describe";
 import { hasTranscriptActions, runTranscriptAction } from "./transcript-actions";
-import type { NativeChild, NativeNode, NativeUiEvent } from "../native/node";
+import type { DescribeContext, NativeChild, NativeNode, NativeUiEvent } from "../native/node";
 import { isNativeRendering } from "../native/state";
-import { NativeImageCache } from "../native/blobs";
+import { NativeImageCache, nativeMediaNode } from "../native/blobs";
 import { Memo } from "../native/memo";
 import { EMPTY_LINK_TARGETS, resolveImageOptions } from "../render/render-utils";
 import { WidthAwareText } from "../render";
@@ -250,6 +250,8 @@ export class AssistantMessageComponent extends Container {
 	#lastMessage?: AssistantMessage;
 	#emergencyText?: ProseBlock;
 	#toolImagesByCallId = new Map<string, ImageContent[]>();
+	/** File each grouped read showed that Tern's media viewer shows, for native `media` nodes. */
+	#toolMediaPathByCallId = new Map<string, string>();
 	/**
 	 * Payload keys ({@link imagePayloadKey}) whose Kitty PNG conversion this
 	 * component is awaiting, so a re-delivered image neither re-encodes nor
@@ -798,7 +800,8 @@ export class AssistantMessageComponent extends Container {
 	 * head's `title`. With `hideThinkingBlock` only the live head shows (collapsed)
 	 * and a finished thought emits nothing.
 	 */
-	override describe(): NativeNode {
+	override describe(cx?: DescribeContext): NativeNode {
+		const media = cx?.supports("media") === true;
 		const tail = this.#displayedMessage ? this.#thinkingTailIndex(this.#displayedMessage) : undefined;
 		const rate =
 			tail !== undefined && this.#lastUpdateTransient && this.#thinkingRateLive
@@ -813,9 +816,10 @@ export class AssistantMessageComponent extends Container {
 			this.#errorExpanded,
 			this.#nativeViewVersion,
 			rate,
+			media,
 			getThemeEpoch(),
 		];
-		return this.#native.get(key, () => this.#describeMessage(tail, rate));
+		return this.#native.get(key, () => this.#describeMessage(tail, rate, media));
 	}
 
 	/**
@@ -828,10 +832,10 @@ export class AssistantMessageComponent extends Container {
 		this.#nativeViewVersion++;
 	}
 
-	/** Mirrors a thinking section collapsed or expanded in the terminal. */
+	/** Mirrors a thinking section collapsed or expanded in the terminal; runs its controls' clicks. */
 	handleNativeEvent(event: NativeUiEvent): void {
 		if (event.type === "action") {
-			this.#handleErrorAction(event.act);
+			this.#handleAction(event.act);
 			return;
 		}
 		if (event.type !== "toggle" || !event.key.startsWith("k")) return;
@@ -841,7 +845,7 @@ export class AssistantMessageComponent extends Container {
 		this.#nativeViewVersion++;
 	}
 
-	#describeMessage(thinkingTail: number | undefined, rate: number): NativeNode {
+	#describeMessage(thinkingTail: number | undefined, rate: number, media: boolean): NativeNode {
 		const message = this.#displayedMessage;
 		const previousParts = this.#nativeParts;
 		const parts = new Map<string, { text: string; stream: boolean; node: NativeNode }>();
@@ -860,6 +864,7 @@ export class AssistantMessageComponent extends Container {
 			return entry.node;
 		};
 		const children: NativeChild[] = [];
+		let answered = false;
 		if (message) {
 			const live = !this.#transcriptBlockFinalized && this.#lastUpdateTransient;
 			let tailIndex = -1;
@@ -876,6 +881,7 @@ export class AssistantMessageComponent extends Container {
 				const content = message.content[index]!;
 				const streaming = live && index === tailIndex;
 				if (content.type === "text" && canonicalizeMessage(content.text)) {
+					answered = true;
 					const source = content.text.trim();
 					// The terminal renders this source itself and would resolve a relative
 					// link against its own idea of the cwd: hand it the session-resolved
@@ -960,7 +966,17 @@ export class AssistantMessageComponent extends Container {
 				}
 			}
 			if (this.#showImages && this.#showToolResultImages) {
+				// Reads of files Tern's media viewer shows: the host loads each file once by path, no bytes uploaded.
+				const shownPaths = new Set<string>();
+				if (media) {
+					for (const [toolCallId, mediaPath] of this.#toolMediaPathByCallId) {
+						if (shownPaths.has(mediaPath)) continue;
+						shownPaths.add(mediaPath);
+						children.push(nativeMediaNode(mediaPath, `r${toolCallId}`));
+					}
+				}
 				for (const [toolCallId, images] of this.#toolImagesByCallId) {
+					if (media && this.#toolMediaPathByCallId.has(toolCallId)) continue;
 					images.forEach((image, index) => {
 						children.push(this.#nativeImages.get(`r${toolCallId}:${index}`, image.data, image.mimeType));
 					});
@@ -983,16 +999,29 @@ export class AssistantMessageComponent extends Container {
 		}
 		if (this.#turnUsage) {
 			const usage = formatTurnUsage(this.#turnUsage);
+			const line: NativeChild[] = [];
+			// Led by Copy and a dot: `⧉ · 12.4s · 19K tok this turn`.
+			if (answered && hasTranscriptActions()) {
+				line.push(
+					// `copy-answer`, not Tern's local `copy` (that would copy the icon's empty label).
+					node(
+						"icon",
+						{
+							name: "copy",
+							role: "omp.turn.copy",
+							title: "Copy answer",
+							aria: "Copy answer",
+							actions: { click: "copy-answer" },
+						},
+						undefined,
+						"copy",
+					),
+					node("text", { text: "·" }, undefined, "dot"),
+				);
+			}
+			line.push(node("text", { text: usage.text }, undefined, "text"));
 			children.push(
-				node(
-					"row",
-					{ role: "omp.turn.usage", gap: "xs", align: "center", title: usage.title },
-					[
-						node("icon", { name: "time" }, undefined, "icon"),
-						node("text", { text: usage.text }, undefined, "text"),
-					],
-					"turn-usage",
-				),
+				node("row", { role: "omp.turn.usage", gap: "xs", align: "center", title: usage.title }, line, "turn-usage"),
 			);
 		}
 		return col(children, { role: this.#rewound ? "omp.assistant.rewound" : "omp.assistant" });
@@ -1081,11 +1110,24 @@ export class AssistantMessageComponent extends Container {
 		return card({ role: "omp.error", tone: "error", key: "error" }, children);
 	}
 
-	/** Error frame action clicks: omp's own retry, clipboard and model-picker paths. */
-	#handleErrorAction(act: string): void {
+	/** Control clicks (the error frame's actions, the turn footer's Copy): omp's own retry, clipboard and model-picker paths. */
+	#handleAction(act: string): void {
 		if (act === "retry") runTranscriptAction({ act: "retry" });
 		else if (act === "switch-model") runTranscriptAction({ act: "switch-model" });
 		else if (act === "copy-error" && this.#errorText) runTranscriptAction({ act: "copy", text: this.#errorText });
+		else if (act === "copy-answer") {
+			const text = this.#answerText();
+			if (text) runTranscriptAction({ act: "copy", text });
+		}
+	}
+
+	/** The answer as the transcript shows it: its text blocks' markdown, a blank line apart, without thinking or tool calls. */
+	#answerText(): string {
+		const blocks: string[] = [];
+		for (const content of this.#displayedMessage?.content ?? []) {
+			if (content.type === "text" && canonicalizeMessage(content.text)) blocks.push(content.text.trim());
+		}
+		return blocks.join("\n\n");
 	}
 
 	/** Width-independent stable identities for the streamed leading thinking run. */
@@ -1493,8 +1535,15 @@ export class AssistantMessageComponent extends Container {
 		}
 	}
 
-	setToolResultImages(toolCallId: string, images: ImageContent[]): void {
+	/**
+	 * A grouped read's result images, and `mediaPath`: the file it read that Tern's media viewer
+	 * shows (read details), which a native host supporting `media` shows by path instead of the
+	 * images. A media-only result (a model, a PDF) passes no images.
+	 */
+	setToolResultImages(toolCallId: string, images: ImageContent[], mediaPath?: string): void {
 		if (!toolCallId) return;
+		if (mediaPath) this.#toolMediaPathByCallId.set(toolCallId, mediaPath);
+		else this.#toolMediaPathByCallId.delete(toolCallId);
 		const validImages = images.filter(img => img.type === "image" && img.data && img.mimeType);
 		if (validImages.length === 0) {
 			this.#toolImagesByCallId.delete(toolCallId);
