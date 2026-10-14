@@ -4,7 +4,7 @@ import { untilAborted } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../tools";
 import {
 	denyError,
-	formatApprovalPrompt,
+	requestApproval,
 	resolveApproval,
 	resolveApprovalFromContext,
 	type ToolApproval,
@@ -85,8 +85,6 @@ export interface EvalPreludeDefinition {
 	 * mid-session, since the cached system prompt is not rebuilt for the toggle.
 	 */
 	guidance?: string;
-	/** Optional declarations appended to code-mode TypeScript context while enabled. */
-	codeModeDeclarations?: string;
 	/** Approval tier or argument-dependent approval decision for host calls. */
 	approval?: ToolApproval;
 	/** Live availability predicate. Omission means enabled. */
@@ -166,10 +164,8 @@ async function approvePreludeInvocation(
 				`Set tools.approval.${definition.name}: allow or use an interactive UI to approve the call.`,
 		);
 	}
-	const choice = await untilAborted(context.signal, () =>
-		ui.select(formatApprovalPrompt(subject, parameters, resolved.reason), ["Approve", "Deny"]),
-	);
-	if (choice !== "Approve") throw new Error(`Eval prelude call denied by user: ${definition.name}`);
+	const approved = await untilAborted(context.signal, () => requestApproval(ui, subject, parameters, resolved.reason));
+	if (!approved) throw new Error(`Eval prelude call denied by user: ${definition.name}`);
 }
 
 /**

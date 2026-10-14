@@ -17,7 +17,9 @@
 
 - Fixed desktop screenshot zoom on niri rejecting an unchanged display layout.
 - Fixed Wayland PipeWire desktop capture dropping all but the first authorized monitor stream. Capture now composes every stream using its logical placement and pixel dimensions and supports selecting an authorized display by ID.
+- Fixed Wayland display listing shrinking to the last captured display after a single-display screenshot, which made every other display fail with `Unknown display`.
 - Fixed local Linux native builds with PipeWire enabled when validating Wayland display geometry.
+- Fixed local Nix builds failing to open microphones and speakers outside the development shell.
 - Refused global coordinate mapping and AX coordinate clicks when a window's global origin is unknown or its AT-SPI bounds cannot be verified.
 - Fixed niri window screenshots rejecting valid buffers on fractional-scale outputs.
 - Kept Wayland desktop capture and window discovery working when optional niri IPC metadata is unavailable.
@@ -30,6 +32,12 @@
 - Fixed Wayland text input using keymaps whose shared file descriptor is at EOF or whose groups have numeric labels, and kept Enter mapped to its control key ([#13848](https://github.com/can1357/oh-my-pi/issues/13848)).
 - Kept libei input waiting for every granted device to become ready and bounded discovery even under continuous events ([#13210](https://github.com/can1357/oh-my-pi/pull/13210) by [@Komzpa](https://github.com/Komzpa)).
 - Allowed X11 startup when inherited Wayland sockets are stale without falling back on permission or live-session failures ([#10752](https://github.com/can1357/oh-my-pi/pull/10752) by [@jake8302](https://github.com/jake8302)).
+
+## [18.10.4] - 2026-10-13
+
+### Fixed
+
+- Fixed `pwsh` code blocks rendering without PowerShell syntax colors ([#15008](https://github.com/can1357/oh-my-pi/issues/15008)).
 
 ## [18.10.2] - 2026-10-12
 

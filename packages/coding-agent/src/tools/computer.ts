@@ -226,7 +226,6 @@ export function createComputerPrelude(
 		javascript: computerPreludeAssets.javascript,
 		python: computerPreludeAssets.python,
 		exports: ["computer"],
-		codeModeDeclarations: computerPreludeAssets.codeModeDeclarations,
 		guidance: computerUsePrompt,
 		approval: computerApproval,
 		enabled: () => cfgComputerEnabled.get(session.settings) === true,

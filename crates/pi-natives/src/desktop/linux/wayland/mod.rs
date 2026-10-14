@@ -238,7 +238,6 @@ impl Backend for WaylandBackend {
 				Target::Desktop | Target::Display(_) => {
 					let (image, displays) = geometry::compose(frames, selected, &known)?;
 					let frame = FrameGeometry::for_displays(&displays);
-					self.displays = displays;
 					Ok((image, frame))
 				},
 				Target::Window(id) => {

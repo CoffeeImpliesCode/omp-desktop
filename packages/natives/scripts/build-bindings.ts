@@ -10,6 +10,8 @@
  * `OMP_NATIVE_FEATURES` adds comma- or space-separated Cargo features to the
  * local napi build while retaining the default Wayland PipeWire capture feature.
  * Cargo passes them to `napi build --features`; Bazel builds ignore this option.
+ * `OMP_NATIVE_RUNTIME_LIBRARY_PATH` adds Linux runtime library directories to
+ * the addon's RUNPATH before embedding; the Nix shell supplies audio clients.
  */
 
 import * as fsSync from "node:fs";
@@ -282,6 +284,11 @@ try {
 	}
 
 	const builtAddonPath = await resolveBuiltAddonPath(buildOutputDir, canonicalAddonFilename);
+	if (process.platform === "linux" && Bun.env.OMP_NATIVE_RUNTIME_LIBRARY_PATH) {
+		// Audio clients are loaded by name, so linking cannot discover them.
+		// Retain the shell's declared runtime paths in the embedded addon.
+		await $`patchelf --add-rpath ${Bun.env.OMP_NATIVE_RUNTIME_LIBRARY_PATH} ${builtAddonPath}`;
+	}
 	// Stamp the release version post-link, before the addon becomes visible
 	// under its canonical name, so a version bump never recompiles the crate.
 	const { version } = (await Bun.file(packageJsonPath).json()) as { version: string };

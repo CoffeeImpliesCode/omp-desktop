@@ -9,7 +9,7 @@ empty. Backend selection reads only `WAYLAND_DISPLAY` / `DISPLAY`
 `~/.omp/agent/settings.json` nor `config.yml` turns the feature on. The build
 below compiles both addons with `wayland-pipewire` and embeds them in the
 executable. The fork also keeps every authorized monitor stream, adds exact
-niri window capture, and integrates upstream v18.10.3.
+niri window capture, and integrates upstream v18.10.4.
 
 ## Why a hand-dropped addon is not enough
 
@@ -27,6 +27,9 @@ the next launch, and the feature flag has to live in the binary. The
 - The Rust toolchain pinned by `rust-toolchain.toml`.
 - `pkg-config`, Clang, and the PipeWire development libraries.
 - On NixOS, `nix develop path:.` loads the pinned tools and native libraries.
+- Linux voice mode uses PulseAudio client libraries with `pipewire-pulse`, or
+  ALSA. The Nix shell supplies both and `patchelf`; local native builds retain
+  their paths through `OMP_NATIVE_RUNTIME_LIBRARY_PATH` before embedding.
 
 On NixOS, enter the development shell first so dependency installation and the
 build use the pinned Bun, Rust toolchain, and PipeWire libraries:
