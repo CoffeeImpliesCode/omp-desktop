@@ -726,7 +726,8 @@ export class RelayBridge {
 
 	/**
 	 * Forward a command to the tab and reply to it; resolves whether the command succeeded.
-	 * `beforeReply` runs on success ahead of the reply.
+	 * `beforeReply` runs on success ahead of the reply. Target lifecycle commands are answered by the
+	 * relay's browser handlers instead, which reply (or throw to `cdpMessage`) themselves: they resolve `true`.
 	 */
 	async #forwardToTab(
 		conn: CdpConnection,
@@ -767,6 +768,17 @@ export class RelayBridge {
 		if (!inst || !inst.socket) {
 			this.#replyError(conn, msg, "relay extension is not connected");
 			return false;
+		}
+		// Sent raw, createTarget honors `newWindow` and answers with Chrome's id, which no relay command
+		// resolves; close and activate are refused ("Not allowed"). Run them in this tab's browser, where a
+		// new tab lands like every relay-created tab: in that browser's current window.
+		if (
+			msg.method === "Target.createTarget" ||
+			msg.method === "Target.closeTarget" ||
+			msg.method === "Target.activateTarget"
+		) {
+			await this.#handleBrowserCommand(conn, msg, tab);
+			return true;
 		}
 		try {
 			const result = await this.#rpc(
@@ -851,7 +863,8 @@ export class RelayBridge {
 		}
 	}
 
-	async #handleBrowserCommand(conn: CdpConnection, msg: CdpCommand): Promise<void> {
+	/** `near`: the tab whose session sent the command; a tab it creates opens in that tab's browser. */
+	async #handleBrowserCommand(conn: CdpConnection, msg: CdpCommand, near?: TabState): Promise<void> {
 		switch (msg.method) {
 			case "Browser.getVersion": {
 				this.#reply(conn, msg, {
@@ -939,7 +952,7 @@ export class RelayBridge {
 			case "Target.createTarget": {
 				const url =
 					typeof msg.params?.url === "string" && msg.params.url.length > 0 ? msg.params.url : "about:blank";
-				const inst = this.#lastHello();
+				const inst = near ? this.#instances.get(near.instanceId) : this.#lastHello();
 				if (!inst || !inst.socket) {
 					this.#replyError(conn, msg, "relay extension is not connected");
 					return;
@@ -980,6 +993,10 @@ export class RelayBridge {
 				const activatedTab = parsed ? this.#tabs.get(parsed.key) : undefined;
 				if (parsed && activatedTab) {
 					await this.#rpc({ op: "activateTab", tabId: activatedTab.tabId }, this.#instanceFor(activatedTab));
+				} else if (near) {
+					// Raw, a page session's activate failed; don't turn an unknown id into success there.
+					this.#replyError(conn, msg, `No target with id ${String(msg.params?.targetId)}`);
+					return;
 				}
 				this.#reply(conn, msg, {});
 				return;

@@ -152,6 +152,12 @@ export interface CompactionResult<T = unknown> {
 	details?: T;
 	/** Hook-provided data to persist alongside compaction entry. */
 	preserveData?: Record<string, unknown>;
+	/**
+	 * Last entry the provider-native replay history covers. Set when a remote
+	 * compaction could only fit the history before the kept tail; later entries
+	 * replay normally after the native history.
+	 */
+	providerReplayThroughEntryId?: string;
 }
 
 // ============================================================================
@@ -1268,6 +1274,8 @@ export interface CompactionPreparation {
 	recentMessages: AgentMessage[];
 	/** Entry IDs parallel to recentMessages, for an Anthropic-safe keep-tail boundary. */
 	recentEntryIds?: string[];
+	/** Last entry before the kept tail; a remote compaction that cannot fit the tail covers history through it. */
+	lastSummarizedEntryId?: string;
 	/** Whether this is a split turn (cut point in middle of turn) */
 	isSplitTurn: boolean;
 	tokensBefore: number;
@@ -1480,6 +1488,7 @@ export function prepareCompaction(
 		turnPrefixMessages,
 		recentMessages,
 		recentEntryIds,
+		lastSummarizedEntryId: compactionEntries[cutPoint.firstKeptEntryIndex - 1]?.id,
 		isSplitTurn: cutPoint.isSplitTurn,
 		tokensBefore,
 		previousSummary: previousCompaction?.summary,
@@ -1587,6 +1596,13 @@ function formatRemoteCompactionSummary(inputTokens: number): string {
 	);
 }
 
+/** A V2 remote-compaction request's history and the user items its replacement history retains. */
+interface RemoteCompactionV2Input {
+	codexBody: OpenAICodexCompactionBody | undefined;
+	remoteHistory: Array<Record<string, unknown>>;
+	retainedUserItems: unknown[];
+}
+
 /**
  * Generate summaries for compaction using prepared data.
  * Returns CompactionResult - SessionManager adds id/parentId when saving.
@@ -1608,6 +1624,7 @@ export async function compact(
 		turnPrefixMessages,
 		recentMessages,
 		recentEntryIds,
+		lastSummarizedEntryId,
 		isSplitTurn,
 		tokensBefore,
 		previousSummary,
@@ -1688,15 +1705,50 @@ export async function compact(
 		withOpenAiRemoteCompactionPreserveData(previousPreserveData, undefined),
 		undefined,
 	);
-	const remoteMessages: AgentMessage[] = [
+	const remotePrefixMessages: AgentMessage[] = [
 		...(previousSummaryMigrationMessage ? [previousSummaryMigrationMessage] : []),
 		...(snapcompactArchiveMigrationMessage ? [snapcompactArchiveMigrationMessage] : []),
 		...messagesToSummarize,
 		...turnPrefixMessages,
-		...recentMessages,
 	];
+	const remoteMessages: AgentMessage[] = [...remotePrefixMessages, ...recentMessages];
 	let usedRemoteCompaction = false;
+	let remoteReplayThroughEntryId: string | undefined;
 	let nativeCompactionError: unknown;
+	/**
+	 * Remote compaction replaces the whole history, so its request carries the
+	 * kept tail too. A turn can leave that history over the window (a large
+	 * response or tool output after the last check), which no request can
+	 * send. Then compact the history before the tail instead; the tail replays
+	 * normally after the native history, as a speculative snapshot's later
+	 * turns do. While that fallback exists, the whole-history attempt must not
+	 * rewrite the tail's trailing tool outputs: the prefix keeps them intact.
+	 */
+	const canCompactBeforeTail = lastSummarizedEntryId !== undefined && recentMessages.length > 0;
+	const sendRemoteCompaction = async (
+		sendWhole: () => Promise<void>,
+		sendPrefix: () => Promise<boolean>,
+	): Promise<void> => {
+		try {
+			await sendWhole();
+		} catch (err) {
+			if (
+				signal?.aborted ||
+				!canCompactBeforeTail ||
+				!AIError.is(AIError.classify(err), AIError.Flag.ContextOverflow)
+			) {
+				throw err;
+			}
+			logger.info("Remote compaction history overflows the context window; compacting before the kept tail", {
+				model: model.id,
+				provider: model.provider,
+				keptMessages: recentMessages.length,
+				error: err instanceof Error ? err.message : String(err),
+			});
+			if (!(await sendPrefix())) throw err;
+			remoteReplayThroughEntryId = lastSummarizedEntryId;
+		}
+	};
 	if (
 		settings.remoteEnabled !== false &&
 		settings.remoteStreamingV2Enabled !== false &&
@@ -1708,126 +1760,147 @@ export async function compact(
 				? previousRemoteCompaction.replacementHistory
 				: undefined;
 		const convertToLlm = summaryOptions.convertToLlm ?? defaultConvertToLlm;
-		const messages = convertToLlm(remoteMessages);
 		// Replacement history keeps what the user wrote. Summaries, archive
 		// migrations, and custom/hook messages can serialize as user-role items
 		// too, so pick the user's own messages before serialization erases that,
 		// then serialize each one exactly as the request does.
 		const isUserAuthored = summaryOptions.isUserAuthored ?? ((message: AgentMessage) => message.role === "user");
-		const userMessages = convertToLlm(
-			[...messagesToSummarize, ...turnPrefixMessages, ...recentMessages].filter(isUserAuthored),
-		);
-		const retainedUserItems: unknown[] = [...(previousReplacementHistory ?? [])];
 		const remoteSystemPrompt = summaryOptions.remoteSystemPrompt ?? [SUMMARIZATION_SYSTEM_PROMPT];
-		let codexBody: OpenAICodexCompactionBody | undefined;
-		let remoteHistory: Array<Record<string, unknown>>;
-		if (isCodexResponsesModel(model)) {
-			const previousCodexInput: CodexInputItem[] = [];
-			for (const item of previousReplacementHistory ?? []) {
-				if (!isCodexInputItem(item)) {
-					throw new Error("Stored Codex V2 compaction history contains an invalid input item");
-				}
-				previousCodexInput.push(item);
-			}
-			codexBody = await buildTransformedCodexRequestBody(
-				model,
-				{ systemPrompt: remoteSystemPrompt, messages, tools: summaryOptions.tools },
-				{
-					reasoning: resolveCompactionEffort(model, summaryOptions.thinkingLevel),
-					forceReasoningOff: summaryOptions.thinkingLevel === ThinkingLevel.Off,
-					responsesLite: model.useResponsesLite,
-					sessionId: summaryOptions.sessionId,
-					promptCacheKey: summaryOptions.promptCacheKey,
-					providerSessionState: summaryOptions.providerSessionState,
-					codexCompaction: createOpenAICodexCompactionRequestContext({
-						context: summaryOptions.codexCompaction,
-						implementation: "responses_compaction_v2",
-					}),
-				},
-				undefined,
-				previousCodexInput,
+		const buildV2Input = async (includeTail: boolean): Promise<RemoteCompactionV2Input> => {
+			const messages = convertToLlm(includeTail ? remoteMessages : remotePrefixMessages);
+			const userMessages = convertToLlm(
+				[...messagesToSummarize, ...turnPrefixMessages, ...(includeTail ? recentMessages : [])].filter(
+					isUserAuthored,
+				),
 			);
-			const input = Array.isArray(codexBody.input) ? codexBody.input : [];
-			const nativeInput: Array<Record<string, unknown>> = [];
-			for (const item of input) {
-				if (!isRecord(item)) {
-					throw new Error("Codex V2 compaction input contains a non-object item");
+			const retainedUserItems: unknown[] = [...(previousReplacementHistory ?? [])];
+			let codexBody: OpenAICodexCompactionBody | undefined;
+			let remoteHistory: Array<Record<string, unknown>>;
+			if (isCodexResponsesModel(model)) {
+				const previousCodexInput: CodexInputItem[] = [];
+				for (const item of previousReplacementHistory ?? []) {
+					if (!isCodexInputItem(item)) {
+						throw new Error("Stored Codex V2 compaction history contains an invalid input item");
+					}
+					previousCodexInput.push(item);
 				}
-				nativeInput.push(item);
-			}
-			remoteHistory = stripOpenAIResponsesOutputOnlyStatusesForReplay(nativeInput);
-			codexBody.input = remoteHistory;
-			for (const message of userMessages) {
-				const userBody = await buildTransformedCodexRequestBody(
+				codexBody = await buildTransformedCodexRequestBody(
 					model,
-					{ messages: [message] },
-					{ responsesLite: model.useResponsesLite },
-				);
-				retainedUserItems.push(...(userBody.input ?? []));
-			}
-		} else {
-			remoteHistory = buildOpenAiResponsesCompactionInput(messages, model, previousReplacementHistory);
-			for (const message of userMessages) {
-				retainedUserItems.push(...buildOpenAiResponsesCompactionInput([message], model, undefined));
-			}
-		}
-		if (remoteHistory.length > 0) {
-			try {
-				const instructions = codexBody
-					? typeof codexBody.instructions === "string"
-						? codexBody.instructions
-						: ""
-					: remoteSystemPrompt.join("\n\n");
-				const tools = codexBody
-					? Array.isArray(codexBody.tools)
-						? codexBody.tools
-						: undefined
-					: summaryOptions.tools
-						? convertTools(summaryOptions.tools, model.compat.supportsStrictMode, model)
-						: undefined;
-				const trimmed = trimRemoteCompactionInputToContextWindow(
-					remoteHistory,
-					new Tokenizer(model),
-					model.contextWindow,
-					instructions,
-					tools,
-				);
-				if (trimmed.rewrittenOutputs > 0) {
-					logger.info("Rewrote trailing tool outputs before OpenAI V2 remote compaction", {
-						model: model.id,
-						provider: model.provider,
-						rewrittenOutputs: trimmed.rewrittenOutputs,
-						estimatedTokensBefore: trimmed.estimatedTokensBefore,
-						estimatedTokensAfter: trimmed.estimatedTokensAfter,
-						contextWindow: model.contextWindow,
-					});
-				}
-				assertRemoteCompactionInputFits(trimmed, model);
-				const requestOptions = {
-					sessionId: summaryOptions.sessionId,
-					promptCacheKey: summaryOptions.promptCacheKey,
-					retainedMessageBudget: settings.v2RetainedMessageBudget,
-					retainedUserItems,
-				};
-				const request = codexBody
-					? buildCompactionV2RequestFromBody(model, { ...codexBody, input: trimmed.input }, requestOptions)
-					: buildCompactionV2Request(model, trimmed.input, instructions, {
-							...requestOptions,
-							tools,
-							reasoning: buildCompactionV2Reasoning(model, summaryOptions.thinkingLevel),
-						});
-				const remote = await withAuth(
-					apiKey,
-					key =>
-						requestCompactionV2Streaming(model, key, request, signal, {
-							fetch: summaryOptions.fetch,
-							providerSessionState: summaryOptions.providerSessionState,
-							preferWebsockets: summaryOptions.preferWebsockets,
-							codexCompaction: summaryOptions.codexCompaction,
+					{ systemPrompt: remoteSystemPrompt, messages, tools: summaryOptions.tools },
+					{
+						reasoning: resolveCompactionEffort(model, summaryOptions.thinkingLevel),
+						forceReasoningOff: summaryOptions.thinkingLevel === ThinkingLevel.Off,
+						responsesLite: model.useResponsesLite,
+						sessionId: summaryOptions.sessionId,
+						promptCacheKey: summaryOptions.promptCacheKey,
+						providerSessionState: summaryOptions.providerSessionState,
+						codexCompaction: createOpenAICodexCompactionRequestContext({
+							context: summaryOptions.codexCompaction,
+							implementation: "responses_compaction_v2",
 						}),
-					{ signal },
+					},
+					undefined,
+					previousCodexInput,
 				);
-				preserveData = { ...preserveData, ...storeCompactionV2PreserveData(remote, model) };
+				const input = Array.isArray(codexBody.input) ? codexBody.input : [];
+				const nativeInput: Array<Record<string, unknown>> = [];
+				for (const item of input) {
+					if (!isRecord(item)) {
+						throw new Error("Codex V2 compaction input contains a non-object item");
+					}
+					nativeInput.push(item);
+				}
+				remoteHistory = stripOpenAIResponsesOutputOnlyStatusesForReplay(nativeInput);
+				codexBody.input = remoteHistory;
+				for (const message of userMessages) {
+					const userBody = await buildTransformedCodexRequestBody(
+						model,
+						{ messages: [message] },
+						{ responsesLite: model.useResponsesLite },
+					);
+					retainedUserItems.push(...(userBody.input ?? []));
+				}
+			} else {
+				remoteHistory = buildOpenAiResponsesCompactionInput(messages, model, previousReplacementHistory);
+				for (const message of userMessages) {
+					retainedUserItems.push(...buildOpenAiResponsesCompactionInput([message], model, undefined));
+				}
+			}
+			return { codexBody, remoteHistory, retainedUserItems };
+		};
+		const sendV2 = async (
+			{ codexBody, remoteHistory, retainedUserItems }: RemoteCompactionV2Input,
+			rewriteOutputs: boolean,
+		): Promise<void> => {
+			const instructions = codexBody
+				? typeof codexBody.instructions === "string"
+					? codexBody.instructions
+					: ""
+				: remoteSystemPrompt.join("\n\n");
+			const tools = codexBody
+				? Array.isArray(codexBody.tools)
+					? codexBody.tools
+					: undefined
+				: summaryOptions.tools
+					? convertTools(summaryOptions.tools, model.compat.supportsStrictMode, model)
+					: undefined;
+			const trimmed = trimRemoteCompactionInputToContextWindow(
+				remoteHistory,
+				new Tokenizer(model),
+				model.contextWindow,
+				instructions,
+				tools,
+				{ rewriteOutputs },
+			);
+			if (trimmed.rewrittenOutputs > 0) {
+				logger.info("Rewrote trailing tool outputs before OpenAI V2 remote compaction", {
+					model: model.id,
+					provider: model.provider,
+					rewrittenOutputs: trimmed.rewrittenOutputs,
+					estimatedTokensBefore: trimmed.estimatedTokensBefore,
+					estimatedTokensAfter: trimmed.estimatedTokensAfter,
+					contextWindow: model.contextWindow,
+				});
+			}
+			assertRemoteCompactionInputFits(trimmed, model);
+			const requestOptions = {
+				sessionId: summaryOptions.sessionId,
+				promptCacheKey: summaryOptions.promptCacheKey,
+				retainedMessageBudget: settings.v2RetainedMessageBudget,
+				retainedUserItems,
+			};
+			const request = codexBody
+				? buildCompactionV2RequestFromBody(model, { ...codexBody, input: trimmed.input }, requestOptions)
+				: buildCompactionV2Request(model, trimmed.input, instructions, {
+						...requestOptions,
+						tools,
+						reasoning: buildCompactionV2Reasoning(model, summaryOptions.thinkingLevel),
+					});
+			const remote = await withAuth(
+				apiKey,
+				key =>
+					requestCompactionV2Streaming(model, key, request, signal, {
+						fetch: summaryOptions.fetch,
+						providerSessionState: summaryOptions.providerSessionState,
+						preferWebsockets: summaryOptions.preferWebsockets,
+						codexCompaction: summaryOptions.codexCompaction,
+					}),
+				{ signal },
+			);
+			preserveData = { ...preserveData, ...storeCompactionV2PreserveData(remote, model) };
+		};
+		const whole = await buildV2Input(true);
+		if (whole.remoteHistory.length > 0) {
+			try {
+				await sendRemoteCompaction(
+					() => sendV2(whole, !canCompactBeforeTail),
+					async () => {
+						const prefix = await buildV2Input(false);
+						if (prefix.remoteHistory.length === 0) return false;
+						await sendV2(prefix, true);
+						return true;
+					},
+				);
 				usedRemoteCompaction = true;
 			} catch (err) {
 				// A user/session abort is a cancellation, not a remote failure —
@@ -1859,33 +1932,52 @@ export async function compact(
 				: previousV2Compaction?.provider === model.provider
 					? previousV2Compaction.replacementHistory
 					: undefined;
-		const remoteHistory = buildOpenAiNativeHistory(
-			(summaryOptions.convertToLlm ?? defaultConvertToLlm)(remoteMessages),
+		const convertToLlm = summaryOptions.convertToLlm ?? defaultConvertToLlm;
+		const supportsOriginalDetail = openAiCompatSupportsImageDetailOriginal(model);
+		const sendV1 = async (remoteHistory: Array<Record<string, unknown>>, rewriteOutputs: boolean): Promise<void> => {
+			const remote = await withAuth(
+				apiKey,
+				key =>
+					requestOpenAiRemoteCompaction(
+						model,
+						key,
+						remoteHistory,
+						summaryOptions.remoteSystemPrompt?.join("\n\n") ?? SUMMARIZATION_SYSTEM_PROMPT,
+						signal,
+						{
+							fetch: summaryOptions.fetch,
+							sessionId: summaryOptions.sessionId,
+							providerSessionState: summaryOptions.providerSessionState,
+							codexCompaction: summaryOptions.codexCompaction,
+							rewriteOutputs,
+						},
+					),
+				{ signal },
+			);
+			preserveData = withOpenAiRemoteCompactionPreserveData(preserveData, remote);
+		};
+		const whole = buildOpenAiNativeHistory(
+			convertToLlm(remoteMessages),
 			model,
 			previousReplacementHistory,
-			openAiCompatSupportsImageDetailOriginal(model),
+			supportsOriginalDetail,
 		);
-		if (remoteHistory.length > 0) {
+		if (whole.length > 0) {
 			try {
-				const remote = await withAuth(
-					apiKey,
-					key =>
-						requestOpenAiRemoteCompaction(
+				await sendRemoteCompaction(
+					() => sendV1(whole, !canCompactBeforeTail),
+					async () => {
+						const prefix = buildOpenAiNativeHistory(
+							convertToLlm(remotePrefixMessages),
 							model,
-							key,
-							remoteHistory,
-							summaryOptions.remoteSystemPrompt?.join("\n\n") ?? SUMMARIZATION_SYSTEM_PROMPT,
-							signal,
-							{
-								fetch: summaryOptions.fetch,
-								sessionId: summaryOptions.sessionId,
-								providerSessionState: summaryOptions.providerSessionState,
-								codexCompaction: summaryOptions.codexCompaction,
-							},
-						),
-					{ signal },
+							previousReplacementHistory,
+							supportsOriginalDetail,
+						);
+						if (prefix.length === 0) return false;
+						await sendV1(prefix, true);
+						return true;
+					},
 				);
-				preserveData = withOpenAiRemoteCompactionPreserveData(preserveData, remote);
 				usedRemoteCompaction = true;
 			} catch (err) {
 				// A user/session abort is a cancellation, not a remote failure —
@@ -2157,6 +2249,7 @@ export async function compact(
 		tokensBefore,
 		details: { readFiles, modifiedFiles } as CompactionDetails,
 		preserveData: finalPreserveData,
+		...(remoteReplayThroughEntryId ? { providerReplayThroughEntryId: remoteReplayThroughEntryId } : {}),
 	};
 }
 

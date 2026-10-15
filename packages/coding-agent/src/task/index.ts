@@ -36,7 +36,7 @@ import taskSpawnFeedbackTemplate from "../prompts/tools/task-spawn-feedback.md" 
 import taskSpecializationAdvisoryTemplate from "../prompts/tools/task-specialization-advisory.md" with { type: "text" };
 import taskFollowUpTemplate from "../prompts/tools/task-follow-up.md" with { type: "text" };
 import { TASK_EFFORTS, type TaskEffort } from "@oh-my-pi/pi-tui/thinking";
-import { type ApprovalDetailsOptions, truncateApprovalDetail, truncateForPrompt } from "../tools/approval";
+import { truncateForPrompt } from "../tools/approval";
 import { hasWaitTool } from "../tools/wait";
 import { isIrcEnabled } from "../irc/messaging";
 import { isReadOnlyAgent } from "./read-only-policy";
@@ -157,6 +157,7 @@ interface TaskDescriptionOptions {
 	structured: boolean;
 	asyncEnabled: boolean;
 	ircEnabled: boolean;
+	asyncGuidance: string;
 	parentSpawns: string;
 }
 
@@ -178,6 +179,8 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		description: agent.description,
 		readOnly: isReadOnlyAgent(agent),
 		blocking: agent.blocking === true,
+		// Marked only while `task.structured` is off; with it on, every agent's result is structured.
+		structured: !options.structured && agent.structured === true,
 	}));
 	const scoutAvailable = isScoutSpawnable(options.disabledAgents, options.parentSpawns);
 	return prompt.render(taskDescriptionTemplate, {
@@ -193,14 +196,17 @@ function renderDescription(options: TaskDescriptionOptions): string {
 		structured: options.structured,
 		asyncEnabled: options.asyncEnabled,
 		hasBlockingAgents: renderedAgents.some(agent => agent.blocking),
+		hasStructuredAgents: renderedAgents.some(agent => agent.structured),
 		hasModelMentions: options.sessionAgents.length > 0,
 		ircEnabled: options.ircEnabled,
+		asyncGuidance: options.asyncGuidance,
 	});
 }
 
 function createTaskModeError(text: string): AgentToolResult<TaskToolDetails> {
 	return {
 		content: [{ type: "text", text }],
+		isError: true,
 		details: { projectAgentsDir: null, results: [], totalDurationMs: 0 },
 	};
 }
@@ -556,7 +562,7 @@ export async function refreshAgentDiscovery(cwd: string, extensionRoots?: Effect
 export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetails, Theme> {
 	readonly name = "task";
 	readonly approval = "exec" as const;
-	readonly formatApprovalDetails = (args: unknown, options?: ApprovalDetailsOptions): string[] => {
+	readonly formatApprovalDetails = (args: unknown): string[] => {
 		const params = args as Partial<TaskParams>;
 		const lines: string[] = [];
 		if (typeof params.agent === "string") {
@@ -566,10 +572,10 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			lines.push(`Name: ${truncateForPrompt(params.name)}`);
 		}
 		if (typeof params.task === "string") {
-			lines.push(`Task:\n${truncateApprovalDetail(params.task, options)}`);
+			lines.push(`Task:\n${truncateForPrompt(params.task)}`);
 		}
 		if (typeof params.context === "string" && params.context.trim()) {
-			lines.push(`Context:\n${truncateApprovalDetail(params.context, options)}`);
+			lines.push(`Context:\n${truncateForPrompt(params.context)}`);
 		}
 		const tasks: unknown[] = Array.isArray(params.tasks) ? params.tasks : [];
 		if (tasks.length > 0) {
@@ -596,7 +602,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 				}
 				lines.push(`Agent: ${truncateForPrompt(effectiveAgent(firstTask))}`);
 				if ("task" in firstTask && typeof firstTask.task === "string") {
-					lines.push(`Task:\n${truncateApprovalDetail(firstTask.task, options)}`);
+					lines.push(`Task:\n${truncateForPrompt(firstTask.task)}`);
 				}
 			}
 			if (tasks.length > 1) {
@@ -690,6 +696,15 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 		return renderTaskCall(repairTaskParams(args as TaskParams), options, theme);
 	}
 
+	/** Background-job lifecycle contract; inherited by extension replacements that delegate to Task. */
+	get delegationGuidance(): string {
+		if (!cfgAsyncEnabled.get(this.session.settings)) return "";
+		return prompt.render(taskAsyncContractTemplate, {
+			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
+			waitTool: hasWaitTool(this.session),
+		});
+	}
+
 	/** Dynamic description that reflects current task settings. */
 	get description(): string {
 		const disabledAgents = cfgTaskDisabledAgents.get(this.session.settings);
@@ -709,6 +724,7 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			structured: this.#isStructured(),
 			asyncEnabled: cfgAsyncEnabled.get(this.session.settings),
 			ircEnabled: isIrcEnabled(this.session.settings, this.session.taskDepth ?? 0),
+			asyncGuidance: this.delegationGuidance,
 			parentSpawns: this.session.getSessionSpawns() ?? "*",
 		});
 	}
@@ -731,7 +747,8 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 	/**
 	 * Result contract for a spawn: with `task.structured` the caller's
 	 * `outputSchema`/`schemaMode` pass through; without it the child gets no
-	 * schema or `yield` tool and returns its final message.
+	 * schema or `yield` tool and returns its final message, unless its agent
+	 * declares `structured: true` (resolved in the shared subagent policy).
 	 */
 	#resultParams(params: TaskParams): Pick<StructuredSubagentRequest, "outputSchema" | "schemaMode" | "structured"> {
 		if (!this.#isStructured()) return { structured: false };
@@ -1146,9 +1163,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 			failedSchedules.length > 0
 				? ` Failed to schedule ${failedSchedules.length} spawn${failedSchedules.length === 1 ? "" : "s"}: ${failedSchedules.join("; ")}.`
 				: "";
-		const guidance = prompt
-			.render(taskAsyncContractTemplate, { ircEnabled, waitTool: hasWaitTool(this.session) })
-			.trim();
 		const renderSpawnFeedback = (mixed: boolean): string =>
 			prompt
 				.render(taskSpawnFeedbackTemplate, {
@@ -1162,7 +1176,6 @@ export class TaskTool implements AgentTool<TaskToolSchemaInstance, TaskToolDetai
 					agentLabel,
 					started,
 					scheduleFailureSummary,
-					guidance,
 				})
 				.trim();
 
