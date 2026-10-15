@@ -261,7 +261,7 @@ impl Libei {
 			loop {
 				control::check()?;
 				let now = tokio::time::Instant::now();
-				let until = drain_deadline.unwrap_or(deadline);
+				let until = drain_deadline.unwrap_or(deadline).min(deadline);
 				if now >= until {
 					if targets.is_complete(
 						self.has_capability(DeviceCapability::PointerAbsolute),
@@ -275,7 +275,6 @@ impl Libei {
 						"libei device discovery timed out"
 					}));
 				}
-				let until = until.min(deadline);
 				let tick = (tokio::time::Instant::now() + Duration::from_millis(10)).min(until);
 				let event = match tokio::time::timeout_at(tick, events.next()).await {
 					Ok(Some(event)) => event.map_err(|err| {
@@ -284,8 +283,7 @@ impl Libei {
 					Ok(None) => {
 						return Err(DesktopError::input_failed("libei disconnected during discovery"));
 					},
-					Err(_) if tokio::time::Instant::now() < until => continue,
-					Err(_) => break,
+					Err(_) => continue,
 				};
 				self.handle_event(event)?;
 				// Drain the initial burst even after the first matching devices:

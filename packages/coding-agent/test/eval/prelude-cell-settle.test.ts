@@ -1,6 +1,8 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
+import { evalToolRenderer } from "@oh-my-pi/pi-tui/tools/eval";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
 import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/preludes";
@@ -102,6 +104,28 @@ describe("eval prelude cell settlement", () => {
 			{ calls: 2, failed: false, output: expect.stringContaining("cell body") },
 			{ calls: 1, failed: true, output: expect.any(String) },
 		]);
+	});
+
+	it("keeps settlement feedback visible beside a JSON display without rendering the display twice", async () => {
+		const settled: Settled[] = [];
+		const tool = new EvalTool(evalSession([countingPrelude(settled)], `prelude-settle-json-${crypto.randomUUID()}`));
+		const result = await tool.execute("settle-json", {
+			language: "js",
+			code: "await counter.hit(); console.log('cell body'); display({ marker: ['SETTLE', 'JSON'].join('') });",
+		});
+		expect(text(result)).toContain('"marker": "SETTLEJSON"');
+		expect(text(result)).toContain("counter: 1 call(s) this cell");
+
+		const theme = (await getThemeByName("dark"))!;
+		const rendered = Bun.stripANSI(
+			evalToolRenderer
+				.renderResult(result, { expanded: true, isPartial: false, spinnerFrame: 0 }, theme)
+				.render(120)
+				.join("\n"),
+		);
+		expect(rendered).toContain("cell body");
+		expect(rendered.split("counter: 1 call(s) this cell")).toHaveLength(2);
+		expect(rendered.split("SETTLEJSON")).toHaveLength(2);
 	});
 
 	it("groups a Python cell's prelude calls under one cell", async () => {

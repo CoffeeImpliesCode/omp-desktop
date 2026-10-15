@@ -771,6 +771,11 @@ pub(crate) fn user_activity() -> u64 {
 
 static OWNED: AtomicBool = AtomicBool::new(false);
 
+/// Serializes tests that take this process's input ownership, which is one
+/// per process: the ownership tests here and worker tests that send input.
+#[cfg(test)]
+pub(crate) static OWNERSHIP_TEST: Mutex<()> = Mutex::new(());
+
 struct ProcessLease;
 impl ProcessLease {
 	fn acquire() -> CoreResult<Self> {
@@ -1040,8 +1045,6 @@ impl Drop for KernelLease {
 #[cfg(test)]
 mod ownership_tests {
 	use super::*;
-
-	static OWNERSHIP_TEST: Mutex<()> = Mutex::new(());
 
 	/// Real ownership without OS event monitoring: lifecycle regressions must
 	/// not depend on an interactive desktop or Accessibility permissions.

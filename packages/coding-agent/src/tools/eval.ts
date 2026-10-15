@@ -1074,12 +1074,12 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						: runtimeOutput;
 				const imageText = cellImageNotes.join("\n");
 				const displayText = cellDisplayTexts.join("\n\n");
-				const visibleDisplayText =
-					displayText && imageText ? `${displayText}\n\n${imageText}` : displayText || imageText;
-				const cellOutput = [stdoutTrimmed, visibleDisplayText, ...preludeReplies]
-					.filter(text => text !== "")
-					.join("\n\n");
+				const cellOutput = [stdoutTrimmed, displayText, imageText, ...preludeReplies].filter(Boolean).join("\n\n");
 				cellResult.output = cellOutput;
+				// Renderers show JSON displays from `jsonOutputs`; without them the cell box repeats each one (#10778).
+				cellResult.textOutput = displayText
+					? [stdoutTrimmed, imageText, ...preludeReplies].filter(Boolean).join("\n\n")
+					: undefined;
 				cellResult.exitCode = result.exitCode;
 				cellResult.durationMs = durationMs;
 				cellResult.statusEvents = cellStatus.statusEvents;
