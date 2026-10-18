@@ -106,27 +106,41 @@ describe("eval prelude cell settlement", () => {
 		]);
 	});
 
-	it("keeps settlement feedback visible beside a JSON display without rendering the display twice", async () => {
-		const settled: Settled[] = [];
-		const tool = new EvalTool(evalSession([countingPrelude(settled)], `prelude-settle-json-${crypto.randomUUID()}`));
-		const result = await tool.execute("settle-json", {
-			language: "js",
-			code: "await counter.hit(); console.log('cell body'); display({ marker: ['SETTLE', 'JSON'].join('') });",
-		});
-		expect(text(result)).toContain('"marker": "SETTLEJSON"');
-		expect(text(result)).toContain("counter: 1 call(s) this cell");
+	for (const language of ["js", "py"] as const) {
+		it(`keeps ${language} settlement feedback visible once beside a printed JSON view`, async () => {
+			const settled: Settled[] = [];
+			const tool = new EvalTool(
+				evalSession([countingPrelude(settled)], `prelude-settle-json-${language}-${crypto.randomUUID()}`),
+			);
+			const marker = "SETTLEJSON";
+			const padding = "x".repeat(90);
+			const result = await tool.execute(`settle-json-${language}`, {
+				language,
+				code:
+					language === "js"
+						? `await counter.hit(); print('cell body'); print({ marker: ['SETTLE', 'JSON'].join(''), padding: '${padding}' });`
+						: `await counter.hit()\nprint('cell body')\nprint({'marker': ''.join(['SETTLE', 'JSON']), 'padding': '${padding}'})`,
+			});
+			const cell = result.details?.cells?.[0];
+			expect(cell?.views).toHaveLength(1);
+			expect(cell?.views?.[0]?.view).toEqual({ kind: "json", value: { marker, padding } });
+			expect(text(result)).toBe(cell!.output);
+			expect(text(result).split(marker)).toHaveLength(2);
+			expect(text(result).split("counter: 1 call(s) this cell")).toHaveLength(2);
+			expect(settled[0]?.output).not.toContain("counter:");
 
-		const theme = (await getThemeByName("dark"))!;
-		const rendered = Bun.stripANSI(
-			evalToolRenderer
-				.renderResult(result, { expanded: true, isPartial: false, spinnerFrame: 0 }, theme)
-				.render(120)
-				.join("\n"),
-		);
-		expect(rendered).toContain("cell body");
-		expect(rendered.split("counter: 1 call(s) this cell")).toHaveLength(2);
-		expect(rendered.split("SETTLEJSON")).toHaveLength(2);
-	});
+			const theme = (await getThemeByName("dark"))!;
+			const rendered = Bun.stripANSI(
+				evalToolRenderer
+					.renderResult(result, { expanded: true, isPartial: false, spinnerFrame: 0 }, theme)
+					.render(120)
+					.join("\n"),
+			);
+			expect(rendered).toContain("cell body");
+			expect(rendered.split("counter: 1 call(s) this cell")).toHaveLength(2);
+			expect(rendered.split(marker)).toHaveLength(2);
+		});
+	}
 
 	it("groups a Python cell's prelude calls under one cell", async () => {
 		const settled: Settled[] = [];
@@ -261,22 +275,21 @@ describe("eval prelude cell settlement", () => {
 		expect(Math.min(...Object.values(await imageSize(plain[0]!)))).toBe(200);
 	});
 
-	it("keeps an explicitly shown JavaScript frame at its captured resolution", async () => {
-		const tool = new EvalTool(evalSession([], `prelude-display-original-${crypto.randomUUID()}`));
-		const frame =
-			"iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAFklEQVR4nGP8z8DwnwEPYMInOXwUAAASWwIOH0pJXQAAAABJRU5ErkJggg==";
-		const shown = async (language: "js" | "py", code: string): Promise<ImageContent[]> => {
-			const result = await tool.execute(`display-original-${language}-${crypto.randomUUID()}`, { language, code });
-			return result.content.filter((block): block is ImageContent => block.type === "image");
-		};
-
-		const js = await shown(
-			"js",
-			`display({ type: "image", data: ${JSON.stringify(frame)}, mimeType: "image/png", detail: "original" });`,
-		);
-		expect(js).toHaveLength(1);
-		expect(await imageSize(js[0]!)).toEqual({ width: 8, height: 8 });
-	});
+	for (const language of ["js", "py"] as const) {
+		it(`keeps an explicitly printed ${language} frame at its captured resolution`, async () => {
+			const tool = new EvalTool(evalSession([], `prelude-print-original-${language}-${crypto.randomUUID()}`));
+			const frame =
+				"iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAFklEQVR4nGP8z8DwnwEPYMInOXwUAAASWwIOH0pJXQAAAABJRU5ErkJggg==";
+			const result = await tool.execute(`print-original-${language}`, {
+				language,
+				code: `print({ "type": "image", "data": "${frame}", "mimeType": "image/png", "detail": "original" })`,
+			});
+			const images = result.content.filter((block): block is ImageContent => block.type === "image");
+			expect(images).toHaveLength(1);
+			expect(images[0]?.detail).toBe("original");
+			expect(await imageSize(images[0]!)).toEqual({ width: 8, height: 8 });
+		});
+	}
 
 	it("keeps a prelude-returned frame's original marker through the Python bridge", async () => {
 		const frame =

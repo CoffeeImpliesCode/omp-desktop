@@ -82,6 +82,10 @@ export interface NativeDesktopSession {
 	): Promise<DesktopCapture>;
 	cancel(): void;
 	retire(): void;
+	/** Keep the display awake from the next activity until `releaseDisplayAwake()`, not just for the grace period. */
+	holdDisplayUntilReleased(): void;
+	/** Let a turn's hold go now (activity outside a turn keeps its grace); later activity gets the grace again. */
+	releaseDisplayAwake(): void;
 	listApplications(options?: ApplicationQuery): Promise<Application[]>;
 	openApplication(id: string, options?: ApplicationOpenOptions): Promise<Application>;
 	menuItems(target: string, path?: string[]): Promise<MenuItem[]>;
@@ -177,6 +181,8 @@ interface ActiveRun {
 	ac: AbortController;
 	signal: AbortSignal;
 	pendingTools: Map<string, PendingTool>;
+	/** The agent turn the run belongs to, if any; a resume while it starts carries it into the turn that went on. */
+	displayTurn?: number;
 }
 
 interface ComputerRunContext {
@@ -1253,6 +1259,8 @@ export class ComputerWorkerCore {
 	/** The cell the active request belongs to; `discard` matches against it. */
 	#activeCellId: string | undefined;
 	#closed = false;
+	/** The latest agent turn whose end was sent here; a run of that turn or earlier, arriving late, holds nothing. */
+	#releasedTurn = 0;
 
 	constructor(transport: ComputerWorkerTransport, createSession?: NativeDesktopSessionFactory) {
 		this.#transport = transport;
@@ -1305,6 +1313,15 @@ export class ComputerWorkerCore {
 				this.#active?.ac.abort(new ToolAbortError("Computer control revoked"));
 				this.#session?.cancel();
 				this.#transport.send({ type: "control-revoked", id: message.id });
+				return;
+			case "release-display":
+				this.#releasedTurn = Math.max(this.#releasedTurn, message.turn);
+				this.#session?.releaseDisplayAwake();
+				return;
+			case "resume-display":
+				if (this.#active?.displayTurn !== message.from) return;
+				this.#active.displayTurn = message.turn;
+				this.#session?.holdDisplayUntilReleased();
 				return;
 			case "tool-reply":
 				this.#deliverToolReply(message.id, message.reply);
@@ -1366,7 +1383,13 @@ export class ComputerWorkerCore {
 		const runAc = new AbortController();
 		const signal = AbortSignal.any([timeoutSignal, ac.signal, runAc.signal]);
 		const cellId = this.#cellIdOf(message);
-		const active: ActiveRun = { id: message.id, ac, signal, pendingTools: new Map() };
+		const active: ActiveRun = {
+			id: message.id,
+			ac,
+			signal,
+			pendingTools: new Map(),
+			displayTurn: message.session.displayTurn,
+		};
 		this.#active = active;
 		this.#activeCellId = cellId;
 		// Cancel synchronously while this run owns the native session, including
@@ -1395,6 +1418,9 @@ export class ComputerWorkerCore {
 		try {
 			throwIfAborted(signal);
 			const session = await this.#ensureSession(message.session);
+			throwIfAborted(signal);
+			const { displayTurn } = active;
+			if (displayTurn !== undefined && displayTurn > this.#releasedTurn) session.holdDisplayUntilReleased();
 			const observer = (this.#observer ??= new InputObserver(session, this.#currentRunContext));
 			let body: () => Promise<unknown>;
 			if (message.type === "settle") {

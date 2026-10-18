@@ -1561,6 +1561,7 @@ export async function buildSessionOptions(
 	if (parsed.noPrewalk && (parsed.prewalk || parsed.prewalkInto !== undefined)) {
 		throw new Error("--no-prewalk cannot be combined with --prewalk or --prewalk-into");
 	}
+	options.suppressAutoPrewalk = parsed.noPrewalk;
 	const explicitPrewalk = parsed.prewalk === true || parsed.prewalkInto !== undefined;
 	const prewalkEnabled = parsed.noPrewalk
 		? false
@@ -2476,9 +2477,12 @@ export async function runRootCommand(
 				eventBus,
 				subagentEventBus,
 				preloadedExtensions: extensionsResult,
-				// runInteractiveMode validates once init has painted the first frame.
-				deferRetryFallbackValidation: isInteractive,
+				// Validated once the background refresh is in flight, so selectors it
+				// may still supply defer instead of warning; interactive mode also
+				// waits for the first frame (`startDeferredStartupWork`).
+				deferRetryFallbackValidation: true,
 			});
+			if (!isInteractive) session.validateRetryFallbackChains();
 
 			const sessionToolNames = session.getAllToolNames();
 			try {
@@ -2529,8 +2533,8 @@ export async function runRootCommand(
 			// prompt: fallback-chain validation only produces header warnings, and the
 			// background refresh already raced the first prompt when it ran earlier.
 			const startDeferredStartupWork = (): void => {
-				session.validateRetryFallbackChains();
 				modelRegistry.refreshInBackground();
+				session.validateRetryFallbackChains();
 				if (configuredScope.length > 0) {
 					// Must follow refreshInBackground: it waits on the in-flight refresh.
 					void rebuildScopedModelsAfterDiscovery(session, parsedArgs, modelRegistry, settingsInstance).catch(

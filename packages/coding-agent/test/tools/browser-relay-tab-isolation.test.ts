@@ -33,6 +33,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
 import { acquireTab, releaseTab, runInTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { WorkerCore } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker";
+import { newUploadStagingDir } from "@oh-my-pi/pi-coding-agent/tools/browser/upload-files";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import { chromiumAvailable } from "./chromium-probe";
 
@@ -144,7 +145,8 @@ async function launchRelayFixture(options: FixtureOptions = {}): Promise<RelayFi
 			headless: true,
 			pipe: true,
 			enableExtensions: [extension],
-			args: ["--no-first-run", "--no-default-browser-check", "--use-mock-keychain"],
+			// Software compositing avoids host-GPU stalls during background chrome.debugger captures.
+			args: ["--no-first-run", "--no-default-browser-check", "--use-mock-keychain", "--disable-gpu"],
 		});
 		const target = await browser.waitForTarget(candidate => candidate.type() === "service_worker", {
 			timeout: 15_000,
@@ -302,6 +304,58 @@ function startWorker(payload: WorkerInitPayload): TestWorker {
 }
 
 describe.skipIf(!CHROMIUM_AVAILABLE)("relay page ownership across worker recovery", () => {
+	it("keeps owned relay identity and background capture after its worker exits", async () => {
+		const fixture = await launchRelayFixture();
+		const human = await fixture.browser.newPage();
+		await human.goto(`${fixture.origin}/human`);
+		const relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
+		const name = `relay-worker-exit-${process.pid}`;
+		const session = makeSession();
+		try {
+			const { tab } = await acquireTab(name, relay, { url: `${fixture.origin}/first`, timeoutMs: 20_000 });
+			if (tab.backend !== "worker") throw new Error("Expected a worker tab");
+			const targetId = tab.targetId;
+			const uploadDir = tab.uploadDir;
+			await runInTab(name, {
+				code: "await tab.click('button');",
+				timeoutMs: 15_000,
+				session,
+			});
+			await expect(runInTab(name, { code: "process.exit(3);", timeoutMs: 20_000, session })).rejects.toThrow(
+				"Browser tab worker exited unexpectedly",
+			);
+			const recovered = await runInTab(name, {
+				code: "const shot = await tab.screenshot({ silent: true }); return { shot, text: await tab.text('button') };",
+				timeoutMs: 20_000,
+				session,
+			});
+			const value = recovered.returnValue as { shot: string; text: string };
+			try {
+				expect(value.text).toBe("clicked");
+				expect(await Bun.file(value.shot).exists()).toBe(true);
+			} finally {
+				await fs.rm(value.shot, { force: true });
+			}
+			expect(tab.targetId).toBe(targetId);
+			expect(tab.uploadDir).toBe(uploadDir);
+			expect(tab.ownsPage).toBe(true);
+			expect(tab.activateForScreenshot).toBe(false);
+			const listed = await fixture.chromeTabs();
+			expect(
+				listed.filter(candidate => candidate.url.endsWith("/human")).map(candidate => candidate.active),
+			).toEqual([true]);
+			expect(listed.find(candidate => candidate.id === chromeTabIdOf(targetId))?.active).toBe(false);
+			await releaseTab(name);
+			expect((await fixture.chromeTabs()).some(candidate => candidate.id === chromeTabIdOf(targetId))).toBe(false);
+			expect(human.isClosed()).toBe(false);
+		} finally {
+			await releaseTab(name).catch(() => undefined);
+			await releaseBrowser(relay, { kill: false });
+			await human.close().catch(() => undefined);
+			await fixture.close();
+		}
+	}, 120_000);
+
 	it("keeps an owned page alive after a failed init so the retry can adopt it", async () => {
 		const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 		if (!("browser" in browser)) throw new Error("Expected a Chromium handle");
@@ -313,6 +367,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay page ownership across worker recover
 			mode: "attach",
 			browserWSEndpoint: browser.browser.wsEndpoint(),
 			safeDir: getPuppeteerDir(),
+			uploadDir: newUploadStagingDir(),
 			targetId,
 			ownsPage: true,
 			recover: true,

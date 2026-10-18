@@ -13,6 +13,8 @@
  */
 
 import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { Browser } from "puppeteer-core";
 import type { PuppeteerBrowserHandle } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import type { WorkerInbound, WorkerOutbound } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
@@ -23,6 +25,7 @@ import {
 	releaseTabsForOwner,
 	type WorkerTabSession,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import { newUploadStagingDir } from "@oh-my-pi/pi-coding-agent/tools/browser/upload-files";
 
 const TARGET_ID = "PAGEANON00000009.9";
 
@@ -45,25 +48,25 @@ class ClosedOnRequestWorker {
 	/** Terminations observed, so a batch release that abandons a tab is visible. */
 	terminations = 0;
 	#handlers = new Set<(msg: WorkerOutbound) => void>();
-	#closed = false;
 
 	send(msg: WorkerInbound): void {
 		this.sent.push(msg);
 		if (msg.type !== "close") return;
-		this.#closed = true;
 		for (const handler of this.#handlers) handler({ type: "closed" });
 	}
 
 	onMessage(handler: (msg: WorkerOutbound) => void): () => void {
 		this.#handlers.add(handler);
-		// `waitForClosed` subscribes after the close command was delivered.
-		if (this.#closed) handler({ type: "closed" });
 		return () => {
 			this.#handlers.delete(handler);
 		};
 	}
 
 	onError(): () => void {
+		return () => {};
+	}
+
+	onExit(): () => void {
 		return () => {};
 	}
 
@@ -129,6 +132,7 @@ function makeRelayTab(
 		kindTag: "relay",
 		ownsPage,
 		activateForScreenshot: false,
+		uploadDir: newUploadStagingDir(),
 		ownerSessionId: "session-relay-ownership",
 		persist: false,
 		lastActivityAt: Date.now(),
@@ -210,6 +214,64 @@ describe("relay tab ownership on managed close", () => {
 		const name = register(makeRelayTab(`relay-offline-${process.pid}`, handle, true));
 
 		await expect(releaseTab(name, { kill: false })).rejects.toThrow("relay extension is not connected");
+	});
+
+	it("removes staged uploads only after the owned page close succeeds", async () => {
+		const handle = makeRelayHandle(() => Promise.resolve({ success: true }));
+		const tab = makeRelayTab("relay-upload-owned", handle, true);
+		register(tab);
+		const file = path.join(tab.uploadDir, "picked.txt");
+		await Bun.write(file, "picked");
+		try {
+			expect(await releaseTab(tab.name, { kill: false })).toBe(true);
+			expect(await Bun.file(file).exists()).toBe(false);
+		} finally {
+			await fs.rm(tab.uploadDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps staged uploads when the owned page close is unconfirmed", async () => {
+		const handle = makeRelayHandle(() => Promise.resolve({ success: false }));
+		const tab = makeRelayTab("relay-upload-unconfirmed", handle, true);
+		register(tab);
+		const file = path.join(tab.uploadDir, "picked.txt");
+		await Bun.write(file, "picked");
+		try {
+			expect(await releaseTab(tab.name, { kill: false })).toBe(true);
+			expect(await Bun.file(file).text()).toBe("picked");
+		} finally {
+			await fs.rm(tab.uploadDir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps staged uploads for a borrowed page after releasing its worker", async () => {
+		const handle = makeRelayHandle(() => Promise.reject(new Error("Borrowed page must stay open")));
+		const tab = makeRelayTab("relay-upload-borrowed", handle, false);
+		register(tab);
+		const file = path.join(tab.uploadDir, "picked.txt");
+		await Bun.write(file, "picked");
+		try {
+			expect(await releaseTab(tab.name, { kill: false })).toBe(true);
+			expect(handle.commands).toEqual([]);
+			expect(await Bun.file(file).text()).toBe("picked");
+		} finally {
+			await fs.rm(tab.uploadDir, { recursive: true, force: true });
+		}
+	});
+
+	it("joins concurrent releases without closing the owned page twice", async () => {
+		const close = Promise.withResolvers<unknown>();
+		const handle = makeRelayHandle(() => close.promise);
+		const worker = new ClosedOnRequestWorker();
+		const tab = makeRelayTab("relay-concurrent-close", handle, true, TARGET_ID, worker);
+		register(tab);
+		const first = releaseTab(tab.name, { kill: false });
+		const second = releaseTab(tab.name, { kill: false });
+		close.resolve({ success: true });
+		expect(await Promise.all([first, second])).toEqual([true, true]);
+		expect(handle.commands).toEqual([{ method: "Target.closeTarget", params: { targetId: TARGET_ID } }]);
+		expect(worker.terminations).toBe(1);
+		expect(handle.disconnects()).toBe(1);
 	});
 });
 

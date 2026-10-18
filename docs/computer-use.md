@@ -64,7 +64,7 @@ await win.click(120, 48, button="right")
 
 When `positionKnown` is false, `bounds.x` and `bounds.y` are not global desktop coordinates. Window capture can still work, but coordinate input that needs the missing origin fails with `InvalidCoordinateFrame`. Do not substitute AT-SPI window-relative coordinates for a global origin.
 
-For multi-step sequences, `computer.run(fnOrCode, { args?, read_only?, timeout? })` runs a function or JavaScript string inside the same session. The function receives `{ desktop, wait, assert }`, where `desktop` has the same helpers as `computer`; it is serialized, so it cannot capture Eval-cell closures. Pass plain data, functions, or `RegExp` values through `{ args: [...] }`. Python `computer.run(code, read_only=..., timeout=...)` accepts a JavaScript string only. The run returns the code's real structured value; nonempty text emitted by inner `display(...)` calls prints in the outer Eval cell, while screenshots surface as Eval images. Code runs with top-level `await` in a persistent, full-host-access Bun session. Window handles, screenshot frames, and recent AX references survive between calls. Ordinary Eval helpers such as `display`, `print`, `read`, `write`, and `tool.*` remain available.
+For multi-step sequences, `computer.run(fnOrCode, { args?, read_only?, timeout? })` runs a function or JavaScript string inside the same session. The function receives `{ desktop, wait, assert }`, where `desktop` has the same helpers as `computer`; it is serialized, so it cannot capture Eval-cell closures. Pass plain data, functions, or `RegExp` values through `{ args: [...] }`. Python `computer.run(code, read_only=..., timeout=...)` accepts a JavaScript string only. The run returns the code's real structured value; nonempty text printed inside the run prints in the outer Eval cell, while screenshots surface as Eval images. Code runs with top-level `await` in a persistent, full-host-access Bun session. Window handles, screenshot frames, and recent AX references survive between calls. Ordinary Eval helpers such as `print`, `read`, `write`, and `tool.*` remain available.
 
 Direct inspection helpers run read-only automatically. In `computer.run`, use `read_only: true` to declare an inspection-only call for approval and to block mutation through the `desktop` facade: screenshots and AX reads work, while facade input and clipboard-write methods reject the call. This is **not a sandbox**. The evaluated code still has full Bun/Node host access, including `process`, `require`, and `fs`, so `read_only` does not prevent mutation through arbitrary host APIs.
 
@@ -74,8 +74,8 @@ One lazy worker queues runs, direct calls, and per-cell observation settlement i
 
 ```js
 const matches = await computer.windows({ app: "Code" });
-display(await computer.displays());
-display(await computer.capabilities());
+console.log(await computer.displays());
+console.log(await computer.capabilities());
 ```
 
 `computer.windows({ app?, title? })` returns window IDs, app/title, PID, logical bounds, and focus state for up to 48 matching windows. Select exactly one target with `computer.window(idOrFilter)`; an ambiguous filter throws and lists candidates. A missing target reports a bounded list of available windows so you can correct the filter. `computer.focusedWindow()` returns the current target or `null`.
@@ -86,7 +86,7 @@ Control helpers act through the platform compositor or window manager. They do n
 
 ```js
 const win = await computer.window({ app: "Code" });
-display(await win.state());
+print(await win.state());
 await win.focus();
 await win.moveTo({ x: 120, y: 80 });
 await win.resize({ width: 1280 });
@@ -278,7 +278,7 @@ Window control is backend-reported, not assumed. Read `computer.capabilities().w
 
 ### macOS display sleep and the lock screen
 
-While the agent uses the desktop, the macOS session holds a `PreventUserIdleDisplaySleep` power assertion, shown by `pmset -g assertions` as "oh-my-pi computer tool is operating the desktop". Every desktop call except `capabilities()` holds or renews it; it is released five minutes after the last call, or when the session closes. Releasing it restarts the system's display-sleep countdown, so the display, and an idle lock tied to it, can arrive no sooner than five minutes plus your display-sleep setting after the agent's last action.
+While the agent uses the desktop, the macOS session holds a `PreventUserIdleDisplaySleep` power assertion, shown by `pmset -g assertions` as "oh-my-pi computer tool is operating the desktop". The first desktop call of an agent turn, other than `capabilities()`, takes it, and it lasts however long the turn spends on other work, until the agent waits for you: the turn ends (an interrupt included), or a question, approval or other prompt asks for your answer. A question or `cfg://` approval bounded by `ask.timeout` keeps it, since the turn goes on by itself when the deadline passes. Once you answer, the turn's next desktop call takes it again, as does the next turn's first. Closing the session also releases it. Without an agent turn (SDK or eval use) or in a subagent, each call holds it until five minutes after the last call instead. Releasing it restarts the system's display-sleep countdown, so the display, and an idle lock tied to it, can arrive no sooner than your display-sleep setting after the agent starts waiting.
 
 The assertion does not wake a display that is already asleep or unlock a locked screen. `capabilities()` reports `screenLocked` and `displayAsleep`, a screenshot taken behind the lock screen carries `screenLocked: true` and a note, any failed call names the state, and a run that ends locked or asleep starts with a `Note:` line. Input is never refused because of the lock; measured on macOS 26, it behaves as follows:
 

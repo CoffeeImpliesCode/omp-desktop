@@ -2,7 +2,8 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createDaemonBrokerClient } from "../../src/launch/client";
+import { Process } from "@oh-my-pi/pi-natives";
+import { readLiveDaemonBrokerPid } from "../../src/launch/presence";
 import { findFreeCdpPort } from "../../src/tools/browser/attach";
 import { probeRelayServer } from "../../src/tools/browser/relay/daemon";
 
@@ -166,8 +167,12 @@ try {
 					cwd,
 					env: {
 						...process.env,
+						// HOME alone does not isolate the machine-global broker when XDG paths are inherited.
 						HOME: home,
 						USERPROFILE: home,
+						XDG_STATE_HOME: path.join(home, "state"),
+						XDG_DATA_HOME: path.join(home, "data"),
+						XDG_CACHE_HOME: path.join(home, "cache"),
 						PI_CONFIG_DIR: ".omp",
 						OMP_PROFILE: profile,
 						OMP_DAEMON_IDLE_GRACE_MS: "200",
@@ -200,16 +205,7 @@ try {
 			}
 		} finally {
 			await terminateConsumer(first);
-			const rescue = await createDaemonBrokerClient(globalRuntimeDir, {
-				runtimeDir: globalRuntimeDir,
-				idleGraceMs: 200,
-			});
-			try {
-				await rescue.request({ op: "shutdown" });
-			} catch {
-				// The last-client grace may already have stopped the broker.
-			}
-			rescue.close();
+			await waitForIsolatedBrokerExit(globalRuntimeDir);
 			await fs.rm(home, { recursive: true, force: true });
 		}
 		// Budget must exceed the sum of the bounds inside the test: two 15s marker waits
@@ -250,6 +246,9 @@ try {
 					...process.env,
 					HOME: home,
 					USERPROFILE: home,
+					XDG_STATE_HOME: path.join(home, "state"),
+					XDG_DATA_HOME: path.join(home, "data"),
+					XDG_CACHE_HOME: path.join(home, "cache"),
 					PI_CONFIG_DIR: ".omp",
 					OMP_DAEMON_IDLE_GRACE_MS: "200",
 					OMP_TEST_FIRST_RELAY_URL: firstUrl,
@@ -270,16 +269,7 @@ try {
 		} finally {
 			if (child.exitCode === null) child.kill();
 			await child.exited;
-			const rescue = await createDaemonBrokerClient(globalRuntimeDir, {
-				runtimeDir: globalRuntimeDir,
-				idleGraceMs: 200,
-			});
-			try {
-				await rescue.request({ op: "shutdown" });
-			} catch {
-				// The last-client grace may already have stopped the broker.
-			}
-			rescue.close();
+			await waitForIsolatedBrokerExit(globalRuntimeDir);
 			await fs.rm(home, { recursive: true, force: true });
 		}
 	}, 60_000);
@@ -820,6 +810,9 @@ async function runWithIsolatedBroker(
 			...process.env,
 			HOME: home,
 			USERPROFILE: home,
+			XDG_STATE_HOME: path.join(home, "state"),
+			XDG_DATA_HOME: path.join(home, "data"),
+			XDG_CACHE_HOME: path.join(home, "cache"),
 			PI_CONFIG_DIR: ".omp",
 			OMP_DAEMON_IDLE_GRACE_MS: "200",
 			...env,
@@ -838,16 +831,20 @@ async function runWithIsolatedBroker(
 	} finally {
 		if (child.exitCode === null) child.kill();
 		await child.exited;
-		const rescue = await createDaemonBrokerClient(globalRuntimeDir, {
-			runtimeDir: globalRuntimeDir,
-			idleGraceMs: 200,
-		});
-		try {
-			await rescue.request({ op: "shutdown" });
-		} catch {
-			// The last-client grace may already have stopped the broker.
-		}
-		rescue.close();
+		await waitForIsolatedBrokerExit(globalRuntimeDir);
 		await fs.rm(home, { recursive: true, force: true });
 	}
+}
+
+/**
+ * Waits for the isolated global broker, and the daemons it stops on its way out, to exit before the caller removes
+ * the temp HOME: on Windows a live broker's open runtime files, or a relay whose cwd is the broker's runtime dir,
+ * make the removal fail with EBUSY. Its clients are gone, so the broker leaves after its 200ms last-client grace;
+ * no `shutdown` request is sent because a client finding no broker would spawn a fresh one into HOME.
+ */
+async function waitForIsolatedBrokerExit(runtimeDir: string): Promise<void> {
+	const pid = await readLiveDaemonBrokerPid(runtimeDir);
+	const broker = pid === undefined ? null : Process.fromPid(pid);
+	if (!broker || (await broker.waitForExit({ timeoutMs: 10_000 }))) return;
+	await broker.terminate({ group: true, gracefulMs: 0, timeoutMs: 2_000 });
 }

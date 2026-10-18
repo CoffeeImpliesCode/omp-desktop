@@ -53,6 +53,10 @@ class FakeStartupWorker {
 		return () => this.#errorHandlers.delete(handler);
 	}
 
+	onExit(): () => void {
+		return () => {};
+	}
+
 	async terminate(): Promise<void> {}
 
 	emitReady(info: ReadyInfo): void {
@@ -75,6 +79,7 @@ const initPayload = {
 	mode: "headless" as const,
 	browserWSEndpoint: "ws://127.0.0.1/devtools/browser/test",
 	safeDir: "/tmp/omp-puppeteer",
+	uploadDir: "/tmp/omp-uploads-test",
 };
 
 describe("browser tab worker startup", () => {
@@ -836,11 +841,17 @@ describe("browser tabs whose renderer crashed", () => {
 		async () => {
 			let requests = 0;
 			const started = Promise.withResolvers<void>();
+			const gateEntered = Promise.withResolvers<void>();
+			const gate = Promise.withResolvers<Response>();
 			const server = Bun.serve({
 				port: 0,
 				fetch: request => {
-					if (new URL(request.url).pathname === "/started") started.resolve();
-					else requests++;
+					const pathname = new URL(request.url).pathname;
+					if (pathname === "/started") started.resolve();
+					else if (pathname === "/continue") {
+						gateEntered.resolve();
+						return gate.promise;
+					} else requests++;
 					return new Response("ok");
 				},
 			});
@@ -866,18 +877,21 @@ describe("browser tabs whose renderer crashed", () => {
 				expect(getTab(name)).toMatchObject({ worker: { mode: "inline" } });
 				const { client, crashed } = await watchRenderer(browser, url);
 				const run = runInTab(name, {
-					code: `await fetch("http://127.0.0.1:${server.port}/started"); await wait(2_000); await fetch("http://127.0.0.1:${server.port}/after-crash");`,
+					code: `await fetch("http://127.0.0.1:${server.port}/started"); await wait(async () => { await fetch("http://127.0.0.1:${server.port}/continue"); return true; }); await fetch("http://127.0.0.1:${server.port}/after-crash");`,
 					timeoutMs: 10_000,
 					session,
 				}).catch((error: unknown) => error);
 				await started.promise;
+				await gateEntered.promise;
 				void client.send("Page.crash").catch(() => undefined);
 				await crashed;
 				expect(String(await run)).toContain("the tab could not be reattached and was closed");
-				// A run left going reaches the second fetch two seconds after it started; nothing marks that it did not.
+				// Release the continuation only after the caller was told; slow crash recovery must not race a timer.
+				gate.resolve(new Response("continue"));
 				await Bun.sleep(2_500);
 				expect(requests).toBe(0);
 			} finally {
+				gate.resolve(new Response("closed"));
 				await releaseTab(name, { kill: true });
 				if ("browser" in browser && browser.browser.connected) await releaseBrowser(browser, { kill: true });
 				server.stop(true);

@@ -118,7 +118,7 @@ The inner `tab` is the full worker helper API. In addition to the direct surface
 
 Runs use a persistent, per-tab JavaScript runtime with ordinary Eval helpers and full Bun/Node and tool-bridge access. This is API isolation, not a security sandbox. Raw `page.setRequestInterception` and run-added request listeners are cleaned up at run end; `tab.route` handlers persist until `unroute` or tab close.
 
-The return value stays structured. Nonempty text emitted by inner `display(...)` calls prints in the outer Eval cell, object/image displays remain Eval output, and a run with no display text emits no placeholder.
+The return value stays structured. Nonempty text printed inside the run (`print`, `console.*`) prints in the outer Eval cell, printed images remain Eval output, and a run with no printed text emits no placeholder.
 
 ## Python API
 
@@ -155,9 +155,9 @@ Reusing one tab name across browser kinds is rejected until the existing tab is 
 
 Images are saved beneath `browser.screenshotDir`, or the OS temporary directory when unset. Chromium saves full resolution when that directory or an explicit format is supplied; otherwise it saves the resized image. Model-visible images are resized to at most 1024×1024 and 150 KiB. When the image's pixels are not CSS pixels (resized, or captured at a device scale other than 1), the capture text gives the factor from image coordinates to CSS pixels: viewport pixels for `clickAt` on a plain capture, page pixels for `fullPage`, element-relative pixels for `selector`. Unless `silent: true`, a capture emits an Eval image. `annotate: true` overlays numeric interactive-element labels and refreshes `tab.id` mappings. Screenshot options do not accept an output path; `diffScreenshot(baselinePath, { threshold?, output? })` does, and `pdf({ path?, ... })` writes a PDF.
 
-Screenshots of relay-created background tabs do not activate them or change the user's foreground tab. Hidden borrowed relay targets still require explicit activation before capture; obtain authorization before activating the user's tab.
+Screenshots of relay-created background tabs do not activate them or change the user's foreground tab. Hidden borrowed relay targets require explicit activation before capture. Get authorization before activating the user's tab.
 
-Host result details preserve structured `value` separately from displayed content. Display text is capped by the shared inline-output policy; over-cap text is stored as a session artifact and the capped text is printed.
+Host result details preserve structured `value` separately from displayed content. Printed text is capped by the shared inline-output policy. Over-cap text is stored as a session artifact and the capped text is printed.
 
 ## Safety and lifecycle
 
@@ -166,6 +166,8 @@ Relay and attached modes operate on real logged-in sessions; sites attribute act
 Each named tab permits one active run; Chromium-backed tabs have one worker, while Tern/cmux use their own backend. A timed-out or aborted run can recycle the worker and invalidate handles. A call on a Chromium tab whose renderer crashed (under it, or earlier while idle) fails at once and recycles the worker before returning, which reloads the page; its error says so. A page that does not come back (it crashes again as it loads, or a relay tab, which reattaching leaves crashed) closes the tab, as does any crash on a tab whose worker runs inline in the omp process. An open that navigates or resizes such a tab reloads it first and reports it. `browser.close({ all: true })` releases all managed tabs and continues if one close fails; failures and unconfirmed physical closes are logged. `kill` never closes or kills relay/CDP-attached browser processes.
 
 By default, omp-owned managed Chromium tabs freeze at turn settle and unfreeze on next use (`browser.freezeOnTurnEnd = true`). Owned Chromium and Tern tabs idle for 1,800 seconds are closed (`browser.idleCloseSec`; `0` disables this). `persist: true` opts a tab out of both policies, but explicit close still releases it. Relay, connected, spawned, and cmux tabs are not auto-frozen or idle-closed.
+
+Upload staging survives worker recovery because an open page can read selected files later. A confirmed close of an omp-owned page removes its staged files. Borrowed pages and unconfirmed closes keep staged files until the stale-folder sweep, at least 24 hours after the last upload.
 
 ## Common recovery
 
