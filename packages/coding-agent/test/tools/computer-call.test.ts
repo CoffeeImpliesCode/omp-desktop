@@ -118,7 +118,7 @@ describe("isReadOnlyComputerCall", () => {
 		const windowReads = Object.keys(WINDOW_METHODS)
 			.filter(method => isReadOnlyComputerCall(windowCall(method)))
 			.sort();
-		expect(windowReads).toEqual(["ax", "find", "menu.items", "observe", "ref", "screenshot", "state", "zoom"]);
+		expect(windowReads).toEqual(["ax", "find", "observe", "ref", "screenshot", "state", "zoom"]);
 
 		const desktopReads = Object.keys(DESKTOP_METHODS)
 			.filter(method => isReadOnlyComputerCall([{ method, args: [] }]))

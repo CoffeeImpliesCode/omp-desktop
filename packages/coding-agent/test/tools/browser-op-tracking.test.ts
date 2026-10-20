@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import type { Page } from "puppeteer-core";
 import {
 	describeInflight,
 	describeScreenshot,
@@ -6,7 +7,7 @@ import {
 	preparePageForScreenshot,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker";
 
-type ScreenshotPage = Parameters<typeof preparePageForScreenshot>[0];
+type ScreenshotPage = Pick<Page, "bringToFront" | "evaluate">;
 
 describe("browser op tracking — timeout diagnostics", () => {
 	it("labels a screenshot op by its distinguishing argument", () => {
@@ -91,9 +92,6 @@ describe("browser screenshot activation", () => {
 			evaluate: async () => false,
 		};
 
-		// omp creates its own relay pages in the background and emulates their
-		// focus, so a screenshot must neither fail for being hidden nor steal
-		// the user's foreground tab.
 		await preparePageForScreenshot(page as ScreenshotPage, undefined, false, true);
 
 		expect(activations).toBe(0);

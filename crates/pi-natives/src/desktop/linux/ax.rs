@@ -556,6 +556,8 @@ impl AxBackend for AtSpiAx {
 				bounds,
 				actions,
 				child_count,
+				identity: None,
+				partial: false,
 			})
 		})
 	}

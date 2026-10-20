@@ -9,11 +9,13 @@ The companion relay server lives in the omp CLI (`omp browser-relay`, see `packa
 1. `omp browser-relay install` — writes the bundled extension to `~/.omp/browser-relay/extension`, then load it via `chrome://extensions` → Developer mode → *Load unpacked*. (Or grab `omp-browser-relay-extension.zip` from GitHub releases.)
 2. Opt in, one of two ways:
    - **Per call** — pass `app: { relay: true }` to `browser.open(...)` in Eval. Works without any setting and persists nothing: the configured default for every other call and session stays whatever it already was.
-   - **As the default** — `omp config set browser.relay true` makes the relay the default for **every session using this profile, in every project** (project-level settings, `PI_BROWSER_RELAY`, and an explicit `app` choice still take precedence). Ordinary `browser.open(...)` calls create separate background tabs, including in background sessions. Only an explicit `app.target` borrows an existing tab; passing `url` then navigates that selected tab.
+   - **As the default** — `omp config set browser.relay true` makes the relay the default for **every session using this profile, in every project**. Project-level settings, `PI_BROWSER_RELAY`, and an explicit `app` choice still take precedence. Ordinary `browser.open(...)` calls create separate background tabs, including in background sessions. Only an explicit `app.target` borrows an existing tab. Passing `url` then navigates that selected tab.
 
 That's it: the relay server auto-starts under omp's profile-independent global daemon broker the first time Eval's browser API needs it. Every relay consumer holds a broker lease, so one project exiting cannot interrupt another; the server stops after the last consumer across all projects exits. The extension badge turns **on** when connected. Run `omp browser-relay` manually only for `--token`, `--no-group`, or a non-default port — a relay already serving the port is adopted, never fought over.
 
 Without `app.target`, omp creates an owned background tab and leaves your foreground tab in place. `app.target` borrows a specific existing tab by URL/title substring. Closing an owned tab removes it; closing a borrowed handle only releases it. Owned background screenshots do not activate the tab; hidden borrowed targets require explicit activation.
+
+An older relay extension can select newly created tabs instead. Run `omp browser-relay install` again and reload the extension.
 
 Tabs omp is **actively driving** are gathered into a per-window **"omp" tab group** (cyan) — released when omp lets go of the tab and dissolved on disconnect; the rest of your tabs, pinned tabs, tabs in your own groups, and tabs you drag out are left alone. Disable with `omp browser-relay --no-group`.
 

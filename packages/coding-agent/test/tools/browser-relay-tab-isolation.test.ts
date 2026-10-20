@@ -22,19 +22,25 @@ import puppeteer, { type Browser, type Page, type WebWorker } from "puppeteer-co
 import { getPuppeteerDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
-import { ensureChromiumExecutable } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import { browserConnection, ensureChromiumExecutable } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { waitForRelayExtension } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/probe";
-import { startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
+import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
 import { acquireBrowser, releaseBrowser } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
 import type {
 	WorkerInbound,
 	WorkerInitPayload,
 	WorkerOutbound,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
-import { acquireTab, releaseTab, runInTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
+import {
+	acquireTab,
+	getTabsMapForTest,
+	releaseTab,
+	runInTab,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { WorkerCore } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-worker";
 import { newUploadStagingDir } from "@oh-my-pi/pi-coding-agent/tools/browser/upload-files";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
+import { rejectionOf } from "../helpers/rejection";
 import { chromiumAvailable } from "./chromium-probe";
 
 const CHROMIUM_AVAILABLE = await chromiumAvailable();
@@ -52,6 +58,9 @@ interface RelayFixture {
 	/** The extension's MV3 service worker. */
 	worker: WebWorker;
 	cdpUrl: string;
+	server: RelayServer;
+	/** A second disposable Chrome on this relay, with a separate profile. */
+	launchBrowser(): Promise<{ browser: Browser; worker: WebWorker }>;
 	/** Loopback origin serving the fixture pages. */
 	origin: string;
 	/** Page targets the relay currently advertises over CDP. */
@@ -98,6 +107,17 @@ chrome.debugger.onDetach.addListener = listener => {
 	registerDetach(listener);
 };`;
 
+/** Make Chrome refuse the next requested removals, to exercise the extension's close retries. */
+const REFUSE_REMOVES_PRELUDE = `
+const removeTab = chrome.tabs.remove.bind(chrome.tabs);
+chrome.tabs.remove = tabId => {
+	if (globalThis.testRefuseRemoves > 0) {
+		globalThis.testRefuseRemoves--;
+		return Promise.reject(new Error("Tabs cannot be edited right now (user may be dragging a tab)."));
+	}
+	return removeTab(tabId);
+};`;
+
 /** Puppeteer keeps the CDP target id in a private field; relay page ids come from it. */
 function targetIdOf(target: object): string | undefined {
 	return "_targetId" in target && typeof target._targetId === "string" ? target._targetId : undefined;
@@ -115,44 +135,57 @@ async function launchRelayFixture(options: FixtureOptions = {}): Promise<RelayFi
 	const port = await findFreeCdpPort();
 	const server = startRelayServer({ port, group: false, log: options.log });
 	const extension = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-isolation-"));
+	const xdg = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-isolation-xdg-"));
 	const pages = Bun.serve({
 		port: 0,
 		fetch(request) {
 			const route = new URL(request.url).pathname;
 			const html =
 				route === "/first"
-					? `<title>First</title><button onclick="this.textContent='clicked'">First</button>`
+					? `<title>First</title><button onclick="this.textContent='clicked'">First</button><p id="hover" onmouseover="this.textContent='hovered'">Hover</p>`
 					: route === "/second"
 						? "<title>Second</title><button>Second</button>"
 						: "<title>Human sentinel</title><h1>Keep me</h1>";
 			return new Response(html, { headers: { "Content-Type": "text/html" } });
 		},
 	});
-	let browser: Browser | undefined;
+	const browsers: Browser[] = [];
 	async function close(): Promise<void> {
 		try {
-			await browser?.close().catch(() => undefined);
+			await Promise.all(browsers.map(browser => browser.close().catch(() => undefined)));
 		} finally {
 			server.stop();
 			pages.stop(true);
 			await fs.rm(extension, { recursive: true, force: true });
+			await fs.rm(xdg, { recursive: true, force: true });
 		}
 	}
-	try {
-		await writeExtension(extension, port, options.prelude);
-		browser = await puppeteer.launch({
+	async function launchBrowser(): Promise<{ browser: Browser; worker: WebWorker }> {
+		const browser = await puppeteer.launch({
 			executablePath: await ensureChromiumExecutable(),
 			headless: true,
 			pipe: true,
 			enableExtensions: [extension],
 			// Software compositing avoids host-GPU stalls during background chrome.debugger captures.
 			args: ["--no-first-run", "--no-default-browser-check", "--use-mock-keychain", "--disable-gpu"],
+			env: {
+				...process.env,
+				XDG_CONFIG_HOME: path.join(xdg, "config"),
+				XDG_CACHE_HOME: path.join(xdg, "cache"),
+				XDG_DATA_HOME: path.join(xdg, "data"),
+			},
 		});
+		browsers.push(browser);
 		const target = await browser.waitForTarget(candidate => candidate.type() === "service_worker", {
 			timeout: 15_000,
 		});
 		const worker = await target.worker();
 		if (!worker) throw new Error("Missing relay extension service worker");
+		return { browser, worker };
+	}
+	try {
+		await writeExtension(extension, port, `${REFUSE_REMOVES_PRELUDE}\n${options.prelude ?? ""}`);
+		const { browser, worker } = await launchBrowser();
 		const cdpUrl = `http://127.0.0.1:${port}`;
 		const outcome = await waitForRelayExtension(cdpUrl);
 		if (outcome !== "ready") throw new Error(`Relay fixture handshake failed: ${outcome}`);
@@ -160,6 +193,8 @@ async function launchRelayFixture(options: FixtureOptions = {}): Promise<RelayFi
 			browser,
 			worker,
 			cdpUrl,
+			server,
+			launchBrowser,
 			origin: `http://127.0.0.1:${pages.port}`,
 			relayTargets() {
 				return server.bridge.listTargets();
@@ -191,6 +226,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab isolation", () => {
 		const human = await fixture.browser.newPage();
 		const humanUrl = `${fixture.origin}/human`;
 		await human.goto(humanUrl);
+		await human.bringToFront();
 		const relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
 		const names = [`relay-first-${process.pid}`, `relay-second-${process.pid}`, `relay-borrowed-${process.pid}`];
 		const session = makeSession();
@@ -220,6 +256,12 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab isolation", () => {
 				session,
 			});
 			expect(clicked.returnValue).toBe("clicked");
+			const hovered = await runInTab(names[0]!, {
+				code: "await tab.hover('#hover'); return await tab.text('#hover');",
+				timeoutMs: 15_000,
+				session,
+			});
+			expect(hovered.returnValue).toBe("hovered");
 
 			// A screenshot of an owned background page must work and must not
 			// raise the user's window to do it.
@@ -252,7 +294,8 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab isolation", () => {
 
 			// `app.target` borrows a page the user owns: release returns it, it
 			// does not close it.
-			await acquireTab(names[2]!, relay, { target: "Human sentinel", timeoutMs: 20_000 });
+			const borrowed = await acquireTab(names[2]!, relay, { target: "Human sentinel", timeoutMs: 20_000 });
+			expect(borrowed.tab.targetId).not.toBe(first.tab.targetId);
 			await releaseTab(names[2]!);
 			expect(human.isClosed()).toBe(false);
 			expect(await human.title()).toBe("Human sentinel");
@@ -368,12 +411,13 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay page ownership across worker recover
 			browserWSEndpoint: browser.browser.wsEndpoint(),
 			safeDir: getPuppeteerDir(),
 			uploadDir: newUploadStagingDir(),
-			targetId,
-			ownsPage: true,
+			page: { kind: "owned", targetId },
 			recover: true,
-			emulateFocus: true,
 		};
-		const failed = startWorker({ ...payload, downloadsPath: "/dev/null/notadir" });
+		const downloadDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-recovery-download-"));
+		const blockedDownloadPath = path.join(downloadDir, "not-a-directory");
+		await fs.writeFile(blockedDownloadPath, "existing file");
+		const failed = startWorker({ ...payload, downloadsPath: blockedDownloadPath });
 		let retried: TestWorker | undefined;
 		try {
 			// A retry adopts this same target, so a failed init must not destroy
@@ -388,18 +432,19 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay page ownership across worker recover
 			if (ready.type === "ready") expect(ready.info.targetId).toBe(targetId);
 			await retried.close();
 			retried = undefined;
-			// Ownership survived the recovery, so the worker's own close still
-			// destroys the page it was told it owns.
-			if (!page.isClosed()) {
-				const { promise, resolve } = Promise.withResolvers<void>();
-				page.once("close", () => resolve());
-				await promise;
+			// Ask Chrome directly: this Puppeteer connection may not have received its target event yet.
+			const session = await browser.browser.target().createCDPSession();
+			try {
+				const { targetInfos } = await session.send("Target.getTargets");
+				expect(targetInfos.map(info => info.targetId)).not.toContain(targetId);
+			} finally {
+				await session.detach();
 			}
-			expect(page.isClosed()).toBe(true);
 		} finally {
 			await retried?.close();
 			await failed.close();
 			await page.close().catch(() => undefined);
+			await fs.rm(downloadDir, { recursive: true, force: true });
 			await releaseBrowser(browser, { kill: true });
 		}
 	}, 60_000);
@@ -449,4 +494,118 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab cleanup after a debugger detach"
 			await fixture.close();
 		}
 	}, 90_000);
+});
+
+describe.skipIf(!CHROMIUM_AVAILABLE)("relay multi-browser placement and cleanup", () => {
+	it("opens a default tab in the browser of the tab omp used last, not the first selected one", async () => {
+		const secondHello = Promise.withResolvers<void>();
+		let hellos = 0;
+		const fixture = await launchRelayFixture({
+			log(message) {
+				if (message === "extension connected" && ++hellos === 2) secondHello.resolve();
+			},
+		});
+		const human = await fixture.browser.newPage();
+		await human.goto(`${fixture.origin}/human`);
+		await human.bringToFront();
+		const relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
+		const names = [
+			`relay-near-human-${process.pid}`,
+			`relay-near-other-${process.pid}`,
+			`relay-near-own-${process.pid}`,
+		];
+		const browserOf = (targetId: string) => targetId.slice(4, targetId.lastIndexOf("."));
+		try {
+			const inFirst = await acquireTab(names[0]!, relay, { target: "Human sentinel", timeoutMs: 15_000 });
+			const other = await fixture.launchBrowser();
+			await secondHello.promise;
+			await (await other.browser.newPage()).goto(`${fixture.origin}/first`);
+			const inSecond = await acquireTab(names[1]!, relay, { target: "First", timeoutMs: 15_000 });
+			expect(browserOf(inSecond.tab.targetId)).not.toBe(browserOf(inFirst.tab.targetId));
+			const owned = await acquireTab(names[2]!, relay, { url: `${fixture.origin}/second`, timeoutMs: 15_000 });
+			expect(browserOf(owned.tab.targetId)).toBe(browserOf(inSecond.tab.targetId));
+		} finally {
+			for (const name of names) await releaseTab(name).catch(() => undefined);
+			await releaseBrowser(relay, { kill: false });
+			await fixture.close();
+		}
+	}, 60_000);
+
+	it("closes an owned tab Chrome refuses to close at first", async () => {
+		const fixture = await launchRelayFixture();
+		const relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
+		const name = `relay-refused-close-${process.pid}`;
+		try {
+			const { tab } = await acquireTab(name, relay, { url: `${fixture.origin}/first`, timeoutMs: 15_000 });
+			await fixture.worker.evaluate("globalThis.testRefuseRemoves = 2");
+			await releaseTab(name);
+			expect((await fixture.chromeTabs()).some(candidate => candidate.id === chromeTabIdOf(tab.targetId))).toBe(
+				false,
+			);
+		} finally {
+			await releaseTab(name).catch(() => undefined);
+			await releaseBrowser(relay, { kill: false });
+			await fixture.close();
+		}
+	}, 60_000);
+
+	it("drops a closed owned tab's handle and browser hold when timeout recovery loses its connection", async () => {
+		const fixture = await launchRelayFixture();
+		const relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
+		if (!("browser" in relay)) throw new Error("Expected relay Chromium connection");
+		const name = `relay-closed-recovery-${process.pid}`;
+		const referencesBefore = relay.refCount;
+		const runAc = new AbortController();
+		let unsubscribe: (() => void) | undefined;
+		let runFailure: Promise<unknown> | undefined;
+		try {
+			const { tab } = await acquireTab(name, relay, { timeoutMs: 15_000 });
+			expect(tab.backend).toBe("worker");
+			if (tab.backend !== "worker") throw new Error("Expected relay tab worker");
+			expect(tab.ownsPage).toBe(true);
+			const gone = Promise.withResolvers<void>();
+			const connection = browserConnection(relay.browser);
+			const onGone = (event: { targetId: string }) => {
+				if (event.targetId === tab.targetId) gone.resolve();
+			};
+			// The worker and registry use separate CDP connections. Worker readiness
+			// does not mean the registry initialized this target, which Puppeteer's
+			// Browser.targetdestroyed requires. Observe the relay's actual retraction.
+			connection.on("Target.targetDestroyed", onGone);
+			unsubscribe = () => connection.off("Target.targetDestroyed", onGone);
+			runFailure = rejectionOf(
+				runInTab(name, {
+					code: "await page.close(); await wait(60_000);",
+					timeoutMs: 5_000,
+					signal: runAc.signal,
+					session: makeSession(),
+				}),
+			);
+			// An error before page.close must fail here, not strand the fixture on
+			// a lifecycle event that can no longer arrive.
+			await Promise.race([
+				gone.promise,
+				runFailure.then(error => {
+					throw error;
+				}),
+			]);
+			expect(fixture.relayTargets().some(target => target.id === tab.targetId)).toBe(false);
+			relay.browser.disconnect();
+			const error = await runFailure;
+			expect(error).toBeInstanceOf(Error);
+			expect((error as Error).message).toStartWith("Browser code execution timed out after 5000ms");
+			expect(getTabsMapForTest().has(name)).toBe(false);
+			expect(relay.refCount).toBe(referencesBefore);
+		} finally {
+			runAc.abort();
+			unsubscribe?.();
+			try {
+				await releaseTab(name).catch(() => undefined);
+				await runFailure?.catch(() => undefined);
+				await releaseBrowser(relay, { kill: false });
+			} finally {
+				await fixture.close();
+			}
+		}
+	}, 30_000);
 });

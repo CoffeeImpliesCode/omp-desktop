@@ -98,7 +98,7 @@ function makeRelayHandle(close: (targetId: string) => Promise<unknown>): RelayHa
 			disconnects += 1;
 			browser.connected = false;
 		},
-		_connection: { send },
+		_connection: { send, createSession: async () => ({ send, detach: async () => undefined }) },
 	};
 	return {
 		browser: {
