@@ -2,11 +2,12 @@
 
 This fork of [oh-my-pi](https://github.com/can1357/oh-my-pi) improves desktop computer use specifically for **Linux Wayland**.
 
-Upstream base: [v18.12.3](https://github.com/can1357/oh-my-pi/releases/tag/v18.12.3).
+Upstream base: [v18.12.6](https://github.com/can1357/oh-my-pi/releases/tag/v18.12.6).
 
 ## Linux Wayland improvements
 
-- Capture exact niri windows, including unfocused windows, without raising the window or changing focus.
+- Capture exact niri windows, including unfocused windows and windows with client-side shadows, without raising the window or changing focus.
+- Match niri windows to their AT-SPI trees through Flatpak `xdg-dbus-proxy` connections, `xwayland-satellite` X11 clients, and AccessKit frames without the window's title, refusing any match that two windows could share.
 - Compose desktop screenshots from all portal-authorized monitor streams, with mixed scales and negative origins.
 - Save and display the same capped PNG in the JavaScript and Python computer helpers.
 - Expose `positionKnown` so unknown window origins do not block exact screenshots or permit unsafe global pointer mapping.

@@ -23,6 +23,12 @@
 - Fixed local Nix builds failing to open microphones and speakers outside the development shell.
 - Refused global coordinate mapping and AX coordinate clicks when a window's global origin is unknown or its AT-SPI bounds cannot be verified.
 - Fixed niri window screenshots rejecting valid buffers on fractional-scale outputs.
+- Fixed niri screenshots of windows with client-side shadows, such as Firefox-based browsers, failing with `CaptureFailed`; the window is located inside the cast by its opaque pixels.
+- Fixed zoom on a niri window screenshot failing with `InvalidCoordinateFrame` after the display list changed, and opening a ScreenCast portal request to validate it.
+- Fixed a slow niri IPC reply failing window screenshots with `Resource temporarily unavailable`; replies get 5 seconds and a missed deadline reports `Timeout`.
+- Fixed accessibility trees of Flatpak apps on niri finding no AT-SPI application: the accessibility connection belongs to the instance's `xdg-dbus-proxy`, which is now matched to the window through the shared Flatpak instance.
+- Fixed X11 apps on niri, such as Topocraft, being matched to niri's own accessibility tree: their windows now report the X11 client's pid from `xwayland-satellite`'s display instead of the bridge's, and the compositor's ancestry no longer counts as window ownership.
+- Fixed accessibility trees of niri windows whose toolkit publishes a frame without the window's title, such as AccessKit apps with an unnamed or stale frame title; the frame is used only when it is the app's only frame and the compositor shows no other window for that app.
 - Kept Wayland desktop capture and window discovery working when optional niri IPC metadata is unavailable.
 - Invalidated all screenshot coordinate frames before window, workspace, and display mutations, including requests that fail after possible partial delivery.
 - Kept minimized X11 windows discoverable for restore and refused capture of their stale on-screen rectangles.

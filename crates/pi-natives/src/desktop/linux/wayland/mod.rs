@@ -5,6 +5,7 @@ mod libei;
 mod niri;
 mod portal;
 mod xkb;
+mod xwayland;
 
 #[cfg(any(feature = "wayland-pipewire", test))]
 use geometry::PortalGeometry;
@@ -22,6 +23,25 @@ use crate::desktop::{
 		DesktopWindowState, DesktopWorkspace, DisplaySelector, Target,
 	},
 };
+
+/// Every window niri reports, or `None` without a readable niri.
+///
+/// AT-SPI uses it to prove that an accessibility connection serves exactly
+/// one window before it accepts a frame without the window's title as it.
+pub(super) fn compositor_windows() -> Option<Vec<DesktopWindow>> {
+	niri::windows()
+		.ok()
+		.flatten()
+		.map(|windows| windows.into_iter().map(|entry| entry.window).collect())
+}
+
+/// The niri compositor's pid, or `None` without a readable niri.
+///
+/// The compositor is the ancestor of every process it spawns, Xwayland bridges
+/// included, so AT-SPI must never take ancestry from it as window ownership.
+pub(super) fn compositor_pid() -> Option<u32> {
+	niri::compositor_pid().ok()
+}
 
 pub struct WaylandBackend {
 	#[cfg_attr(
@@ -150,6 +170,12 @@ impl Backend for WaylandBackend {
 
 	fn validate_frame_layout(&mut self, frame: &FrameGeometry) -> CoreResult<()> {
 		control::check()?;
+		// A niri window frame is the compositor's render of that window; no
+		// monitor stream backs it, so refreshing portal geometry would only ask
+		// for monitor consent the frame never needed.
+		if !frame.display_bound() {
+			return Ok(());
+		}
 		#[cfg(not(feature = "wayland-pipewire"))]
 		{
 			let _ = frame;
@@ -222,7 +248,8 @@ impl Backend for WaylandBackend {
 				&& id.starts_with("niri:")
 			{
 				let (image, window) = niri::capture_window(id)?;
-				let frame = FrameGeometry::for_window(&window, image.width(), image.height());
+				let frame =
+					FrameGeometry::for_compositor_window(&window, image.width(), image.height());
 				return Ok((image, frame));
 			}
 			// The portal reports the authorized stream geometry. Use niri only

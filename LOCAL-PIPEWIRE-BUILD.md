@@ -9,7 +9,7 @@ empty. Backend selection reads only `WAYLAND_DISPLAY` / `DISPLAY`
 `~/.omp/agent/settings.json` nor `config.yml` turns the feature on. The build
 below compiles both addons with `wayland-pipewire` and embeds them in the
 executable. The fork also keeps every authorized monitor stream, adds exact
-niri window capture, and integrates upstream v18.12.3.
+niri window capture, and integrates upstream v18.12.6.
 
 ## Why a hand-dropped addon is not enough
 
@@ -146,5 +146,7 @@ verified geometry before testing input.
   X11 has no monitor-focus or workspace-to-monitor binding. Those stay
   unsupported instead of falling back to synthesized input. See
   [docs/computer-use.md](docs/computer-use.md#window-workspace-and-display-control).
-- Window streams with popup or shadow margins whose origin cannot be verified
-  fail with `CaptureFailed` instead of silently misaligning the image.
+- niri window streams are sized from the window's bounding box, which includes
+  client-side shadows and popups. The window is cropped out of that box by its
+  opaque pixels; a popup reaching past the window or a translucent window edge
+  fails with `CaptureFailed` instead of silently misaligning the image.

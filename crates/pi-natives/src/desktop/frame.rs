@@ -57,11 +57,16 @@ enum FrameKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FrameGeometry {
-	width:   u32,
-	height:  u32,
-	regions: Vec<FrameRegion>,
-	layout:  Vec<DisplayGeometry>,
-	kind:    FrameKind,
+	width:         u32,
+	height:        u32,
+	regions:       Vec<FrameRegion>,
+	layout:        Vec<DisplayGeometry>,
+	kind:          FrameKind,
+	/// Whether the pixels depend on the monitor layout. A compositor-rendered
+	/// window frame is the window's own buffer, so a monitor that moves,
+	/// rescales, or leaves the capture grant does not change what its pixels
+	/// mean.
+	display_bound: bool,
 }
 
 impl FrameGeometry {
@@ -91,14 +96,21 @@ impl FrameGeometry {
 				pixel_height: f64::from(d.pixel_height),
 			})
 			.collect();
-		Self { width, height, regions, layout: Vec::new(), kind: FrameKind::Desktop }
+		Self {
+			width,
+			height,
+			regions,
+			layout: Vec::new(),
+			kind: FrameKind::Desktop,
+			display_bound: true,
+		}
 	}
 
 	pub(crate) fn for_window(window: &DesktopWindow, px_width: u32, px_height: u32) -> Self {
 		Self {
-			width:   px_width,
-			height:  px_height,
-			regions: vec![FrameRegion {
+			width:         px_width,
+			height:        px_height,
+			regions:       vec![FrameRegion {
 				id:           window.id.clone(),
 				scale:        f64::from(px_width) / f64::from(window.width.max(1)),
 				x:            f64::from(window.x),
@@ -110,21 +122,37 @@ impl FrameGeometry {
 				pixel_width:  f64::from(px_width),
 				pixel_height: f64::from(px_height),
 			}],
-			layout:  Vec::new(),
-			kind:    FrameKind::Window {
+			layout:        Vec::new(),
+			kind:          FrameKind::Window {
 				captured_width:  window.width,
 				captured_height: window.height,
 			},
+			display_bound: true,
 		}
+	}
+
+	/// A window frame the compositor rendered from the window's own buffer,
+	/// independent of any monitor stream.
+	pub(crate) fn for_compositor_window(
+		window: &DesktopWindow,
+		px_width: u32,
+		px_height: u32,
+	) -> Self {
+		Self { display_bound: false, ..Self::for_window(window, px_width, px_height) }
+	}
+
+	pub(crate) const fn display_bound(&self) -> bool {
+		self.display_bound
 	}
 
 	pub(crate) const fn identity_global() -> Self {
 		Self {
-			width:   u32::MAX,
-			height:  u32::MAX,
-			regions: Vec::new(),
-			layout:  Vec::new(),
-			kind:    FrameKind::Identity,
+			width:         u32::MAX,
+			height:        u32::MAX,
+			regions:       Vec::new(),
+			layout:        Vec::new(),
+			kind:          FrameKind::Identity,
+			display_bound: true,
 		}
 	}
 
@@ -148,6 +176,9 @@ impl FrameGeometry {
 				"desktop layout changed while capturing; capture this target again",
 			));
 		}
+		if !self.display_bound {
+			return Ok(());
+		}
 		self.layout = displays
 			.iter()
 			.map(|display| DisplayGeometry {
@@ -165,6 +196,9 @@ impl FrameGeometry {
 	}
 
 	pub(crate) fn validate_layout(&self, displays: &[DesktopDisplay]) -> CoreResult<()> {
+		if !self.display_bound {
+			return Ok(());
+		}
 		if self.layout.len() != displays.len()
 			|| self
 				.layout
@@ -668,6 +702,30 @@ mod tests {
 			assert!(frame.validate_layout(&[first.clone(), changed]).is_err());
 		}
 		assert!(frame.validate_layout(std::slice::from_ref(&first)).is_err());
+	}
+
+	/// A compositor-rendered window frame keeps working when the monitor set
+	/// changes, e.g. a later desktop capture narrowed it to the portal grant,
+	/// while a window cropped out of monitor streams still has to recapture.
+	#[test]
+	fn compositor_window_frame_survives_monitor_layout_changes() {
+		let first = display(1.0);
+		let second =
+			DesktopDisplay { id: "2".to_string(), x: 500, is_primary: false, ..display(1.0) };
+		let both = [first.clone(), second];
+		let mut compositor = FrameGeometry::for_compositor_window(&window(0, 0), 800, 600);
+		compositor.record_layout(&both).unwrap();
+		assert!(
+			compositor
+				.validate_layout(std::slice::from_ref(&first))
+				.is_ok()
+		);
+		let mut cropped = FrameGeometry::for_window(&window(0, 0), 800, 600);
+		cropped.record_layout(&both).unwrap();
+		let err = cropped
+			.validate_layout(std::slice::from_ref(&first))
+			.unwrap_err();
+		assert_eq!(err.code.as_str(), "InvalidCoordinateFrame");
 	}
 
 	#[test]

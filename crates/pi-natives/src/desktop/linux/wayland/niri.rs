@@ -22,18 +22,16 @@
 //! is the compositor's render of that one window rather than a crop of
 //! whichever monitor happened to be selected.
 
-#[cfg(feature = "wayland-pipewire")]
-use std::os::fd::AsRawFd;
 use std::{
 	collections::{HashMap, HashSet},
 	fmt,
 	io::{self, Read, Write},
-	os::unix::net::UnixStream,
+	os::{fd::AsRawFd, unix::net::UnixStream},
 	path::PathBuf,
 	time::Duration,
 };
 
-#[cfg(feature = "wayland-pipewire")]
+#[cfg(any(feature = "wayland-pipewire", test))]
 use image::RgbaImage;
 use serde::{Deserialize, de::DeserializeOwned};
 use smallvec::{SmallVec, smallvec};
@@ -75,7 +73,11 @@ pub(super) const ID_PREFIX: &str = "niri:";
 const REPLY_LIMIT: usize = 8 * 1024 * 1024;
 
 /// Read and write deadline for one IPC exchange.
-const IPC_TIMEOUT: Duration = Duration::from_secs(2);
+///
+/// niri answers on its render loop, so a session under memory pressure can
+/// stall a reply for seconds; two seconds failed window listings on a loaded
+/// desktop that answered moments later.
+const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Deadline for the record/start exchange and for the node signal.
 #[cfg(feature = "wayland-pipewire")]
@@ -235,7 +237,12 @@ fn action_line(action: &serde_json::Value) -> Result<String, String> {
 }
 
 fn reply_error(variant: &str, fault: &ReplyFault) -> DesktopError {
-	DesktopError::capture_failed(format!("niri IPC {variant}: {fault}"))
+	let detail = format!("niri IPC {variant}: {fault}");
+	if fault.timed_out {
+		DesktopError::timeout(detail)
+	} else {
+		DesktopError::capture_failed(detail)
+	}
 }
 
 /// A mutation fault, once its request is on the wire.
@@ -261,10 +268,13 @@ struct ReplyFault {
 impl ReplyFault {
 	/// A socket that answered with nothing usable in time.
 	fn transport(operation: &str, err: &io::Error) -> Self {
-		Self {
-			timed_out: matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut),
-			detail:    format!("{operation}: {err}"),
-		}
+		let timed_out = matches!(err.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut);
+		let detail = if timed_out {
+			format!("{operation}: the compositor did not respond within {}s", IPC_TIMEOUT.as_secs())
+		} else {
+			format!("{operation}: {err}")
+		};
+		Self { timed_out, detail }
 	}
 
 	/// A reply or request that could not be encoded or decoded.
@@ -629,11 +639,24 @@ pub(super) struct NiriWindow {
 }
 
 /// Every window niri has open, or `None` when this session is not niri.
+///
+/// A window bridged from X11 carries its X client's pid, not the bridge's.
 pub(super) fn windows() -> CoreResult<Option<Vec<NiriWindow>>> {
 	if socket_path().is_none() {
 		return Ok(None);
 	}
-	Ok(Some(State::fetch()?.windows()))
+	let mut windows = State::fetch()?
+		.windows()
+		.into_iter()
+		.map(|entry| entry.window)
+		.collect::<Vec<_>>();
+	super::xwayland::resolve_client_pids(&mut windows);
+	Ok(Some(
+		windows
+			.into_iter()
+			.map(|window| NiriWindow { window })
+			.collect(),
+	))
 }
 
 /// Every enabled output, or `None` when this session is not niri.
@@ -708,7 +731,9 @@ pub(super) fn workspaces() -> CoreResult<Vec<DesktopWorkspace>> {
 pub(super) fn window_state(id: &str) -> CoreResult<DesktopWindowState> {
 	let state = live_state()?;
 	let window = window_id(id)?;
-	state.window_state(state.window(window)?)
+	let mut window_state = state.window_state(state.window(window)?)?;
+	super::xwayland::resolve_client_pids(std::slice::from_mut(&mut window_state.window));
+	Ok(window_state)
 }
 
 /// Focus one window, the native activation primitive behind `raise_window`.
@@ -1000,7 +1025,7 @@ pub(super) fn capture_window(id: &str) -> CoreResult<(RgbaImage, DesktopWindow)>
 			"niri window {id} was resized during capture; capture it again"
 		)));
 	}
-	verify_source(id, image.dimensions(), expected, descriptor.width, descriptor.height, scale)?;
+	let image = window_pixels(id, image, expected, descriptor.width, descriptor.height, scale)?;
 	Ok((image, current))
 }
 
@@ -1153,31 +1178,70 @@ fn scale_unknown(window: &IpcWindow) -> DesktopError {
 	))
 }
 
-/// Check the buffer against the geometry the compositor published.
+/// The window's own pixels out of a niri window cast buffer.
 ///
 /// niri sizes a window cast from the window's bounding box, which grows with
-/// popups and shadows and is not published over IPC, so a buffer that is not
-/// exactly the window cannot be cropped to it: the window's offset inside the
-/// buffer is unknown, and cropping would invent pixels. `Stream.Parameters` is
-/// no help either — niri reports the placeholder `(0,0)/(1,1)` for windows.
+/// client-side shadows and popups, and places the window geometry inside it at
+/// an offset it does not publish: IPC carries no bounding box, and
+/// `Stream.Parameters` reports the placeholder `(0,0)/(1,1)` for windows. The
+/// cast is negotiated with premultiplied alpha on a transparent background, so
+/// shadows are translucent while the window body is opaque. When the opaque
+/// pixels span exactly the window's extent, that span is the window. Anything
+/// else — a popup reaching past the window, a translucent window edge, a frame
+/// without alpha — fails closed instead of guessing an offset.
+///
+/// The result is opaque: premultiplied pixels with alpha forced to 255 are the
+/// window composited over black, the same pixels an alpha-less cast delivers.
 #[cfg(any(feature = "wayland-pipewire", test))]
-fn verify_source(
+fn window_pixels(
 	id: &str,
-	buffer: (u32, u32),
+	image: RgbaImage,
 	expected: (u32, u32),
 	width: u32,
 	height: u32,
 	scale: f64,
-) -> CoreResult<()> {
-	if buffer == expected {
-		return Ok(());
+) -> CoreResult<RgbaImage> {
+	let mut image = if image.dimensions() == expected {
+		image
+	} else {
+		let opaque = opaque_extent(&image);
+		let Some((x, y, ..)) = opaque.filter(|&(.., w, h)| (w, h) == expected) else {
+			let found = opaque.map_or_else(
+				|| "no opaque pixels".to_string(),
+				|(x, y, w, h)| format!("opaque pixels spanning {w}x{h} px at ({x},{y})"),
+			);
+			return Err(DesktopError::capture_failed(format!(
+				"niri window {id} rendered a {}x{} px buffer but the compositor reports \
+				 {width}x{height} logical px at scale {scale}, so {}x{} px was expected; the buffer \
+				 holds {found}, so the window's offset inside its bounding box is unknown. An open \
+				 popup or a translucent window edge causes this; close the popup and capture again",
+				image.width(),
+				image.height(),
+				expected.0,
+				expected.1
+			)));
+		};
+		image::imageops::crop_imm(&image, x, y, expected.0, expected.1).to_image()
+	};
+	for pixel in image.pixels_mut() {
+		pixel.0[3] = u8::MAX;
 	}
-	Err(DesktopError::capture_failed(format!(
-		"niri window {id} rendered a {}x{} px buffer but the compositor reports {width}x{height} \
-		 logical px at scale {scale}, so {}x{} px was expected; the buffer is sized from the window \
-		 bounding box, which grows with popups and shadows, and that box is not published",
-		buffer.0, buffer.1, expected.0, expected.1
-	)))
+	Ok(image)
+}
+
+/// Bounding box `(x, y, width, height)` of the fully opaque pixels.
+#[cfg(any(feature = "wayland-pipewire", test))]
+fn opaque_extent(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
+	let (mut left, mut top, mut right, mut bottom) = (u32::MAX, u32::MAX, 0, 0);
+	for (x, y, pixel) in image.enumerate_pixels() {
+		if pixel.0[3] == u8::MAX {
+			left = left.min(x);
+			top = top.min(y);
+			right = right.max(x + 1);
+			bottom = bottom.max(y + 1);
+		}
+	}
+	(right > left && bottom > top).then(|| (left, top, right - left, bottom - top))
 }
 
 #[cfg(feature = "wayland-pipewire")]
@@ -1337,8 +1401,7 @@ fn bus_error(err: zbus::Error) -> DesktopError {
 ///
 /// `SO_PEERCRED` reports the process on the far end of the socket, so this is
 /// the compositor itself rather than anything that merely forwarded the path.
-#[cfg(feature = "wayland-pipewire")]
-fn compositor_pid() -> CoreResult<u32> {
+pub(super) fn compositor_pid() -> CoreResult<u32> {
 	let Ipc { stream } = Ipc::connect()?;
 	let mut credentials = libc::ucred { pid: 0, uid: 0, gid: 0 };
 	let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -1386,7 +1449,7 @@ fn capture_frame(window: u64, id: &str) -> CoreResult<RgbaImage> {
 			})?
 	});
 	let frame = match node {
-		Ok(node) => super::capture::grab_pipewire_frame(node, None),
+		Ok(node) => super::capture::grab_pipewire_frame(node, None, super::capture::Formats::Alpha),
 		Err(err) => {
 			stop(runtime, &session);
 			return Err(err);
@@ -1595,23 +1658,68 @@ mod tests {
 		}
 	}
 
-	/// The buffer has to be the window: niri sizes it from a bounding box that
-	/// grows with popups and shadows, and that box is not published.
+	/// A window cast buffer: a translucent shadow everywhere outside the
+	/// window, and the window body at `origin` with `body_alpha`. Body pixels
+	/// encode their window-local position so a crop can be checked exactly.
+	fn cast_buffer(
+		buffer: (u32, u32),
+		origin: (u32, u32),
+		window: (u32, u32),
+		body_alpha: u8,
+	) -> RgbaImage {
+		RgbaImage::from_fn(buffer.0, buffer.1, |x, y| {
+			let inside = (origin.0..origin.0 + window.0).contains(&x)
+				&& (origin.1..origin.1 + window.1).contains(&y);
+			if inside {
+				image::Rgba([(x - origin.0) as u8, (y - origin.1) as u8, 7, body_alpha])
+			} else {
+				image::Rgba([0, 0, 0, 60])
+			}
+		})
+	}
+
+	/// A buffer that is exactly the window is returned whole, and a translucent
+	/// window comes back composited over black instead of see-through.
 	#[test]
-	fn capture_source_must_match_the_compositor_window_geometry() {
+	fn exact_cast_buffer_is_the_window_made_opaque() {
 		let expected = expected_pixels(954, 1044, 1.0).expect("scale 1 renders exactly");
 		assert_eq!(expected, (954, 1044));
-		verify_source("niri:47", (954, 1044), expected, 954, 1044, 1.0)
+		let cast = cast_buffer(expected, (0, 0), expected, 200);
+		let image = window_pixels("niri:47", cast, expected, 954, 1044, 1.0)
 			.expect("an exact buffer is the window");
-		// A fractional scale still has to line up.
-		let scaled = expected_pixels(1536, 864, 1.25).expect("1.25 scale");
-		assert_eq!(scaled, (1920, 1080));
-		verify_source("niri:47", (1920, 1080), scaled, 1536, 864, 1.25)
-			.expect("a scaled buffer is the window");
-		for grown in [(1000, 1044), (954, 1200), (800, 900)] {
-			let err = verify_source("niri:47", grown, expected, 954, 1044, 1.0)
-				.expect_err("a bounding-box buffer cannot be cropped to the window");
-			assert_eq!(err.code.as_str(), "CaptureFailed");
+		assert_eq!(image.dimensions(), expected);
+		assert_eq!(image.get_pixel(3, 5).0, [3, 5, 7, 255]);
+	}
+
+	/// Client-side shadows grow the cast buffer on every side, by amounts the
+	/// compositor does not publish; the opaque window body locates the window.
+	#[test]
+	fn shadow_margins_are_cropped_at_the_opaque_window() {
+		let cast = cast_buffer((80, 70), (16, 24), (40, 30), 255);
+		let image = window_pixels("niri:47", cast, (40, 30), 40, 30, 1.0)
+			.expect("a shadowed window is located by its opaque body");
+		assert_eq!(image.dimensions(), (40, 30));
+		assert_eq!(image.get_pixel(0, 0).0, [0, 0, 7, 255]);
+		assert_eq!(image.get_pixel(39, 29).0, [39, 29, 7, 255]);
+	}
+
+	/// Without an opaque extent that is exactly the window, the offset stays
+	/// unknown and nothing is cropped.
+	#[test]
+	fn unlocatable_windows_fail_closed() {
+		let mut popup = cast_buffer((80, 70), (16, 24), (40, 30), 255);
+		popup.put_pixel(2, 2, image::Rgba([9, 9, 9, 255]));
+		let translucent = cast_buffer((80, 70), (16, 24), (40, 30), 200);
+		let mut without_alpha = cast_buffer((80, 70), (16, 24), (40, 30), 255);
+		for pixel in without_alpha.pixels_mut() {
+			pixel.0[3] = 255;
+		}
+		for (name, cast) in
+			[("popup", popup), ("translucent", translucent), ("no alpha", without_alpha)]
+		{
+			let err = window_pixels("niri:47", cast, (40, 30), 40, 30, 1.0)
+				.expect_err("an unlocated window must not be cropped");
+			assert_eq!(err.code.as_str(), "CaptureFailed", "{name}");
 		}
 	}
 
@@ -1624,19 +1732,20 @@ mod tests {
 	fn fractional_window_extent_is_allocated_rounded_up() {
 		let expected = expected_pixels(957, 801, 1.25).expect("957x801 logical is a real window");
 		assert_eq!(expected, (1197, 1002), "niri ceils the edge it has to cover");
-		verify_source("niri:47", (1197, 1002), expected, 957, 801, 1.25)
+		let cast = cast_buffer(expected, (0, 0), expected, 255);
+		window_pixels("niri:47", cast, expected, 957, 801, 1.25)
 			.expect("the compositor's own allocation is the window");
 	}
 
-	/// One pixel short of the allocated extent is a bounding-box buffer just as
-	/// much as one past it, and neither can be cropped to the window because
-	/// the window's offset inside the buffer is not published.
+	/// An opaque buffer one pixel short of the allocated extent, or one past
+	/// it, has no opaque extent that is the window, so it is not cropped.
 	#[test]
-	fn bbox_buffers_around_the_allocated_extent_fail_closed() {
+	fn opaque_buffers_around_the_allocated_extent_fail_closed() {
 		let expected = expected_pixels(957, 801, 1.25).expect("957x801 logical is a real window");
 		for grown in [(1196, 1002), (1198, 1002)] {
-			let err = verify_source("niri:47", grown, expected, 957, 801, 1.25)
-				.expect_err("a bounding-box buffer cannot be cropped to the window");
+			let cast = cast_buffer(grown, (0, 0), grown, 255);
+			let err = window_pixels("niri:47", cast, expected, 957, 801, 1.25)
+				.expect_err("a buffer that is not the window cannot be cropped to it");
 			assert_eq!(err.code.as_str(), "CaptureFailed", "{grown:?}");
 		}
 	}

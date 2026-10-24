@@ -46,7 +46,9 @@ impl ScreenCastSession<'_> {
 	}
 }
 
-async fn portal_request<T>(request: impl std::future::Future<Output = Result<T, String>>) -> CoreResult<T> {
+async fn portal_request<T>(
+	request: impl std::future::Future<Output = Result<T, String>>,
+) -> CoreResult<T> {
 	super::libei::cancellable(tokio::time::timeout(PORTAL_TIMEOUT, request))
 		.await?
 		.map_err(|_| DesktopError::capture_failed("Wayland ScreenCast portal timed out"))?
@@ -55,7 +57,9 @@ async fn portal_request<T>(request: impl std::future::Future<Output = Result<T, 
 
 async fn open_screencast<'a>() -> CoreResult<ScreenCastSession<'a>> {
 	let portal = portal_request(async {
-		Screencast::new().await.map_err(|err| format!("ScreenCast portal: {err}"))
+		Screencast::new()
+			.await
+			.map_err(|err| format!("ScreenCast portal: {err}"))
 	})
 	.await?;
 	let session = portal_request(async {
@@ -89,9 +93,9 @@ async fn open_screencast<'a>() -> CoreResult<ScreenCastSession<'a>> {
 			.streams()
 			.iter()
 			.map(|stream| MonitorStream {
-				node: stream.pipe_wire_node_id(),
+				node:     stream.pipe_wire_node_id(),
 				position: stream.position(),
-				size: stream.size(),
+				size:     stream.size(),
 			})
 			.collect::<Vec<_>>();
 		if streams.is_empty() {
@@ -266,6 +270,46 @@ impl StreamUserData {
 	}
 }
 
+/// Pixel layouts a capture stream accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Formats {
+	/// Any packed RGB layout; a monitor stream is opaque.
+	Any,
+	/// Only layouts that carry alpha. A niri window cast offers `BGRx` before
+	/// `BGRA`, so a consumer that also accepts `BGRx` never sees which pixels
+	/// are translucent shadow and which are the window itself.
+	Alpha,
+}
+
+/// The `VideoFormat` choice for one [`Formats`] request.
+fn video_format_property(formats: Formats) -> spa::pod::Property {
+	use spa::param::video::VideoFormat as F;
+	match formats {
+		Formats::Any => spa::pod::property!(
+			spa::param::format::FormatProperties::VideoFormat,
+			Choice,
+			Enum,
+			Id,
+			F::BGRx,
+			F::BGRx,
+			F::BGRA,
+			F::RGBx,
+			F::RGBA,
+			F::RGB,
+			F::BGR
+		),
+		Formats::Alpha => spa::pod::property!(
+			spa::param::format::FormatProperties::VideoFormat,
+			Choice,
+			Enum,
+			Id,
+			F::BGRA,
+			F::BGRA,
+			F::RGBA
+		),
+	}
+}
+
 /// Grab one frame from every node over a single `PipeWire` connection.
 ///
 /// `remote` picks the connection: `Some` is a `ScreenCast` `PipeWire` remote
@@ -276,14 +320,18 @@ impl StreamUserData {
 ///
 /// The wait is bounded by [`CAPTURE_TIMEOUT`], and a single failing or missing
 /// stream fails the whole capture rather than returning a partial desktop.
-fn grab_pipewire_frames(nodes: &[u32], remote: Option<OwnedFd>) -> Result<Vec<RgbaImage>, String> {
+fn grab_pipewire_frames(
+	nodes: &[u32],
+	remote: Option<OwnedFd>,
+	formats: Formats,
+) -> Result<Vec<RgbaImage>, String> {
 	if nodes.is_empty() {
 		return Err("PipeWire capture needs at least one node".to_string());
 	}
 	control::check().map_err(|error| error.to_string())?;
 	pw::init();
-	let mainloop = pw::main_loop::MainLoopRc::new(None)
-		.map_err(|err| format!("PipeWire main loop: {err}"))?;
+	let mainloop =
+		pw::main_loop::MainLoopRc::new(None).map_err(|err| format!("PipeWire main loop: {err}"))?;
 	let context = pw::context::ContextRc::new(&mainloop, None)
 		.map_err(|err| format!("PipeWire context: {err}"))?;
 	let core = match remote {
@@ -310,19 +358,7 @@ fn grab_pipewire_frames(nodes: &[u32], remote: Option<OwnedFd>) -> Result<Vec<Rg
 			Id,
 			spa::param::format::MediaSubtype::Raw
 		),
-		spa::pod::property!(
-			spa::param::format::FormatProperties::VideoFormat,
-			Choice,
-			Enum,
-			Id,
-			spa::param::video::VideoFormat::BGRx,
-			spa::param::video::VideoFormat::BGRx,
-			spa::param::video::VideoFormat::BGRA,
-			spa::param::video::VideoFormat::RGBx,
-			spa::param::video::VideoFormat::RGBA,
-			spa::param::video::VideoFormat::RGB,
-			spa::param::video::VideoFormat::BGR
-		),
+		video_format_property(formats),
 		spa::pod::property!(
 			spa::param::format::FormatProperties::VideoSize,
 			Choice,
@@ -460,8 +496,12 @@ fn grab_pipewire_frames(nodes: &[u32], remote: Option<OwnedFd>) -> Result<Vec<Rg
 /// native compositor screencast feeds without a portal. A native capture must
 /// name the exact window node, because a second monitor would otherwise be
 /// cropped into a frame that belongs to somebody else's screen.
-pub(super) fn grab_pipewire_frame(node: u32, remote: Option<OwnedFd>) -> Result<RgbaImage, String> {
-	let mut frames = grab_pipewire_frames(&[node], remote)?;
+pub(super) fn grab_pipewire_frame(
+	node: u32,
+	remote: Option<OwnedFd>,
+	formats: Formats,
+) -> Result<RgbaImage, String> {
+	let mut frames = grab_pipewire_frames(&[node], remote, formats)?;
 	frames
 		.pop()
 		.ok_or_else(|| "PipeWire capture produced no frame".to_string())
@@ -477,9 +517,7 @@ pub(super) fn capture() -> CoreResult<Vec<(RgbaImage, super::PortalGeometry)>> {
 	let session = runtime.block_on(open_screencast())?;
 	let outcome = capture_streams(runtime, session);
 	control::check()?;
-	outcome.map_err(|err| {
-		DesktopError::capture_failed(format!("wayland screencast failed: {err}"))
-	})
+	outcome.map_err(|err| DesktopError::capture_failed(format!("wayland screencast failed: {err}")))
 }
 
 /// Refuse a multi-monitor capture whose streams cannot be placed.
@@ -539,7 +577,7 @@ fn grab_granted_streams(
 		.iter()
 		.map(|stream| stream.node)
 		.collect::<Vec<_>>();
-	grab_pipewire_frames(&nodes, Some(remote)).map(|frames| {
+	grab_pipewire_frames(&nodes, Some(remote), Formats::Any).map(|frames| {
 		frames
 			.into_iter()
 			.zip(&session.streams)
@@ -554,6 +592,10 @@ fn grab_granted_streams(
 			})
 			.collect()
 	})
+}
+
+pub(super) fn geometry() -> CoreResult<Vec<super::PortalGeometry>> {
+	capture().map(|frames| frames.into_iter().map(|(_, geometry)| geometry).collect())
 }
 
 #[cfg(test)]
@@ -669,15 +711,6 @@ mod tests {
 		let missing_size = MonitorStream { node: 46, position: Some((1920, 0)), size: None };
 		assert!(placeable_monitors(&[monitor(44, Some((0, 0))), missing_size]).is_err());
 	}
-}
-
-pub(super) fn geometry() -> CoreResult<Vec<super::PortalGeometry>> {
-	capture().map(|frames| frames.into_iter().map(|(_, geometry)| geometry).collect())
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
 
 	#[test]
 	fn cancelled_geometry_refresh_never_opens_a_portal_session() {
@@ -686,5 +719,25 @@ mod tests {
 		source.cancel();
 		let result = control::with_token_for_test(&token, geometry);
 		assert_eq!(result.unwrap_err().code, token.check().unwrap_err().code);
+	}
+
+	/// A window cast that negotiated `BGRx` loses the alpha that tells the
+	/// window body from its shadow, so the alpha request offers nothing else.
+	#[test]
+	fn alpha_request_offers_only_formats_with_alpha() {
+		use pw::spa::{
+			pod::{ChoiceValue, Value},
+			utils::{Choice, ChoiceEnum},
+		};
+		let Value::Choice(ChoiceValue::Id(Choice(_, ChoiceEnum::Enum { default, alternatives }))) =
+			video_format_property(Formats::Alpha).value
+		else {
+			panic!("the video format is an enumerated choice");
+		};
+		for id in std::iter::once(default).chain(alternatives) {
+			let format = VideoFormat::from_raw(id.0);
+			let layout = PixelLayout::new(format).expect("an offered format converts");
+			assert!(layout.alpha.is_some(), "{format:?} carries no alpha");
+		}
 	}
 }
