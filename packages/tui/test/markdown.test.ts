@@ -189,6 +189,39 @@ describe("Markdown component", () => {
 			expect(plainLines.join("")).toContain("x");
 		});
 
+		it("renders a table inside an ordered list item under its continuation indent", () => {
+			const source = `10. **Keep:**
+
+    | Part | Why |
+    |---|---|
+    | pi | MIT |
+11. Next item`;
+			const markdown = new Markdown(source, 0, 0, defaultMarkdownTheme);
+			const lines = markdown.render(30).map(line => stripVTControlCharacters(line).trimEnd());
+
+			expect(lines[0]).toBe("10. Keep:");
+			expect(lines.filter(line => line.startsWith("    |"))).toHaveLength(2);
+			expect(lines.some(line => line.includes("pi") && line.includes("MIT"))).toBe(true);
+			expect(lines.at(-1)).toBe("11. Next item");
+			expect(lines.every(line => visibleWidth(line) <= 30)).toBe(true);
+		});
+
+		it("keeps a narrow list-item table visible as raw markdown", () => {
+			const source = `10. Keep:
+
+    | Part | Why |
+    |---|---|
+    | pi | MIT |`;
+			const lines = new Markdown(source, 0, 0, defaultMarkdownTheme)
+				.render(10)
+				.map(line => stripVTControlCharacters(line).trimEnd());
+
+			expect(lines[0]).toBe("10. Keep:");
+			expect(lines.slice(1).join("\n")).toContain("Part");
+			expect(lines.slice(1).join("\n")).toContain("MIT");
+			expect(lines.every(line => visibleWidth(line) <= 10)).toBe(true);
+		});
+
 		it("should maintain numbering when code blocks are not indented (LLM output)", () => {
 			// When code blocks aren't indented, marked parses each item as a separate list.
 			// We use token.start to preserve the original numbering.
@@ -1701,6 +1734,63 @@ bar`,
 				expect(line.split(`\x1b]8;;${url}\x07`)).toHaveLength(2);
 				expect(line.match(/\x1b\]8;;\x07/g)).toHaveLength(1);
 				expect(new Set(inspectHyperlinks(line).targets.filter(target => target !== null))).toEqual(new Set([url]));
+			}
+		});
+
+		it("links every wrapped fragment of a URL in a fenced code block, and only when hyperlinks are on (issue #12321)", () => {
+			const url =
+				"https://example.com/very/long/path/segment-one/segment-two/segment-three/segment-four?query=value&another=value";
+			const text = `\`\`\`\n${url}\n\`\`\``;
+			// Highlighters can split a URL across several SGR spans; the link must span them all.
+			const highlighted = {
+				...defaultMarkdownTheme,
+				highlightCode: (code: string): string[] =>
+					code.split("\n").map(line => `\x1b[32m${line.slice(0, 30)}\x1b[39m\x1b[33m${line.slice(30)}\x1b[39m`),
+			};
+
+			for (const theme of [defaultMarkdownTheme, highlighted]) {
+				clearRenderCache();
+				const lines = new Markdown(text, 0, 0, theme).render(40);
+				const fragments = lines.filter(line => inspectHyperlinks(line).targets.includes(url));
+				expect(fragments.length).toBeGreaterThan(2);
+				for (const line of fragments) {
+					const { visible, targets } = inspectHyperlinks(line);
+					expect(line.split(`\x1b]8;;${url}\x07`)).toHaveLength(2);
+					expect(line.match(/\x1b\]8;;\x07/g)).toHaveLength(1);
+					expect(visible.length).toBeLessThanOrEqual(40);
+					for (let i = 0; i < visible.length; i++) {
+						if (visible[i] !== " ") expect(targets[i]).toBe(url);
+					}
+				}
+				const linkedText = fragments.map(line => inspectHyperlinks(line).visible.trimEnd()).join("");
+				expect(linkedText).toBe(url);
+
+				terminalState.hyperlinks = false;
+				try {
+					clearRenderCache();
+					const plainLines = new Markdown(text, 0, 0, theme).render(40);
+					expect(plainLines.join("")).not.toContain("\x1b]8;");
+					expect(plainLines.map(line => inspectHyperlinks(line).visible)).toEqual(
+						lines.map(line => inspectHyperlinks(line).visible),
+					);
+				} finally {
+					terminalState.hyperlinks = true;
+				}
+			}
+		});
+
+		it("leaves an unbalanced closing bracket after a code-block URL out of the link", () => {
+			const cases = [
+				["urls = [https://a.com/x]", "https://a.com/x"],
+				["{https://a.com/x}", "https://a.com/x"],
+				["(https://a.com/x),", "https://a.com/x"],
+				["https://a.com/w[1]", "https://a.com/w[1]"],
+			] as const;
+			for (const [code, target] of cases) {
+				clearRenderCache();
+				const lines = new Markdown(`\`\`\`\n${code}\n\`\`\``, 0, 0, defaultMarkdownTheme).render(80);
+				const targets = lines.flatMap(line => inspectHyperlinks(line).targets).filter(t => t !== null);
+				expect(new Set(targets)).toEqual(new Set([target]));
 			}
 		});
 

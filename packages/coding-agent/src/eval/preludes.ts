@@ -1,15 +1,16 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { untilAborted } from "@oh-my-pi/pi-utils";
 import type { ToolSession } from "../tools";
 import {
+	approvalRestrictions,
 	denyError,
 	requestApproval,
 	resolveApproval,
 	resolveApprovalFromContext,
 	type ToolApproval,
 } from "../tools/approval";
-import type { AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 
 /** Host context supplied when an eval prelude calls back out of its language VM. */
 export interface EvalPreludeContext {
@@ -148,12 +149,21 @@ async function approvePreludeInvocation(
 	// Fourth execute-time site: same helper as wrapper/cursor/mcp so a missing
 	// context cannot silently yolo. Empty `context.context` fail-closes;
 	// omitting it inherits the live session settings (schema default yolo).
+	const settings = context.context?.settings ?? context.session.settings;
 	const { approvalMode: mode, userPolicies: policies } = resolveApprovalFromContext(
-		context.context ?? (context.session.settings ? { settings: context.session.settings } : undefined),
+		context.context ?? (settings ? { settings } : undefined),
 	);
 	const subject: { name: string; approval?: ToolApproval } = { name: definition.name };
 	if (definition.approval !== undefined) subject.approval = definition.approval;
-	const resolved = resolveApproval(subject, parameters, mode, policies);
+	// A prelude names no path of its own, so a restricted folder matches it by the session's directory.
+	const resolved = resolveApproval(
+		subject,
+		parameters,
+		mode,
+		policies,
+		undefined,
+		approvalRestrictions(settings, context.session.cwd),
+	);
 	if (resolved.policy === "deny") throw denyError(resolved, definition.name);
 	if (resolved.policy !== "prompt") return;
 

@@ -23,10 +23,10 @@ the next launch, and the feature flag has to live in the binary. The
 ## Prerequisites
 
 - Bun at or above the `engines.bun` minimum in
-  `packages/coding-agent/package.json`, currently `>= 1.3.14`.
+  `packages/coding-agent/package.json`, currently `>= 1.4.4`.
 - The Rust toolchain pinned by `rust-toolchain.toml`.
 - `pkg-config`, Clang, and the PipeWire development libraries.
-- On NixOS, `nix develop path:.` loads the pinned tools and native libraries.
+- On NixOS, `nix develop .` loads the pinned tools and native libraries.
 - Linux voice mode uses PulseAudio client libraries with `pipewire-pulse`, or
   ALSA. The Nix shell supplies both and `patchelf`; local native builds retain
   their paths through `OMP_NATIVE_RUNTIME_LIBRARY_PATH` before embedding.
@@ -35,7 +35,7 @@ On NixOS, enter the development shell first so dependency installation and the
 build use the pinned Bun, Rust toolchain, and PipeWire libraries:
 
 ```sh
-nix develop path:.
+nix develop .
 bun install --frozen-lockfile --ignore-scripts
 ```
 
@@ -84,7 +84,7 @@ hosts without AVX2 loading an AVX2 binary. The fork's
 
 **Bun runtime.** The standalone binary embeds the Bun used to compile it.
 `packages/coding-agent/package.json` declares the minimum version. The project
-Nix development shell supplies Bun 1.4.2; check `bun --version` before building.
+Nix development shell supplies Bun 1.4.4; check `bun --version` before building.
 
 ## Verify
 

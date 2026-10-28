@@ -23,6 +23,7 @@ import { runInProcessTab } from "./in-process-run";
 import { browserConnection, DEFAULT_VIEWPORT } from "./launch";
 import {
 	closeCdpTarget,
+	closeRelayTarget,
 	forgetSharedTarget,
 	forgetSharedTargets,
 	recordSharedTarget,
@@ -146,6 +147,8 @@ export interface WorkerTabSession extends TabSessionBase<PuppeteerBrowserHandle>
 	workerExitedAt?: number;
 	/** Set when a worker exited with no run in flight and the tab was reattached; the next call reports it. */
 	workerExitNotice?: string;
+	/** The tab was opened with `ignore_https_errors`; a replacement worker re-applies it. */
+	ignoreHttpsErrors?: boolean;
 }
 
 export interface CmuxTabSession extends TabSessionBase<CmuxBrowserHandle> {
@@ -626,6 +629,7 @@ async function acquireTabImpl(
 		lastActivityAt: Date.now(),
 		frozen: false,
 		uploadDir: initPayload.uploadDir,
+		ignoreHttpsErrors: opts.ignoreHttpsErrors,
 	};
 	attachTabWorker(tab, worker);
 	tabs.set(name, tab);
@@ -1099,8 +1103,8 @@ async function runInTabWithSnapshot(
 					error.when === "during" ? "; input this call sent before the detach may already have landed" : "";
 				// Host tool calls the detached run started would otherwise keep running, and reply to the new worker.
 				for (const ctrl of pending.toolCalls.values()) ctrl.abort(error);
-				// Both paths below kill an inline worker's tab, and its `terminate()` is a no-op: without the close
-				// handshake its core keeps its relay connection and could claim the tab again once it is re-announced.
+				// Both paths below kill an inline worker's tab. Close its core first: the close finalizes an active
+				// recording, which the kill's `terminate()` (it only drops the relay connection) would leave unfinished.
 				if (tab.worker.mode === "inline" && tabs.get(name) === tab && tab.state === "alive") {
 					const closed = waitForClosed(tab).catch(() => undefined);
 					safeSend(tab, { type: "close" });
@@ -1416,12 +1420,10 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 }
 
 /**
- * Release every managed tab. Never throws: a tab whose close failed — a refused
- * or unreachable relay outlives every tab queued behind it otherwise — is
- * logged and the sweep continues, returning the count of tabs that actually
- * closed. Each release already terminated its worker, dropped its map entry,
- * and released its browser hold, so the tab is gone either way and only the
- * close went unconfirmed.
+ * Release every managed tab. Never throws: cleanup failures are logged so one
+ * tab cannot strand the workers and browser holds queued behind it. Returns
+ * successful releases, including owned pages whose close remains unconfirmed;
+ * those warn and retain their staged uploads for the stale-folder sweep.
  */
 export async function releaseAllTabs(opts: ReleaseTabOptions = {}): Promise<number> {
 	const names = [...tabs.keys()];
@@ -1457,9 +1459,8 @@ export async function dropHeadlessTabs(): Promise<void> {
  * creator. Tabs opened with no owner (e.g. from an SDK caller that doesn't
  * identify a session) are skipped and must be released explicitly.
  *
- * Never throws for the same reason as {@link releaseAllTabs}: a tab whose close
- * failed is logged and skipped so the session's remaining tabs still release,
- * and the returned count covers only the tabs that actually closed.
+ * Never throws for the same reason as {@link releaseAllTabs}; the returned
+ * count covers successful releases, not confirmed physical page closes.
  */
 export async function releaseTabsForOwner(ownerId: string, opts: ReleaseTabOptions = {}): Promise<number> {
 	if (!ownerId) return 0;
@@ -2074,6 +2075,8 @@ async function recycleTimedOutWorkerTab(
 		page: { kind: tab.ownsPage ? "owned" : "borrowed", targetId: tab.targetId },
 		dialogs: tab.dialogPolicy,
 		allowedDomains: tab.allowedDomains,
+		// The override's CDP session died with the old worker.
+		ignoreHttpsErrors: tab.ignoreHttpsErrors,
 		// Unblock a wedged page (open JS dialog, hung navigation) before adopting it —
 		// otherwise init stalls, times out, and the tab gets force-killed.
 		recover: opts.recover ?? true,
@@ -2215,19 +2218,7 @@ async function closeTargetById(
 ): Promise<boolean> {
 	if (browser.kind.kind === "relay") {
 		if (!browser.browser.connected) return false;
-		try {
-			const result = await browserConnection(browser.browser).send("Target.closeTarget", { targetId });
-			return result.success;
-		} catch (error) {
-			if (
-				!(error instanceof Error) ||
-				(!error.message.endsWith(`No target with id ${targetId}`) &&
-					!error.message.endsWith("No target with given id found"))
-			) {
-				throw error;
-			}
-			return true;
-		}
+		return await closeRelayTarget(browserConnection(browser.browser), targetId);
 	}
 	return await closeCdpTarget(browser.browser, targetId, confirmTimeoutMs);
 }
@@ -2449,9 +2440,12 @@ function wrapBunWorker(worker: Worker): WorkerHandle {
 async function spawnInlineWorker(): Promise<WorkerHandle> {
 	const hostListeners = new Set<(message: WorkerOutbound) => void>();
 	const workerListeners = new Set<(message: WorkerInbound) => void>();
+	let terminated = false;
 	const workerTransport: Transport = {
 		send: msg =>
 			queueMicrotask(() => {
+				// A terminated worker thread reports nothing more; neither does a terminated core.
+				if (terminated) return;
 				for (const listener of hostListeners) listener(msg as WorkerOutbound);
 			}),
 		onMessage: handler => {
@@ -2462,7 +2456,7 @@ async function spawnInlineWorker(): Promise<WorkerHandle> {
 		close: () => {},
 	};
 	const { WorkerCore } = await import("./tab-worker");
-	new WorkerCore(workerTransport, false);
+	const core = new WorkerCore(workerTransport, false);
 	return {
 		mode: "inline",
 		send: msg =>
@@ -2476,7 +2470,8 @@ async function spawnInlineWorker(): Promise<WorkerHandle> {
 		onError: () => () => {},
 		onExit: () => () => {},
 		async terminate() {
-			for (const listener of workerListeners) listener({ type: "close" });
+			terminated = true;
+			core.terminate();
 		},
 	};
 }

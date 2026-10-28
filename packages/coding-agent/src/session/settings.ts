@@ -31,6 +31,25 @@ const EMPTY_NUMBER_RECORD: Record<string, number> = {};
 const EMPTY_STRING_ARRAYS_RECORD: Record<string, string[]> = {};
 const DEFAULT_TOOL_CALL_LOOP_EXEMPT_TOOLS: string[] = ["wait"];
 
+/** Scope of the resume picker's current-folder list. */
+export const cfgSessionWorktreeScope = register({
+	id: "session.worktreeScope",
+	type: "enum",
+	values: ["directory", "repo"] as const,
+	default: "repo",
+	ui: {
+		tab: "interaction",
+		group: "Startup & Updates",
+		label: "Resume Worktree Scope",
+		description:
+			"Choose whether the resume picker's current folder includes sessions from other repository worktrees",
+		options: [
+			{ value: "directory", label: "This Directory", description: "Only sessions saved for this directory" },
+			{ value: "repo", label: "Repository Worktrees", description: "Also include sessions from sibling worktrees" },
+		],
+	},
+});
+
 // Power assertions: macOS IOKit, Linux login1/ScreenSaver, Windows execution state.
 export const cfgPowerSleepPrevention = register({
 	id: "power.sleepPrevention",
@@ -42,7 +61,7 @@ export const cfgPowerSleepPrevention = register({
 		group: "Power",
 		label: "Sleep Prevention",
 		description:
-			"Prevent the system sleeping during active sessions. Each level is cumulative — it adds the flags of all lower levels.",
+			"Prevent the system sleeping while the agent is running a turn; an idle session, including one waiting on background jobs, does not hold it. Each level is cumulative — it adds the flags of all lower levels.",
 		options: [
 			{
 				value: "off",
@@ -52,7 +71,7 @@ export const cfgPowerSleepPrevention = register({
 			{
 				value: "idle",
 				label: "Prevent Idle Sleep",
-				description: "Keep the system awake while a session is open (macOS `caffeinate -i`)",
+				description: "Keep the system awake while the agent is running a turn (macOS `caffeinate -i`)",
 			},
 			{
 				value: "display",
@@ -765,6 +784,19 @@ export const cfgRetryFallbackOn = register({
 	},
 });
 
+export const cfgRetryRateLimitWalksChain = register({
+	id: "retry.rateLimitWalksChain",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "model",
+		group: "Retry & Fallback",
+		label: "Rate Limit Walks Chain",
+		description:
+			"On a rate limit, do not hold the retry.fallbackChains walk for a turn whose thinking is signed by the failing model. Off (the default), such a turn keeps retrying the rate-limited model until retry.maxRetries is spent before the chain is reached.",
+	},
+});
+
 export const cfgRetryUsageAwareFallback = register({
 	id: "retry.usageAwareFallback",
 	type: "boolean",
@@ -873,6 +905,7 @@ export const cfgRetry = combine({
 	waitForUsageReset: cfgRetryWaitForUsageReset,
 	modelFallback: cfgRetryModelFallback,
 	fallbackOn: cfgRetryFallbackOn,
+	rateLimitWalksChain: cfgRetryRateLimitWalksChain,
 	usageAwareFallback: cfgRetryUsageAwareFallback,
 	usageReservePct: cfgRetryUsageReservePct,
 	usageReservePolicy: cfgRetryUsageReservePolicy,
@@ -1481,4 +1514,28 @@ export const cfgThinkingBudgets = combine({
 	high: cfgThinkingBudgetsHigh,
 	xhigh: cfgThinkingBudgetsXhigh,
 	max: cfgThinkingBudgetsMax,
+});
+
+/** Rejects a cost threshold that is not a positive USD amount. */
+function validateCostThreshold(id: string): (raw: unknown) => void {
+	return raw => {
+		if (raw === undefined || raw === null || (typeof raw === "number" && Number.isFinite(raw) && raw > 0)) return;
+		throw new Error(`Invalid ${id}: expected a positive USD amount, got ${Bun.inspect(raw)}.`);
+	};
+}
+
+/** Session-tree spend (USD) at which omp warns once; `--warn-cost` overrides it for one run. */
+export const cfgSessionWarnCost = register({
+	id: "session.warnCost",
+	type: "number",
+	default: undefined,
+	validate: validateCostThreshold("session.warnCost"),
+});
+
+/** Session-tree spend (USD) at which omp stops sending model requests; `--max-cost` overrides it for one run. */
+export const cfgSessionMaxCost = register({
+	id: "session.maxCost",
+	type: "number",
+	default: undefined,
+	validate: validateCostThreshold("session.maxCost"),
 });

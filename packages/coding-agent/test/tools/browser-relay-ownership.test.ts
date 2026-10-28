@@ -80,14 +80,15 @@ const FAILING_TARGET = "PAGEANON00000009.1";
 const BORROWED_TARGET = "PAGEANON00000009.2";
 const CLEAN_TARGET = "PAGEANON00000009.3";
 
-/** Relay handle whose root CDP connection answers `Target.closeTarget` from `close`. */
-function makeRelayHandle(close: (targetId: string) => Promise<unknown>): RelayHandle {
+/** Relay root connection: target info includes known tabs even while their extension is offline. */
+function makeRelayHandle(close: (targetId: string) => Promise<unknown>, targetExists = true): RelayHandle {
 	const commands: RootCommand[] = [];
 	const send = async (method: string, params?: Record<string, unknown>): Promise<unknown> => {
 		commands.push({ method, params });
-		if (method !== "Target.closeTarget") throw new Error(`Unexpected relay command ${method}`);
 		const targetId = String(params?.targetId ?? "");
-		return await close(targetId);
+		if (method === "Target.closeTarget") return await close(targetId);
+		if (method === "Target.getTargetInfo") return { targetInfo: { targetId: targetExists ? targetId : "browser" } };
+		throw new Error(`Unexpected relay command ${method}`);
 	};
 	let disconnects = 0;
 	const browser = {
@@ -187,33 +188,42 @@ describe("relay tab ownership on managed close", () => {
 		expect(handle.disconnects()).toBe(1);
 	});
 
-	it("surfaces a relay refusal instead of reporting a clean close", async () => {
-		// A refusal means the owned tab outlived its release. Swallowing it
-		// tells the agent the tab is gone while Chrome still shows it.
+	it("releases the worker when a relay refusal leaves its owned page unconfirmed", async () => {
+		// The upstream lifecycle warns rather than blocking release; target info
+		// still identifies the page, so cleanup must not claim its uploads are unused.
 		const handle = makeRelayHandle(() => Promise.reject(new Error("Refusing to close a borrowed user tab")));
 		const name = register(makeRelayTab(`relay-refused-${process.pid}`, handle, true));
 
-		await expect(releaseTab(name, { kill: false })).rejects.toThrow("Refusing to close a borrowed user tab");
-		expect(handle.commands).toEqual([{ method: "Target.closeTarget", params: { targetId: TARGET_ID } }]);
+		expect(await releaseTab(name, { kill: false })).toBe(true);
+		expect(handle.commands).toEqual([
+			{ method: "Target.closeTarget", params: { targetId: TARGET_ID } },
+			{ method: "Target.getTargetInfo", params: { targetId: TARGET_ID } },
+		]);
 		expect(getTabsMapForTest().has(name)).toBe(false);
 	});
 
 	it("treats an owned target the relay already forgot as a completed close", async () => {
-		// The worker closed the page through the page session before the root
-		// connection was asked; the relay answers "no such target", which is
-		// the desired end state rather than a cleanup failure.
-		const handle = makeRelayHandle(targetId => Promise.reject(new Error(`No target with id ${targetId}`)));
+		// The worker closed the page before the root connection was asked.
+		// Confirm the missing target through getTargetInfo, not the close error.
+		const handle = makeRelayHandle(targetId => Promise.reject(new Error(`No target with id ${targetId}`)), false);
 		const name = register(makeRelayTab(`relay-missing-${process.pid}`, handle, true));
 
 		expect(await releaseTab(name, { kill: false })).toBe(true);
-		expect(handle.commands).toEqual([{ method: "Target.closeTarget", params: { targetId: TARGET_ID } }]);
+		expect(handle.commands).toEqual([
+			{ method: "Target.closeTarget", params: { targetId: TARGET_ID } },
+			{ method: "Target.getTargetInfo", params: { targetId: TARGET_ID } },
+		]);
 	});
 
-	it("reports an unknown relay failure rather than claiming the tab closed", async () => {
+	it("releases the worker when its offline extension leaves the owned page unconfirmed", async () => {
 		const handle = makeRelayHandle(() => Promise.reject(new Error("relay extension is not connected")));
 		const name = register(makeRelayTab(`relay-offline-${process.pid}`, handle, true));
 
-		await expect(releaseTab(name, { kill: false })).rejects.toThrow("relay extension is not connected");
+		expect(await releaseTab(name, { kill: false })).toBe(true);
+		expect(handle.commands).toEqual([
+			{ method: "Target.closeTarget", params: { targetId: TARGET_ID } },
+			{ method: "Target.getTargetInfo", params: { targetId: TARGET_ID } },
+		]);
 	});
 
 	it("removes staged uploads only after the owned page close succeeds", async () => {
@@ -288,12 +298,15 @@ describe("relay batch release", () => {
 		register(makeRelayTab("relay-batch-borrowed", borrowed, false, BORROWED_TARGET, workers[1]!));
 		register(makeRelayTab("relay-batch-clean", clean, true, CLEAN_TARGET, workers[2]!));
 
-		// Count reports only the tabs that actually closed; the borrowed tab is
-		// released without ever asking the relay to close it.
-		expect(await releaseAllTabs({ kill: false })).toBe(2);
+		// Count reports released workers, including an owned page whose physical
+		// close remains unconfirmed. Borrowed pages are never sent a close.
+		expect(await releaseAllTabs({ kill: false })).toBe(3);
 		expect(getTabsMapForTest().size).toBe(0);
 		for (const worker of workers) expect(worker.terminations).toBe(1);
-		expect(failing.commands).toEqual([{ method: "Target.closeTarget", params: { targetId: FAILING_TARGET } }]);
+		expect(failing.commands).toEqual([
+			{ method: "Target.closeTarget", params: { targetId: FAILING_TARGET } },
+			{ method: "Target.getTargetInfo", params: { targetId: FAILING_TARGET } },
+		]);
 		expect(borrowed.commands).toEqual([]);
 		expect(clean.commands).toEqual([{ method: "Target.closeTarget", params: { targetId: CLEAN_TARGET } }]);
 		for (const handle of [failing, borrowed, clean]) {
@@ -309,7 +322,7 @@ describe("relay batch release", () => {
 		register(makeRelayTab("relay-owner-failing", failing, true, FAILING_TARGET, worker));
 		register(makeRelayTab("relay-owner-borrowed", borrowed, false, BORROWED_TARGET));
 
-		expect(await releaseTabsForOwner("session-relay-ownership", { kill: false })).toBe(1);
+		expect(await releaseTabsForOwner("session-relay-ownership", { kill: false })).toBe(2);
 		expect(getTabsMapForTest().size).toBe(0);
 		expect(worker.terminations).toBe(1);
 		expect(borrowed.commands).toEqual([]);

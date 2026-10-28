@@ -43,6 +43,7 @@ type FakeEditor = {
 	clearCustomKeyHandlers(): void;
 	spaceHold: SpaceHoldGesture;
 	pasteText(text: string): void;
+	handleInput?(data: string): void;
 	imageLinks?: (string | undefined)[];
 	pendingImages: ImageContent[];
 	pendingImageLinks: (string | undefined)[];
@@ -72,6 +73,7 @@ async function createContext() {
 		"app.thinking.toggle": ["ctrl+t"],
 		"app.history.search": ["ctrl+r"],
 		"app.editor.external": ["ctrl+g"],
+		"app.local.open": ["alt+g"],
 		"app.model.selectTemporary": ["ctrl+y"],
 		"app.model.select": ["alt+m"],
 		"app.retry": ["alt+r"],
@@ -167,6 +169,7 @@ async function createContext() {
 	focused = editor;
 	const ctx = {
 		editor: editor as unknown as InteractiveModeContext["editor"],
+		syncIdleMaintenanceView: vi.fn(),
 		resetDisplayAfterAppearanceRefresh,
 		ui: {
 			requestRender,
@@ -311,6 +314,23 @@ function dispatchEnhancedImagePaste(listeners: InputListener[], png: Uint8Array)
 		packet("type=read:status=DONE"),
 		packet("type=read:status=OK"),
 		packet(`type=read:status=DATA:mime=${imageMime}`, Buffer.from(png).toString("base64")),
+		packet("type=read:status=DONE"),
+	]) {
+		dispatchInput(listeners, input);
+	}
+}
+
+/** Replay a kitty OSC 5522 enhanced paste that offers and delivers plain `text`. */
+function dispatchEnhancedTextPaste(listeners: InputListener[], text: string): void {
+	const packet = (metadata: string, payload?: string) =>
+		`\x1b]5522;${metadata}${payload === undefined ? "" : `;${payload}`}\x1b\\`;
+	const textMime = Buffer.from("text/plain").toString("base64");
+	for (const input of [
+		packet("type=read:status=OK:pw=secret"),
+		packet(`type=read:status=DATA:mime=${textMime}`),
+		packet("type=read:status=DONE"),
+		packet("type=read:status=OK"),
+		packet(`type=read:status=DATA:mime=${textMime}`, Buffer.from(text).toString("base64")),
 		packet("type=read:status=DONE"),
 	]) {
 		dispatchInput(listeners, input);
@@ -534,6 +554,36 @@ describe("InputController keybinding setup", () => {
 		expect(result).toEqual({ consume: true });
 		expect(await pasted).toBe("sk-test-key");
 		expect(focusedPasteText).toHaveBeenCalledWith("sk-test-key");
+	});
+
+	it("delivers an enhanced text paste to a focused dialog without pasteText as a bracketed paste", async () => {
+		const { promise: received, resolve: resolveReceived } = Promise.withResolvers<string>();
+		const handleInput = vi.fn((data: string) => {
+			resolveReceived(data);
+		});
+		const { InputController, ctx, editor, setFocused, spies } = await createContext();
+		setFocused({ handleInput });
+		new InputController(ctx).setupKeyHandlers();
+
+		dispatchEnhancedTextPaste(registeredInputListeners(spies.addInputListener), "sk-test-key");
+
+		expect(await received).toBe("\x1b[200~sk-test-key\x1b[201~");
+		expect(editor.getText()).toBe("");
+	});
+
+	it("delivers an enhanced text paste to the main editor as a bracketed paste so image paths attach", async () => {
+		const { promise: received, resolve: resolveReceived } = Promise.withResolvers<string>();
+		const { InputController, ctx, editor, spies } = await createContext();
+		editor.handleInput = vi.fn((data: string) => {
+			resolveReceived(data);
+		});
+		new InputController(ctx).setupKeyHandlers();
+
+		const path = "/tmp/Screenshot\\ 2026-10-19\\ at\\ 14.25.32.png";
+		dispatchEnhancedTextPaste(registeredInputListeners(spies.addInputListener), path);
+
+		expect(await received).toBe(`\x1b[200~${path}\x1b[201~`);
+		expect(editor.getText()).toBe("");
 	});
 
 	it("rejects image smart-paste while a login input is focused instead of mutating the hidden editor", async () => {
@@ -1014,6 +1064,7 @@ describe("InputController global editor actions", () => {
 	const CTRL_G = "\x07";
 	const CTRL_SHIFT_O = "\x1b[111;6u";
 	const ALT_L = "\x1bl";
+	const ALT_G = "\x1bg";
 
 	beforeAll(async () => {
 		await initTheme(false);
@@ -1114,6 +1165,35 @@ describe("InputController global editor actions", () => {
 
 		expect(dispatchInput(listeners, CTRL_G)).toBeUndefined();
 		expect(openExternalEditor).not.toHaveBeenCalled();
+	});
+
+	it("opens the local:// file picker on Alt+G but not while a hook selector is focused", async () => {
+		const context = await createContext();
+		const controller = new context.InputController(context.ctx);
+		const openLocalFilePicker = vi.spyOn(controller, "openLocalFilePicker").mockResolvedValue();
+		controller.setupKeyHandlers();
+		const listeners = registeredInputListeners(context.spies.addInputListener);
+
+		expect(dispatchInput(listeners, ALT_G)).toEqual({ consume: true });
+		expect(openLocalFilePicker).toHaveBeenCalledTimes(1);
+
+		// A second Alt+G while the picker is up must not stack another picker.
+		const selector = {};
+		context.ctx.hookSelector = selector as InteractiveModeContext["hookSelector"];
+		context.setFocused(selector);
+		expect(dispatchInput(listeners, ALT_G)).toBeUndefined();
+		expect(openLocalFilePicker).toHaveBeenCalledTimes(1);
+	});
+
+	it("refuses Alt+G when collabGuest is active", async () => {
+		const context = await createContext();
+		context.ctx.collabGuest = {} as unknown as InteractiveModeContext["collabGuest"];
+		const controller = new context.InputController(context.ctx);
+		controller.setupKeyHandlers();
+		const listeners = registeredInputListeners(context.spies.addInputListener);
+
+		expect(dispatchInput(listeners, ALT_G)).toEqual({ consume: true });
+		expect(context.ctx.showStatus).toHaveBeenCalledWith("/local is host-only during a collab session");
 	});
 
 	it("defers the tree selector's Ctrl+Shift+O filter binding", async () => {

@@ -251,6 +251,7 @@ export class ExtensionUiController {
 			resolvePlanReview: (reviewId, choice, input) => this.ctx.resolvePlanReview(reviewId, choice, input),
 			getPendingPlanReview: () => this.ctx.getPendingPlanReview(),
 			openPlanReview: () => this.ctx.openPlanReview({ fromExtension: true }),
+			sessionModes: this.ctx.sessionModes,
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
@@ -482,6 +483,7 @@ export class ExtensionUiController {
 			resolvePlanReview: (reviewId, choice, input) => this.ctx.resolvePlanReview(reviewId, choice, input),
 			getPendingPlanReview: () => this.ctx.getPendingPlanReview(),
 			openPlanReview: () => this.ctx.openPlanReview({ fromExtension: true }),
+			sessionModes: this.ctx.sessionModes,
 			getContextUsage: () => this.ctx.session.getContextUsage(),
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
@@ -799,16 +801,19 @@ export class ExtensionUiController {
 			let promptResolve: ((value: AskDialogPromptValue | undefined) => void) | undefined;
 			let closed = false;
 			const draftEditor = this.ctx.editor;
+			// A draft in progress when the ask lands keeps the keyboard, so in-flight
+			// typing never answers by accident; up/down hand input to the ask and the
+			// draft stays parked beneath it until the ask closes.
 			const inputGuard =
 				draftEditor.getText().length > 0
 					? {
 							isBlocked: () => draftEditor.getText().length > 0,
 							handleInput: (keyData: string) => draftEditor.handleDraftEdit(keyData),
-							hint: "Finish or clear the current prompt to answer",
+							hint: "typing edits your prompt",
 							// Show the draft's insertion cursor while it owns input; drop it
-							// once the draft clears and the ask controls take over.
-							syncPresentation: () => {
-								draftEditor.focused = draftEditor.getText().length > 0;
+							// once the ask controls take over.
+							syncPresentation: (blocked: boolean) => {
+								draftEditor.focused = blocked;
 							},
 						}
 					: undefined;
@@ -939,6 +944,7 @@ export class ExtensionUiController {
 		const remote = host.requestGuestUi(
 			request,
 			signal ? AbortSignal.any([signal, remoteAbort.signal]) : remoteAbort.signal,
+			{ retainOnReconnect: true },
 		);
 		if (!remote) return local(signal);
 		const localWinner = local(signal ? AbortSignal.any([signal, localAbort.signal]) : localAbort.signal).then(
@@ -1100,7 +1106,7 @@ export class ExtensionUiController {
 		request: CollabUiRequestDraft,
 		signal: AbortSignal,
 	): Promise<GuestUiResult> {
-		const remote = host.requestGuestUi(request, signal);
+		const remote = host.requestGuestUi(request, signal, { retainOnReconnect: true });
 		if (!remote) return { kind: "unavailable" };
 		const result = await remote;
 		if (result.kind === "unavailable") return { kind: "unavailable" };
@@ -1202,6 +1208,7 @@ export class ExtensionUiController {
 				{
 					timeout: dialogOptions?.timeout,
 					onTimeout: dialogOptions?.onTimeout,
+					secret: dialogOptions?.secret,
 					tui: this.ctx.ui,
 				},
 			);
@@ -1434,10 +1441,17 @@ export class ExtensionUiController {
 			options?.deliverAs === "aside";
 		if (startsTurn && this.#rejectGuestExtensionTurn()) return;
 		const wasStreaming = this.ctx.session.isStreaming;
+		const messageCountBefore = this.ctx.session.messages.length;
 		const normalized = normalizeCustomMessagePayload(message);
 		this.ctx.session
 			.sendCustomMessage(normalized, options)
-			.then(() => this.#applyCustomMessageDisplay(wasStreaming, normalized.display))
+			.then(() => {
+				// `deliverAs: "nextTurn"` without a trigger is the one idle arm that appends
+				// to the session silently (no message_start/message_end), so nothing else
+				// paints it and nothing else in the transcript changed.
+				const silentAppend = options?.deliverAs === "nextTurn" && options.triggerTurn !== true;
+				this.#applyCustomMessageDisplay(wasStreaming, normalized, silentAppend ? messageCountBefore : undefined);
+			})
 			.catch((err: unknown) => {
 				this.ctx.showError(`Extension sendMessage failed: ${err instanceof Error ? err.message : String(err)}`);
 			});
@@ -1451,16 +1465,40 @@ export class ExtensionUiController {
 		});
 	};
 
-	#applyCustomMessageDisplay(wasStreaming: boolean, shouldDisplay: boolean | undefined): void {
+	/**
+	 * @param silentAppendBaseline message count before a silent idle `nextTurn` append,
+	 *   or `undefined` when the send was not such an append.
+	 */
+	#applyCustomMessageDisplay(
+		wasStreaming: boolean,
+		message: { customType: string; display?: boolean },
+		silentAppendBaseline: number | undefined,
+	): void {
 		// For non-streaming cases with display=true, update UI
 		// (streaming cases update via message_end event).
 		// Gate on initialChatRendered (#1955): an extension's session_start
 		// sendMessage({display:true}) runs before renderInitialMessages, which would
 		// re-render from session entries AND re-append via preserveExistingChat,
-		// duplicating the message. After the initial render the rebuild must run.
-		if (!wasStreaming && shouldDisplay && this.ctx.initialChatRendered) {
-			this.ctx.rebuildChatFromMessages();
+		// duplicating the message. After the initial render the chat must be updated.
+		if (wasStreaming || !message.display || !this.ctx.initialChatRendered) return;
+		if (silentAppendBaseline !== undefined && !this.ctx.session.isStreaming) {
+			// Append only the new message instead of replaying the whole transcript (#12183).
+			// The count and type checks fail when the send did not land as a plain append
+			// (e.g. it was queued behind a turn that began meanwhile), which falls through
+			// to the rebuild below.
+			const messages = this.ctx.session.messages;
+			const appended = messages.at(-1);
+			if (
+				messages.length === silentAppendBaseline + 1 &&
+				appended?.role === "custom" &&
+				appended.customType === message.customType
+			) {
+				this.ctx.addMessageToChat(appended);
+				this.ctx.ui.requestRender();
+				return;
+			}
 		}
+		this.ctx.rebuildChatFromMessages();
 	}
 
 	/**
