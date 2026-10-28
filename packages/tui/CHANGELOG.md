@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Clearing or rebuilding the transcript now releases detached cards and their render caches while keeping reused cards readable.
+- Completed edits discard superseded streaming previews, and retired tool cards release render caches without losing results or image replay.
+
 ## [18.13.3] - 2026-10-28
 
 ### Added

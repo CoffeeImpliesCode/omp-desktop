@@ -249,6 +249,117 @@ describe("committed transcript blocks release render caches", () => {
 		expect(settled.invalidations + active.invalidations).toBe(0);
 	});
 
+	it("releases detached caches and ownership on clear while keeping retained components reusable", async () => {
+		const transcript = new TranscriptContainer();
+		const settled = new Container();
+		settled.addChild(new Text("settled", 0, 0));
+		let finalized = false;
+		const active = Object.assign(new Container(), { isTranscriptBlockFinalized: () => finalized });
+		active.addChild(new Text("active", 0, 0));
+		transcript.addChild(settled);
+		transcript.addChild(active);
+		const detached = mountDetached();
+		transcript.renderViewport(80, 1, frame);
+		const offered = transcript.peekFinalizedBatch(80, 1);
+		if (!offered) throw new Error("expected a pressure retirement");
+		transcript.acknowledgeFinalizedBatch(offered.id);
+		transcript.nativeBlocks();
+		transcript.describe();
+		// A rebuild may interrupt composition before the viewport closes its frame.
+		transcript.beginFrame(frame);
+		transcript.liveRowCount(80);
+		const settledRows = new WeakRef(settled.render(80));
+		const activeRows = new WeakRef(active.render(80));
+
+		transcript.clear();
+
+		expect(await becomesCollectible(detached)).toBe(true);
+		expect(await becomesCollectible(settledRows)).toBe(true);
+		expect(await becomesCollectible(activeRows)).toBe(true);
+		expect(transcript.children).toEqual([]);
+		expect(transcript.blockStates()).toEqual([]);
+		expect(transcript.nativeBlocks()).toEqual([]);
+		expect(transcript.peekReplayBatch(80)).toBeUndefined();
+		expect(transcript.peekFinalizedBatch(80, 1)).toBeUndefined();
+		expect(transcript.getLastViewportSpans()).toEqual([]);
+		transcript.clear();
+
+		transcript.addChild(active);
+		expect(transcript.renderViewport(40, 10, frame).map(row => row.trimEnd())).toEqual(["active"]);
+		expect(transcript.nativeBlocks()).toEqual([active]);
+		finalized = true;
+		expect(commitAll(transcript, 40).map(row => row.trimEnd())).toEqual(["active", ""]);
+
+		function mountDetached(): WeakRef<Component> {
+			const block = new Text("discarded", 0, 0);
+			transcript.addChild(block);
+			return new WeakRef(block);
+		}
+	});
+
+	it("keeps clearing the transcript when a detached block's cache hook throws", () => {
+		const transcript = new TranscriptContainer();
+		const healthy = new ReleaseCountingBlock(["healthy"], false);
+		transcript.addChild(new ThrowingHooksBlock(["broken"]));
+		transcript.addChild(healthy);
+
+		transcript.clear();
+
+		expect(transcript.render(80)).toEqual([]);
+		expect(transcript.children).toEqual([]);
+		expect(transcript.blockStates()).toEqual([]);
+		transcript.addChild(new ReleaseCountingBlock(["replacement"], true));
+		expect(commitAll(transcript, 80)).toEqual(["replacement", ""]);
+	});
+
+	it("reuses cleared assistant and tool cards at a different width without losing their content", () => {
+		const transcript = new TranscriptContainer();
+		const blocks = [streamedAssistant(), streamedWrite()];
+		for (const block of blocks) transcript.addChild(block);
+		const wide = transcript.render(80);
+		transcript.clear();
+		for (const block of blocks) transcript.addChild(block);
+
+		expect(transcript.render(80)).toEqual(wide);
+		const fresh = new TranscriptContainer();
+		fresh.addChild(streamedAssistant());
+		fresh.addChild(streamedWrite());
+		expect(transcript.render(37)).toEqual(fresh.render(37));
+		expect(commitAll(transcript, 37)).toEqual(commitAll(fresh, 37));
+		expect(replay(transcript, 37)).toEqual(replay(fresh, 37));
+	});
+
+	it("continues live assistant and tool streams after clear and reattachment", () => {
+		const transcript = new TranscriptContainer();
+		const assistant = new AssistantMessageComponent();
+		assistant.updateContent(assistantMessage(ANSWER.slice(0, 100)), { transient: true });
+		const tool = new ToolExecutionComponent("write", { path: "src/values.ts" }, {}, undefined, ui);
+		liveTools.push(tool);
+		tool.updateArgs({ path: "src/values.ts", content: WRITE_CONTENT.slice(0, 100) });
+		transcript.addChild(assistant);
+		transcript.addChild(tool);
+		transcript.render(80);
+
+		transcript.clear();
+		transcript.addChild(assistant);
+		transcript.addChild(tool);
+		assistant.updateContent(assistantMessage(ANSWER));
+		assistant.markTranscriptBlockFinalized();
+		tool.updateArgs({ path: "src/values.ts", content: WRITE_CONTENT });
+		tool.setArgsComplete();
+		tool.setExecutionStarted();
+		tool.updateResult(
+			{ content: [{ type: "text", text: "Successfully wrote src/values.ts" }], details: {}, isError: false },
+			false,
+		);
+
+		const fresh = new TranscriptContainer();
+		fresh.addChild(streamedAssistant());
+		fresh.addChild(streamedWrite());
+		expect(transcript.render(37)).toEqual(fresh.render(37));
+		expect(commitAll(transcript, 37)).toEqual(commitAll(fresh, 37));
+	});
+
 	it("keeps committed caches through replay retries until the replay batch is acknowledged", () => {
 		const transcript = new TranscriptContainer();
 		const block = new ReleaseCountingBlock(["committed"], true);

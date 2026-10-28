@@ -25,6 +25,8 @@
 
 ### Fixed
 
+- Reduced memory retained by RPC sessions during long turns while preserving oversized-frame recovery.
+- Fixed completed tool cards remaining in memory after transcript rebuilds.
 - Fixed raw browser `page.$$eval()` calls in local builds with shortened Bun callsite stacks.
 - Closing all browser tabs now continues after individual failures and logs unconfirmed closes without closing borrowed pages.
 - Fixed headless Chromium renderer crashes by removing the stealth bootstrap's temporary iframe, which could recurse while a new frame context initialized; the retained patches still apply to child frames.

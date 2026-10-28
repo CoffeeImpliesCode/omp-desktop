@@ -11,6 +11,7 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { UiHelpers } from "@oh-my-pi/pi-coding-agent/modes/utils/ui-helpers";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { type Component, TERMINAL } from "@oh-my-pi/pi-tui";
+import { becomesCollectible } from "../../tui/test/gc";
 import { createInteractiveModeContext } from "./helpers/interactive-mode-context";
 
 import { cfgTerminalShowImages } from "@oh-my-pi/pi-coding-agent/modes/settings";
@@ -125,6 +126,78 @@ describe("EventController mixed assistant text/tool rendering", () => {
 
 		expect(chatContainer.children).not.toContain(orphan);
 		expect(orphan.isTranscriptBlockFinalized()).toBe(true);
+	});
+
+	it("replaces a settled prior-turn tool card when the same call is retried", async () => {
+		const { controller, chatContainer, ctx } = createFixture();
+		const start = {
+			type: "tool_execution_start" as const,
+			toolCallId: "prior-turn-retry",
+			toolName: "contract_probe",
+			args: { value: "retry" },
+		};
+		const end = {
+			type: "tool_execution_end" as const,
+			toolCallId: start.toolCallId,
+			toolName: start.toolName,
+			result: { content: [{ type: "text" as const, text: "FAILED ATTEMPT OUTPUT" }] },
+			isError: true,
+		};
+		try {
+			await controller.handleEvent(start);
+			await controller.handleEvent(end);
+			const prior = chatContainer.children.find(child => child instanceof ToolExecutionComponent)!;
+			expect(prior).toBeDefined();
+			await controller.handleEvent({ type: "agent_end", messages: [] });
+			await controller.handleEvent({ type: "agent_start" });
+
+			await controller.handleEvent(start);
+			await controller.handleEvent({
+				...end,
+				result: { content: [{ type: "text", text: "RECOVERED ATTEMPT OUTPUT" }] },
+				isError: false,
+			});
+
+			expect(chatContainer.children).not.toContain(prior);
+			const tools = chatContainer.children.filter(child => child instanceof ToolExecutionComponent);
+			expect(tools).toHaveLength(1);
+			const rows = Bun.stripANSI(chatContainer.render(120).join("\n"));
+			expect(rows).toContain("RECOVERED ATTEMPT OUTPUT");
+			expect(rows).not.toContain("FAILED ATTEMPT OUTPUT");
+		} finally {
+			for (const tool of ctx.pendingTools.values()) tool.seal();
+			controller.dispose();
+		}
+	});
+
+	it("does not retain an ended turn's tool cards after the transcript discards them", async () => {
+		const { controller, chatContainer } = createFixture();
+		async function endAndDetach(): Promise<WeakRef<ToolExecutionComponent>> {
+			await controller.handleEvent({
+				type: "tool_execution_start",
+				toolCallId: "discarded-prior-turn",
+				toolName: "contract_probe",
+				args: {},
+			});
+			await controller.handleEvent({
+				type: "tool_execution_end",
+				toolCallId: "discarded-prior-turn",
+				toolName: "contract_probe",
+				result: { content: [{ type: "text", text: "Completed result" }] },
+				isError: false,
+			});
+			await controller.handleEvent({ type: "agent_end", messages: [] });
+			const card = chatContainer.children.find(child => child instanceof ToolExecutionComponent);
+			if (!card) throw new Error("expected the completed tool card");
+			chatContainer.clear();
+			return new WeakRef(card);
+		}
+		try {
+			const card = await endAndDetach();
+			expect(await becomesCollectible(card)).toBe(true);
+		} finally {
+			controller.dispose();
+		}
 	});
 
 	it("renders assistant text segments in order around two tool results from one mixed message", async () => {

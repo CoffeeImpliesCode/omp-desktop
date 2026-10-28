@@ -352,8 +352,16 @@ export class TranscriptContainer extends Container {
 	}
 
 	override clear(): void {
+		this.#syncEntries();
+		// Rebuilds can reattach these blocks; release only reconstructable caches.
+		for (const entry of this.#entries) this.#releaseRenderCaches(entry);
 		super.clear();
 		this.#entries = [];
+		this.#syncedChildren = this.children;
+		this.#entriesUnverified = false;
+		this.#nativeBlocks = [];
+		this.#nativeNode = undefined;
+		this.#closeFrame();
 		this.#frontier = 0;
 		this.#offered = undefined;
 		this.#childStartRows.clear();
