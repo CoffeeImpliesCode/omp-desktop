@@ -252,7 +252,8 @@ export class EventController {
 	// (AgentSession.retry re-executing a stripped failed batch);
 	// #handleToolExecutionStart evicts the stale aborted card so the fresh
 	// execution replaces it in the transcript instead of stacking a duplicate.
-	#priorTurnToolComponents = new Map<string, Component>();
+	// Retry lookup must not own cards detached by a compaction rebuild.
+	#priorTurnToolComponents = new Map<string, WeakRef<Component>>();
 	// Cards settled by a synthetic aborted/error `tool_execution_end` (agent-loop
 	// emits one per never-run call on a terminal error/abort). They stay visible
 	// for a genuinely terminal failure, but if an auto-retry then supersedes the
@@ -501,6 +502,7 @@ export class EventController {
 		}
 		this.#ircExpiryTimers.clear();
 		this.#liveIrcCards.clear();
+		this.#priorTurnToolComponents.clear();
 	}
 
 	#resetReadGroup(): void {
@@ -1024,6 +1026,7 @@ export class EventController {
 		this.#renderedCustomMessages.clear();
 		this.#lastIntent = undefined;
 		this.#toolTimelineComponents.clear();
+		this.#priorTurnToolComponents.clear();
 		this.#streamedToolCallIdByIndex.clear();
 		this.#pendingStreamPreviews.clear();
 		this.#retractedToolCallIds.clear();
@@ -1979,13 +1982,11 @@ export class EventController {
 		}
 		this.#resolveDisplaceablePoll(renderToolName);
 		if (!this.ctx.pendingTools.has(event.toolCallId)) {
-			const stale = this.#priorTurnToolComponents.get(event.toolCallId);
-			if (stale) {
-				this.#priorTurnToolComponents.delete(event.toolCallId);
-				// Never evict a shared read-group card: it may still carry sibling reads.
-				if (stale instanceof ToolExecutionComponent && this.ctx.chatContainer.children.includes(stale)) {
-					this.ctx.chatContainer.removeChild(stale);
-				}
+			const stale = this.#priorTurnToolComponents.get(event.toolCallId)?.deref();
+			this.#priorTurnToolComponents.delete(event.toolCallId);
+			// Never evict a shared read-group card: it may still carry sibling reads.
+			if (stale instanceof ToolExecutionComponent && this.ctx.chatContainer.children.includes(stale)) {
+				this.ctx.chatContainer.removeChild(stale);
 			}
 			if (renderToolName === "read" && readArgsCollapseIntoGroup(event.args)) {
 				this.#trackReadToolCall(event.toolCallId, event.args);
@@ -2567,7 +2568,10 @@ export class EventController {
 		this.#blockingPrompts.clear();
 		this.#readToolCallArgs.clear();
 		this.#readToolCallAssistantComponents.clear();
-		this.#priorTurnToolComponents = new Map(this.#toolTimelineComponents);
+		this.#priorTurnToolComponents.clear();
+		for (const [toolCallId, component] of this.#toolTimelineComponents) {
+			this.#priorTurnToolComponents.set(toolCallId, new WeakRef(component));
+		}
 		this.#toolTimelineComponents.clear();
 		this.#streamedToolCallIdByIndex.clear();
 		this.#pendingStreamPreviews.clear();

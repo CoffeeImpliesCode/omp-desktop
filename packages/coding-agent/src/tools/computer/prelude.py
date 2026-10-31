@@ -279,10 +279,10 @@ def _make_computer():
             return await _call([_step("display", (self.id,), {}), _step(method, args, kwargs)])
 
     class _Window(_InputTarget):
-        __slots__ = ("id", "app", "title", "pid", "bounds", "focused", "menu")
+        __slots__ = ("id", "app", "title", "pid", "bounds", "positionKnown", "focused", "menu")
 
         def __init__(self, snapshot):
-            for field in ("id", "app", "title", "pid", "bounds", "focused"):
+            for field in ("id", "app", "title", "pid", "bounds", "positionKnown", "focused"):
                 setattr(self, field, snapshot.get(field))
             self.menu = _Menu(self, "menu")
 
@@ -305,9 +305,59 @@ def _make_computer():
         async def _method(self, method, args, kwargs):
             return await _call([_step("window", (self.id,), {}), _step(method, args, kwargs)])
 
-        async def raise_(self, *args, **kwargs):
-            return await self._method("raise", args, kwargs)
+        async def focus(self, *args, **kwargs):
+            return await self._method("focus", args, kwargs)
 
+        async def raise_(self, *args, **kwargs):
+            return await self.focus(*args, **kwargs)
+
+        async def state(self, *args, **kwargs):
+            return await self._method("state", args, kwargs)
+
+        async def close(self, *args, **kwargs):
+            return await self._method("close", args, kwargs)
+
+        async def moveTo(self, *args, **kwargs):
+            return await self._method("moveTo", args, kwargs)
+
+        async def moveBy(self, *args, **kwargs):
+            return await self._method("moveBy", args, kwargs)
+
+        async def resize(self, *args, **kwargs):
+            return await self._method("resize", args, kwargs)
+
+        async def maximize(self, *args, **kwargs):
+            return await self._method("maximize", args, kwargs)
+
+        async def minimize(self, *args, **kwargs):
+            return await self._method("minimize", args, kwargs)
+
+        async def restore(self, *args, **kwargs):
+            return await self._method("restore", args, kwargs)
+
+        async def toggleMaximized(self, *args, **kwargs):
+            return await self._method("toggleMaximized", args, kwargs)
+
+        async def toggleFullscreen(self, *args, **kwargs):
+            return await self._method("toggleFullscreen", args, kwargs)
+
+        async def toggleWindowedFullscreen(self, *args, **kwargs):
+            return await self._method("toggleWindowedFullscreen", args, kwargs)
+
+        async def setFullscreen(self, *args, **kwargs):
+            return await self._method("setFullscreen", args, kwargs)
+
+        async def setFloating(self, *args, **kwargs):
+            return await self._method("setFloating", args, kwargs)
+
+        async def center(self, *args, **kwargs):
+            return await self._method("center", args, kwargs)
+
+        async def moveToWorkspace(self, *args, **kwargs):
+            return await self._method("moveToWorkspace", args, kwargs)
+
+        async def moveToDisplay(self, *args, **kwargs):
+            return await self._method("moveToDisplay", args, kwargs)
         async def ax(self, *args, **kwargs):
             return await self._method("ax", args, kwargs)
 
@@ -350,6 +400,18 @@ def _make_computer():
         async def windows(self, *args, **kwargs):
             return await self._method("windows", args, kwargs)
 
+        async def workspaces(self, *args, **kwargs):
+            """List workspaces; their exact ids are the only accepted focus and move targets."""
+            return await self._method("workspaces", args, kwargs)
+
+        async def focusWorkspace(self, *args, **kwargs):
+            return await self._method("focusWorkspace", args, kwargs)
+
+        async def focusDisplay(self, *args, **kwargs):
+            return await self._method("focusDisplay", args, kwargs)
+
+        async def moveWorkspaceToDisplay(self, *args, **kwargs):
+            return await self._method("moveWorkspaceToDisplay", args, kwargs)
         async def window(self, *args, **kwargs):
             """Resolve one window by id ("74" or 74) or by `app`/`title` filter keywords."""
             snapshot = await self._method("window", args, kwargs)
@@ -387,7 +449,7 @@ def _make_computer():
             return details if "backend" in details else None
 
         async def close(self):
-            """End the persistent desktop session; later calls fail."""
+            """End the persistent desktop session; later calls fail. A window's close() does not."""
             await _invoke("close", {})
 
     return _Computer()

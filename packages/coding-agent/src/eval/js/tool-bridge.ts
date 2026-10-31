@@ -12,7 +12,7 @@ import { committedTodoPhases } from "../../tools/todo";
 import { parseMCPProgress } from "@oh-my-pi/pi-tui/tools/mcp";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { schemaDeclaresIntentField } from "../../utils/tool-schema";
-import { findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
+import { type EvalPreludeCell, findEnabledEvalPrelude, invokeEvalPrelude } from "../preludes";
 import { EVAL_AGENT_BRIDGE_NAME, type EvalAgentHandleResult, runEvalAgent } from "../agent-bridge";
 import { EVAL_BUDGET_BRIDGE_NAME, type EvalBudgetResult, runEvalBudget } from "../budget-bridge";
 import { withBridgeTimeoutPause } from "../bridge-timeout";
@@ -50,6 +50,8 @@ export interface ToolBridgeOptions {
 	emitStatus?: (event: JsStatusEvent) => void;
 	identity?: RuntimeCallIdentity;
 	shadowCell?: EvalShadowCellSession;
+	/** The eval cell this call runs in, forwarded to prelude handlers. */
+	cell?: EvalPreludeCell;
 }
 
 type ToolValue =
@@ -224,6 +226,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 					session: options.session,
 					toolCallId,
 					signal: options.signal,
+					cell: options.cell,
 					context: options.session.getToolContext?.(),
 				}),
 			);

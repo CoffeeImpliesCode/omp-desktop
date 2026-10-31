@@ -7,6 +7,7 @@
 let
   inherit (pkgs) lib;
   linuxLibraries = with pkgs; [
+    alsa-lib
     libpulseaudio
     pipewire
     stdenv.cc.cc.lib
@@ -17,51 +18,57 @@ pkgs.mkShell (
   {
     name = "omp-dev";
 
-    packages =
-      [ bun bun2nix rustToolchain ]
-      ++ (with pkgs; [
-        cargo-nextest
-        rustPlatform.bindgenHook
-        nixfmt
-        typescript-language-server
+    packages = [
+      bun
+      bun2nix
+      rustToolchain
+    ]
+    ++ (with pkgs; [
+      cargo-nextest
+      rustPlatform.bindgenHook
+      nixfmt
+      typescript-language-server
 
-        python312
-        python312Packages.pip
-        uv
-        basedpyright
+      python312
+      python312Packages.pip
+      uv
+      basedpyright
 
-        bash
-        cacert
-        curl
-        fd
-        git
-        git-lfs
-        imagemagick
-        openssh
-        ripgrep
-        sqlite
-        unzip
+      bash
+      cacert
+      curl
+      fd
+      git
+      git-lfs
+      imagemagick
+      openssh
+      ripgrep
+      sqlite
+      unzip
 
-        cmake
-        ninja
-        pkg-config
-        zig
+      cmake
+      ninja
+      pkg-config
+      zig
 
-        cairo
-        giflib
-        libjpeg
-        librsvg
-        openssl
-        pango
-        pcre2
-        zlib
-      ])
-      ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux linuxLibraries;
+      cairo
+      giflib
+      libjpeg
+      librsvg
+      openssl
+      pango
+      pcre2
+      zlib
+    ])
+    ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux (linuxLibraries ++ [ pkgs.patchelf ]);
 
     PCRE2_SYS_STATIC = "1";
     RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
   }
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     LD_LIBRARY_PATH = lib.makeLibraryPath linuxLibraries;
+    # pi-voice dlopens PulseAudio/ALSA. Local addons must retain these paths
+    # after leaving the shell, just like nix/package.nix's packaged addon.
+    OMP_NATIVE_RUNTIME_LIBRARY_PATH = lib.makeLibraryPath linuxLibraries;
   }
 )

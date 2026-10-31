@@ -1,3 +1,29 @@
+# omp-desktop
+
+This fork of [oh-my-pi](https://github.com/can1357/oh-my-pi) improves desktop computer use specifically for **Linux Wayland**.
+
+Upstream base: [v18.13.3](https://github.com/can1357/oh-my-pi/releases/tag/v18.13.3).
+
+## Linux Wayland improvements
+
+- Capture exact niri windows, including unfocused windows and windows with client-side shadows, without raising the window or changing focus.
+- Match niri windows to their AT-SPI trees through Flatpak `xdg-dbus-proxy` connections, `xwayland-satellite` X11 clients, and AccessKit frames without the window's title, refusing any match that two windows could share.
+- Compose desktop screenshots from all portal-authorized monitor streams, with mixed scales and negative origins.
+- Save and display the same capped PNG in the JavaScript and Python computer helpers.
+- Expose `positionKnown` so unknown window origins do not block exact screenshots or permit unsafe global pointer mapping.
+- Control niri windows and workspaces over the compositor IPC socket: focus, close, floating movement, resizing, centering, floating setters, fullscreen and maximization toggles, and workspace and display moves.
+- Report window control per backend instead of guessing. `capabilities().windowControl` lists the advertised operations, the coordinate space used for window movement, and whether focusing may warp the pointer. X11 advertises only what the running window manager really supports, and niri does not pretend to have minimize, restore, or idempotent maximize and fullscreen.
+- Read window and workspace state on demand, with unknown flags left absent instead of reported as `false`, and move windows by exact IDs from discovery.
+
+Native capture requires a Linux build with the `wayland-pipewire` feature and system PipeWire libraries.
+See the [Linux build guide](LOCAL-PIPEWIRE-BUILD.md).
+The local compile helper accepts `OMP_LOCAL_OUTFILE` to select the output path.
+Per-window Wayland input remains unavailable, and AX access depends on each application's AT-SPI registration.
+
+**The upstream packages and installers below do not include these fork changes.**
+
+---
+
 <p align="center">
   <img src="https://github.com/can1357/oh-my-pi/blob/main/assets/hero.png?raw=true" alt="omp">
 </p>
@@ -32,7 +58,7 @@ The most capable agent surface that ships. Continuously tuned by real-world use 
 > while we evaluate how open contributions go. Depending on the results, the
 > vouch system may return.
 
-## Install
+## Install upstream omp
 
 **macOS · Linux**
 
@@ -256,7 +282,7 @@ Eval's `browser.open(...)` returns a tab handle with direct navigation, inspecti
 
 ### 21 · Hands on the desktop itself
 
-Eval's `computer` helpers — `computer.window(...)`, `win.screenshot()`, `win.ax()`, `el.press()`, plus `computer.run(fnOrCode, options)` for multi-step scripts — control the real host: enumerate windows and displays, capture screenshots, send native input, walk the OS accessibility tree, and use the clipboard. It exposes no browser DOM.
+Eval's `computer` helpers — `computer.window(...)`, `win.screenshot()`, `win.ax()`, `el.press()`, plus `computer.run(fnOrCode, options)` for multi-step scripts — control the real host: enumerate windows, workspaces, and displays, capture screenshots, send native input, focus, close, move, and resize windows, move windows between workspaces and displays, walk the OS accessibility tree, and use the clipboard. It exposes no browser DOM.
 
 ## Whatever the task needs, _it's already in the box_.
 
@@ -293,7 +319,7 @@ Core tools live in the same namespace as `read` and `bash`. Pin the active set w
 **Desktop & web**
 
 - `browser` — Puppeteer tabs over headless Chromium, CDP-attached apps, or your own Chrome via the relay.
-- `computer` — persistent JS against the host desktop: windows, screenshots, native input, AX tree, clipboard.
+- `computer` — persistent JS against the host desktop: windows, workspaces, screenshots, native input, window control, AX tree, clipboard.
 - `web_search` — one query across configured providers, returning answer plus citations.
 - `github` — GitHub CLI ops — repo, PR, issues, code search, Actions run-watch.
 - `generate_image` — generate or edit raster images via Gemini, GPT, or xAI Grok image models.
@@ -471,7 +497,7 @@ Inside `pi-natives`, the per-module breakdown (glue and tests omitted):
 
 | Module        | What it does                                                                      | Powered by                                |   ~LoC |
 | ------------- | --------------------------------------------------------------------------------- | ----------------------------------------- | -----: |
-| desktop       | Window/display enumeration · screenshot · native input · AX tree for `computer`   | xcap · enigo · OS AX FFI                  | 10,600 |
+| desktop       | Window/workspace/display enumeration · screenshot · native input · window control · AX tree for `computer` | xcap · enigo · OS AX FFI                  | 10,600 |
 | grep          | Regex search · parallel/sequential · glob & type filters · fuzzy find             | grep-regex · grep-searcher                |  3,280 |
 | text          | ANSI-aware width · truncation · column slicing · SGR-preserving wrap              | unicode-width · segmentation              |  2,070 |
 | snapcompact   | Bitmap-frame rasterization + PNG encode for context compression                   | image · png                               |  1,760 |

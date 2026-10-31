@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `positionKnown` to computer window metadata and handles. Exact niri window screenshots work even when the compositor does not publish a global window origin.
+- Added matching JavaScript and Python computer helpers for window focus, close, movement, resize, state setters and toggles, centering, workspace/display moves, and workspace/display focus.
+- Added fresh `win.state()` and `computer.workspaces()` reads, exact workspace IDs, capability checks, and read-only/cancellation guards for every control mutation.
+- Computer input now returns fresh AX and window-roster feedback after the application settles ([#13681](https://github.com/can1357/oh-my-pi/pull/13681) by [@will-bogusz](https://github.com/will-bogusz)).
+- Computer targets whose screenshots have been shown now return automatic after-input images ([#13690](https://github.com/can1357/oh-my-pi/pull/13690) by [@will-bogusz](https://github.com/will-bogusz)).
+- The computer usage guide now appears once after the first direct window lookup ([#13688](https://github.com/can1357/oh-my-pi/pull/13688) by [@will-bogusz](https://github.com/will-bogusz)).
+
+### Changed
+
+- Added `win.focus()` alongside `win.raise()` and Python `win.raise_()`. Window handle fields remain resolution-time snapshots; use `state()` for current geometry and state.
+- Kept `win.move(x, y)` as pointer movement. Use `moveTo({ x, y })` and `moveBy({ dx, dy })` to move the window.
+- Clarified computer control guidance: focus can warp the pointer, `Timeout` can leave applied effects, and screenshot frames expire before native dispatch.
+- Clarified computer AX reference lifetime: the current and immediately previous generations remain valid.
+- Local standalone builds now write to `packages/coding-agent/dist/omp-linux-x64` by default. `OMP_LOCAL_OUTFILE` still selects another destination.
+- Updated the desktop fork to upstream 18.13.3 while retaining Linux Wayland desktop controls and portable build instructions.
+- Browser relay opens now create dedicated background tabs, and screenshots leave the user's foreground tab in place; `app.target` explicitly borrows an existing tab ([#14060](https://github.com/can1357/oh-my-pi/pull/14060) by [@nnnnoel](https://github.com/nnnnoel)).
+- Automatic computer AX trees now use a 16 KiB UTF-8 budget without splitting rows ([#13692](https://github.com/can1357/oh-my-pi/pull/13692) by [@will-bogusz](https://github.com/will-bogusz)).
+- Increased the `find` tool timeout to five minutes so slower local judge models can finish searches.
+
+### Fixed
+
+- Reduced memory retained by RPC sessions during long turns while preserving oversized-frame recovery.
+- Fixed completed tool cards remaining in memory after transcript rebuilds.
+- Fixed raw browser `page.$$eval()` calls in local builds with shortened Bun callsite stacks.
+- Closing all browser tabs now continues after individual failures and logs unconfirmed closes without closing borrowed pages.
+- Fixed headless Chromium renderer crashes by removing the stealth bootstrap's temporary iframe, which could recurse while a new frame context initialized; the retained patches still apply to child frames.
+- Missing computer windows now report bounded available-window candidates ([#13655](https://github.com/can1357/oh-my-pi/pull/13655) by [@will-bogusz](https://github.com/will-bogusz)).
+- Concurrent computer Eval cells now queue safely and keep cancellation, screenshots, and AX feedback isolated.
+- Computer screenshots now preserve the saved PNG pixel frame through model delivery.
+- Fixed `/live` audio startup in local Nix builds on PipeWire desktops.
+- Fixed computer after-input feedback disappearing from Eval previews beside JSON displays.
+
 ## [18.14.1] - 2026-10-31
 
 ### Added
@@ -1263,5 +1297,7 @@
 - Fixed raw token markers appearing instead of Nerd Font icons in Anthropic idle recaps, `/btw` and `/omfg` replies, and streaming previews.
 - Fixed sessions moved with `/wt` disappearing from resume lists; sessions in Git worktrees now remain discoverable and can be resumed or relocated if their worktree was removed.
 - Fixed live config reload ignoring edits made during startup or right after a config symlink was retargeted, until the next unrelated edit.
+
+## [Unreleased]
 
 Older entries are archived in [packages/coding-agent/CHANGELOG.md@6693ddbfd58c](https://github.com/can1357/oh-my-pi/blob/6693ddbfd58ce9edcdc0dc3fe98a8882c9bae834/packages/coding-agent/CHANGELOG.md).

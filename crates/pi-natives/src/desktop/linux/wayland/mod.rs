@@ -1,127 +1,46 @@
 #[cfg(feature = "wayland-pipewire")]
 mod capture;
+mod geometry;
 mod libei;
+mod niri;
 mod portal;
 mod xkb;
+mod xwayland;
 
+#[cfg(any(feature = "wayland-pipewire", test))]
+use geometry::PortalGeometry;
 use image::RgbaImage;
 
 use crate::desktop::{
 	backend::{AxBackend, Backend, DeliveryMode, PointerEvent},
-	control::{self, OperationToken},
+	control::{self, ControlAction, OperationToken},
 	error::{CoreResult, DesktopError},
 	frame::FrameGeometry,
 	keys::KeyName,
 	linux::ax::{AtSpiAx, AtSpiWindow},
 	types::{
-		CaptureCaps, DesktopCapabilities, DesktopDisplay, DesktopWindow, DisplaySelector, Target,
+		CaptureCaps, DesktopCapabilities, DesktopControlCapabilities, DesktopDisplay, DesktopWindow,
+		DesktopWindowState, DesktopWorkspace, DisplaySelector, Target,
 	},
 };
 
-/// Logical monitor geometry from the portal ScreenCast stream, paired with the
-/// physical PipeWire buffer size.
+/// Every window niri reports, or `None` without a readable niri.
 ///
-/// The captured buffer is in physical pixels, while libei and AT-SPI address
-/// the monitor in the compositor's logical coordinate space. On a scaled
-/// monitor the two differ (e.g. a 2560×2880 buffer for a 1280×1440 logical
-/// region at scale 2), so clicks must be mapped through the logical geometry
-/// instead of treating buffer pixels as logical coordinates.
-#[cfg(any(feature = "wayland-pipewire", test))]
-#[derive(Debug, Clone, Copy)]
-struct PortalGeometry {
-	logical_x:      i32,
-	logical_y:      i32,
-	logical_width:  u32,
-	logical_height: u32,
-	pixel_width:    u32,
-	pixel_height:   u32,
+/// AT-SPI uses it to prove that an accessibility connection serves exactly
+/// one window before it accepts a frame without the window's title as it.
+pub(super) fn compositor_windows() -> Option<Vec<DesktopWindow>> {
+	niri::windows()
+		.ok()
+		.flatten()
+		.map(|windows| windows.into_iter().map(|entry| entry.window).collect())
 }
 
-#[cfg(any(feature = "wayland-pipewire", test))]
-impl PortalGeometry {
-	/// Build from the portal stream's `position`/`size` and the captured buffer
-	/// dimensions. A missing or degenerate logical size falls back to the buffer
-	/// size (scale 1), preserving behaviour on compositors that omit the
-	/// mapping.
-	fn new(
-		position: Option<(i32, i32)>,
-		size: Option<(i32, i32)>,
-		pixel_width: u32,
-		pixel_height: u32,
-	) -> Self {
-		let (logical_x, logical_y) = position.unwrap_or((0, 0));
-		let (logical_width, logical_height) = match size {
-			Some((w, h)) if w > 0 && h > 0 => (w as u32, h as u32),
-			_ => (pixel_width, pixel_height),
-		};
-		Self { logical_x, logical_y, logical_width, logical_height, pixel_width, pixel_height }
-	}
-
-	/// Synthetic single-monitor display describing the captured buffer, with
-	/// logical bounds and scale derived from the portal geometry.
-	fn display(&self) -> DesktopDisplay {
-		let scale = f64::from(self.pixel_width) / f64::from(self.logical_width.max(1));
-		DesktopDisplay {
-			id: "wayland-portal-0".to_string(),
-			name: "Wayland portal monitor".to_string(),
-			x: self.logical_x,
-			y: self.logical_y,
-			width: self.logical_width.max(1),
-			height: self.logical_height.max(1),
-			scale,
-			pixel_x: 0,
-			pixel_y: 0,
-			pixel_width: self.pixel_width,
-			pixel_height: self.pixel_height,
-			is_primary: true,
-		}
-	}
-
-	/// Convert a window's logical bounds (global compositor coordinates) into a
-	/// pixel crop rectangle within the captured buffer.
-	///
-	/// # Errors
-	/// `CaptureFailed` when the toolkit could not report the window's global
-	/// position (native Wayland clients answer with window-relative `0,0`, which
-	/// would crop whatever sits at the monitor's top-left), or when the window
-	/// lies outside the captured monitor.
-	fn window_crop(&self, window: &AtSpiWindow) -> CoreResult<(u32, u32, u32, u32)> {
-		let AtSpiWindow { window, position_known } = window;
-		if !position_known {
-			return Err(DesktopError::capture_failed(format!(
-				"Wayland window {} has no known screen position: its toolkit reports window-relative \
-				 AT-SPI coordinates, so it cannot be located in the portal capture; capture the \
-				 desktop instead",
-				window.id
-			)));
-		}
-		let outside = || {
-			DesktopError::capture_failed(format!(
-				"Wayland window {} is outside the selected portal monitor",
-				window.id
-			))
-		};
-		let scale_x = f64::from(self.pixel_width) / f64::from(self.logical_width.max(1));
-		let scale_y = f64::from(self.pixel_height) / f64::from(self.logical_height.max(1));
-		let rel_x = window.x - self.logical_x;
-		let rel_y = window.y - self.logical_y;
-		if rel_x < 0 || rel_y < 0 {
-			return Err(outside());
-		}
-		let px_x = (f64::from(rel_x) * scale_x).round() as u32;
-		let px_y = (f64::from(rel_y) * scale_y).round() as u32;
-		if px_x >= self.pixel_width || px_y >= self.pixel_height {
-			return Err(outside());
-		}
-		let px_width = (f64::from(window.width) * scale_x).round().max(1.0) as u32;
-		let px_height = (f64::from(window.height) * scale_y).round().max(1.0) as u32;
-		let width = px_width.min(self.pixel_width - px_x);
-		let height = px_height.min(self.pixel_height - px_y);
-		if width == 0 || height == 0 {
-			return Err(outside());
-		}
-		Ok((px_x, px_y, width, height))
-	}
+/// The niri compositor's pid, or `None` without a readable niri.
+///
+/// The compositor is the ancestor of every process it spawns, Xwayland bridges
+/// included, so AT-SPI must never take ancestry from it as window ownership.
+pub(super) fn compositor_pid() -> Option<u32> {
+	niri::compositor_pid().ok()
 }
 
 pub struct WaylandBackend {
@@ -145,7 +64,17 @@ impl WaylandBackend {
 			Ok(ax) => (Some(ax), None),
 			Err(err) => (None, Some(err)),
 		};
-		Self { display, ax, ax_error, input: None, displays: Vec::new() }
+		let mut displays = niri::displays().ok().flatten().unwrap_or_default();
+		if !displays.is_empty() && geometry::layout(&mut displays).is_err() {
+			displays.clear();
+		}
+		if let DisplaySelector::Id(id) = &display {
+			displays.retain(|d| &d.id == id || &d.name == id);
+			if !displays.is_empty() {
+				let _ = geometry::layout(&mut displays);
+			}
+		}
+		Self { display, ax, ax_error, input: None, displays }
 	}
 
 	fn window_input_error(target: &Target, kind: &str) -> CoreResult<()> {
@@ -227,6 +156,9 @@ impl Backend for WaylandBackend {
 				"unavailable".to_string()
 			},
 			display_count: self.displays.len() as u32,
+			// The live window-control surface is attached centrally from
+			// `Backend::control_capabilities`, which probes niri itself.
+			window_control: None,
 			screen_locked: false,
 			display_asleep: false,
 		}
@@ -238,6 +170,12 @@ impl Backend for WaylandBackend {
 
 	fn validate_frame_layout(&mut self, frame: &FrameGeometry) -> CoreResult<()> {
 		control::check()?;
+		// A niri window frame is the compositor's render of that window; no
+		// monitor stream backs it, so refreshing portal geometry would only ask
+		// for monitor consent the frame never needed.
+		if !frame.display_bound() {
+			return Ok(());
+		}
 		#[cfg(not(feature = "wayland-pipewire"))]
 		{
 			let _ = frame;
@@ -257,12 +195,20 @@ impl Backend for WaylandBackend {
 					"could not refresh Wayland display geometry: {error}"
 				))
 			})?;
-			self.displays = vec![geometry.display()];
+			let known = niri::displays().ok().flatten().unwrap_or_default();
+			self.displays = geometry::fresh_layout(&geometry, &known)?;
 			frame.validate_layout(&self.displays)
 		}
 	}
 
 	fn windows(&mut self) -> CoreResult<Vec<DesktopWindow>> {
+		// niri is the authority on what is open, but its IPC is optional
+		// metadata for a listing: a restarting compositor leaves a
+		// `$NIRI_SOCKET` that no longer connects, and that must degrade to the
+		// accessibility listing instead of failing every window query.
+		if let Ok(Some(windows)) = niri::windows() {
+			return Ok(windows.into_iter().map(|entry| entry.window).collect());
+		}
 		Ok(self
 			.atspi_windows()?
 			.into_iter()
@@ -298,16 +244,28 @@ impl Backend for WaylandBackend {
 		}
 		#[cfg(feature = "wayland-pipewire")]
 		{
-			let (image, geometry) = capture::capture()?;
-			self.displays = vec![geometry.display()];
+			if let Target::Window(id) = target
+				&& id.starts_with("niri:")
+			{
+				let (image, window) = niri::capture_window(id)?;
+				let frame =
+					FrameGeometry::for_compositor_window(&window, image.width(), image.height());
+				return Ok((image, frame));
+			}
+			// The portal reports the authorized stream geometry. Use niri only
+			// to enrich display names and match known monitors.
+			let known = niri::displays().ok().flatten().unwrap_or_default();
+			let frames = capture::capture()?;
+			self.displays = geometry::metadata(&frames, &known);
 			let explicit = target.display_selector();
 			let selected = selector
 				.or(explicit.as_ref())
-				.unwrap_or(&self.display)
-				.select(self.displays.clone(), None)?;
+				.unwrap_or(&self.display);
 			match target {
 				Target::Desktop | Target::Display(_) => {
-					Ok((image, FrameGeometry::for_displays(&selected)))
+					let (image, displays) = geometry::compose(frames, selected, &known)?;
+					let frame = FrameGeometry::for_displays(&displays);
+					Ok((image, frame))
 				},
 				Target::Window(id) => {
 					let entry = self
@@ -317,11 +275,27 @@ impl Backend for WaylandBackend {
 						.ok_or_else(|| {
 							DesktopError::window_not_found(format!("Wayland window {id} not found"))
 						})?;
-					let (x, y, width, height) = geometry.window_crop(&entry)?;
-					let cropped = image::imageops::crop_imm(&image, x, y, width, height).to_image();
-					let frame =
-						FrameGeometry::for_window(&entry.window, cropped.width(), cropped.height());
-					Ok((cropped, frame))
+					if !entry.position_known {
+						return Err(DesktopError::capture_failed(format!(
+							"Wayland window {id} has no known screen position; native compositor capture \
+							 is unavailable"
+						)));
+					}
+					let displays = geometry::metadata(&frames, &known);
+					for ((image, geometry), display) in frames.iter().zip(&displays) {
+						if matches!(selected, DisplaySelector::Id(id) if id != &display.id && id != &display.name)
+						{
+							continue;
+						}
+						if let Ok((x, y, width, height)) = geometry.window_crop(&entry) {
+							let cropped = image::imageops::crop_imm(image, x, y, width, height).to_image();
+							let frame = FrameGeometry::for_window(&entry.window, width, height);
+							return Ok((cropped, frame));
+						}
+					}
+					Err(DesktopError::capture_failed(format!(
+						"Wayland window {id} is not fully inside an authorized monitor"
+					)))
 				},
 			}
 		}
@@ -393,10 +367,29 @@ impl Backend for WaylandBackend {
 
 	fn raise_window(&mut self, id: &str, token: &OperationToken) -> CoreResult<()> {
 		token.check()?;
+		if id.starts_with(niri::ID_PREFIX) && niri::compatible() {
+			return niri::focus(id);
+		}
 		Err(DesktopError::background_unavailable(format!(
 			"window {id} wayland-compositor-focus-only: Wayland cannot programmatically activate a \
 			 non-focused window; only the currently focused surface is reachable"
 		)))
+	}
+
+	fn control_capabilities(&mut self) -> DesktopControlCapabilities {
+		niri::control_capabilities()
+	}
+
+	fn control(&mut self, action: &ControlAction) -> CoreResult<()> {
+		niri::control(action)
+	}
+
+	fn workspaces(&mut self) -> CoreResult<Vec<DesktopWorkspace>> {
+		niri::workspaces()
+	}
+
+	fn window_state(&mut self, id: &str) -> CoreResult<DesktopWindowState> {
+		niri::window_state(id)
 	}
 
 	fn ax(&mut self) -> Option<&mut dyn AxBackend> {
@@ -409,13 +402,18 @@ mod tests {
 	use std::{
 		io::ErrorKind,
 		os::unix::net::UnixListener,
+		panic::{AssertUnwindSafe, catch_unwind},
 		sync::{Mutex, mpsc},
 		thread,
 	};
 
 	use super::*;
 
-	static LIBEI_ENV_LOCK: Mutex<()> = Mutex::new(());
+	/// Serializes the tests that move process-global environment variables.
+	///
+	/// `NIRI_SOCKET` is moved by the niri compositor tests too, and two threads
+	/// racing on it would read each other's socket.
+	pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 	fn backend_without_services() -> WaylandBackend {
 		WaylandBackend {
@@ -427,7 +425,7 @@ mod tests {
 		}
 	}
 	fn with_fake_libei(action: impl FnOnce(&mut WaylandBackend)) -> bool {
-		let _guard = LIBEI_ENV_LOCK.lock().expect("lock LIBEI_SOCKET test");
+		let _guard = ENV_LOCK.lock().expect("lock the compositor environment");
 		let socket = std::env::temp_dir().join(format!("omp-libei-test-{}", std::process::id()));
 		let _ = std::fs::remove_file(&socket);
 		let listener = UnixListener::bind(&socket).expect("bind fake libei socket");
@@ -452,6 +450,14 @@ mod tests {
 			}
 		});
 		let previous = std::env::var_os("LIBEI_SOCKET");
+		let previous_bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
+		let previous_niri = std::env::var_os("NIRI_SOCKET");
+		// This input contract must not depend on the user's live AX or compositor
+		// services.
+		unsafe {
+			std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent-omp-test-bus");
+			std::env::remove_var("NIRI_SOCKET");
+		}
 		unsafe { std::env::set_var("LIBEI_SOCKET", &socket) };
 		let mut backend = WaylandBackend::new(DisplaySelector::All);
 		action(&mut backend);
@@ -461,9 +467,58 @@ mod tests {
 		} else {
 			unsafe { std::env::remove_var("LIBEI_SOCKET") };
 		}
+		for (name, value) in
+			[("DBUS_SESSION_BUS_ADDRESS", previous_bus), ("NIRI_SOCKET", previous_niri)]
+		{
+			unsafe {
+				if let Some(value) = value {
+					std::env::set_var(name, value);
+				} else {
+					std::env::remove_var(name);
+				}
+			}
+		}
 		let connected = accepted.join().expect("fake libei listener");
 		let _ = std::fs::remove_file(socket);
 		connected
+	}
+
+	/// A `$NIRI_SOCKET` left behind by a compositor that already exited: the
+	/// path is set, so niri attempts the IPC and the connect fails the way a
+	/// restarting compositor's does. The accessibility bus is unreachable too,
+	/// so the fallback listing is what decides the outcome.
+	fn with_unreachable_compositor(action: impl FnOnce(&mut WaylandBackend)) {
+		let guard = ENV_LOCK.lock().expect("lock the compositor environment");
+		let previous_bus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
+		let previous_niri = std::env::var_os("NIRI_SOCKET");
+		unsafe {
+			std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent-omp-test-bus");
+			std::env::set_var("NIRI_SOCKET", "/nonexistent-omp-test-niri.sock");
+		}
+		let mut backend = WaylandBackend::new(DisplaySelector::All);
+		// A failing assertion must not leave the process-global environment
+		// pointing at this test, so the callback is contained and the panic is
+		// resumed only after both variables are back.
+		let outcome = catch_unwind(AssertUnwindSafe(|| action(&mut backend)));
+		for (name, value) in
+			[("DBUS_SESSION_BUS_ADDRESS", previous_bus), ("NIRI_SOCKET", previous_niri)]
+		{
+			unsafe {
+				if let Some(value) = value {
+					std::env::set_var(name, value);
+				} else {
+					std::env::remove_var(name);
+				}
+			}
+		}
+
+		// The lock is released before the panic resumes, so one failed assertion
+		// cannot poison it for the other tests that move the same variables.
+		drop(guard);
+
+		if let Err(payload) = outcome {
+			std::panic::resume_unwind(payload);
+		}
 	}
 
 	#[test]
@@ -474,6 +529,20 @@ mod tests {
 		let capabilities = capabilities.expect("Wayland capabilities");
 		assert!(capabilities.input);
 		assert_eq!(capabilities.input_permission, "prompt-or-granted");
+	}
+
+	#[test]
+	fn unreachable_niri_ipc_falls_back_to_the_accessibility_listing() {
+		with_unreachable_compositor(|backend| {
+			// The compositor socket cannot be connected to, so it cannot answer
+			// the inventory. That IPC is optional metadata: the listing has to
+			// reach the accessibility fallback and report what went wrong there
+			// instead of the compositor's connect failure.
+			let err = backend
+				.windows()
+				.expect_err("the fallback listing has no accessibility bus to answer it");
+			assert_eq!(err.code.as_str(), "AxFailed");
+		});
 	}
 
 	#[test]
@@ -527,7 +596,7 @@ mod tests {
 		let mut backend = backend_without_services();
 		backend
 			.displays
-			.push(PortalGeometry::new(None, None, 1920, 1080).display());
+			.push(PortalGeometry::new(None, None, 1920, 1080).display(0, &[]));
 		let displays = backend.displays().unwrap();
 		assert_eq!(displays.len(), 1);
 		assert_eq!((displays[0].width, displays[0].height), (1920, 1080));
@@ -539,7 +608,7 @@ mod tests {
 		let mut backend = backend_without_services();
 		backend
 			.displays
-			.push(PortalGeometry::new(None, None, 1920, 1080).display());
+			.push(PortalGeometry::new(None, None, 1920, 1080).display(0, &[]));
 		let frame = FrameGeometry::for_displays(&backend.displays);
 		let error = backend.validate_frame_layout(&frame).unwrap_err();
 		assert_eq!(error.code.as_str(), "InvalidCoordinateFrame");
@@ -617,6 +686,7 @@ mod tests {
 				title: "T".into(),
 				app: "A".into(),
 				pid: None,
+				position_known: Some(position_known),
 				x,
 				y,
 				width,
@@ -632,7 +702,7 @@ mod tests {
 		// 2560x2880 buffer for a 1280x1440 logical region at scale 2 (issue
 		// #11540).
 		let geometry = PortalGeometry::new(Some((0, 0)), Some((1280, 1440)), 2560, 2880);
-		let display = geometry.display();
+		let display = geometry.display(0, &[]);
 		assert_eq!((display.width, display.height), (1280, 1440));
 		assert!((display.scale - 2.0).abs() < f64::EPSILON);
 		let frame = FrameGeometry::for_displays(&[display]);
@@ -647,20 +717,20 @@ mod tests {
 	#[test]
 	fn monitor_offset_is_added_to_logical_point() {
 		let geometry = PortalGeometry::new(Some((100, 50)), Some((1280, 1440)), 2560, 2880);
-		let frame = FrameGeometry::for_displays(&[geometry.display()]);
+		let frame = FrameGeometry::for_displays(&[geometry.display(0, &[])]);
 		assert_eq!(frame.map_point(1280.0, 1440.0, None).unwrap(), (740.0, 770.0));
 	}
 
 	#[test]
 	fn missing_portal_size_falls_back_to_buffer_scale_one() {
 		let geometry = PortalGeometry::new(None, None, 1920, 1080);
-		let display = geometry.display();
+		let display = geometry.display(0, &[]);
 		assert_eq!((display.x, display.y), (0, 0));
 		assert_eq!((display.width, display.height), (1920, 1080));
 		assert!((display.scale - 1.0).abs() < f64::EPSILON);
 		// Degenerate (zero) portal dimensions take the same fallback.
 		let degenerate = PortalGeometry::new(Some((0, 0)), Some((0, 0)), 1920, 1080);
-		assert_eq!(degenerate.display().width, 1920);
+		assert_eq!(degenerate.display(0, &[]).width, 1920);
 	}
 
 	#[test]
@@ -680,7 +750,7 @@ mod tests {
 			let err = geometry
 				.window_crop(&window)
 				.expect_err("window outside monitor");
-			assert!(err.message.contains("outside the selected portal monitor"), "{err}");
+			assert_eq!(err.code.as_str(), "CaptureFailed");
 		}
 	}
 
@@ -694,6 +764,5 @@ mod tests {
 			.window_crop(&portal_window(0, 0, 1159, 896, false))
 			.expect_err("unknown position must not be cropped");
 		assert_eq!(err.code.as_str(), "CaptureFailed");
-		assert!(err.message.contains("no known screen position"), "{err}");
 	}
 }

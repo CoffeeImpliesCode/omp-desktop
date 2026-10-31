@@ -1,9 +1,13 @@
 import type { DesktopWindow } from "@oh-my-pi/pi-natives";
 import { truncate } from "@oh-my-pi/pi-utils/format";
 
+/** Apps listed in a miss, candidates first; the rest are counted. */
 const MAX_APPS = 12;
+/** Titled windows named per app in a miss; the rest are counted. */
 const WINDOWS_PER_APP = 3;
+/** Titled windows named for an app the selector's `app` matched: those are the likely candidates. */
 const WINDOWS_PER_MATCHED_APP = 10;
+/** Characters of a window title shown in a miss. */
 const MAX_TITLE_CHARS = 80;
 
 /**
@@ -45,7 +49,8 @@ export function describeWindowMiss(
 			.slice(0, limit)
 			.map(window => `${window.id} ${JSON.stringify(truncate(window.title, MAX_TITLE_CHARS))}`);
 		if (ordered.length > limit) entries.push(`${ordered.length - limit} more`);
-		return `- ${name}: ${entries.join(", ")}`;
+		// App names come from the OS: a newline in one must not start a row of its own.
+		return `- ${name.replace(/[\s\p{Cc}]+/gu, " ")}: ${entries.join(", ")}`;
 	});
 	const omitted = apps.slice(MAX_APPS);
 	if (omitted.length > 0) {

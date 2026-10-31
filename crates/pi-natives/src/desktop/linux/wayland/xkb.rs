@@ -275,9 +275,8 @@ fn parse_keys(section: &str, keycodes: &HashMap<String, u32>) -> Vec<ParsedKey> 
 	keys
 }
 
-/// Finds the next `label` (e.g. `symbols[`) group index at or after `from`,
-/// returning the zero-based group and the byte offset past its `]`. xkbcomp
-/// writes `symbols[Group1]`; libxkbcommon 1.13 writes `symbols[1]`.
+/// Finds the next group index and byte offset past its closing bracket.
+/// xkbcomp writes `Group1`; libxkbcommon may serialize the numeric `1`.
 fn next_group_label(body: &str, label: &str, from: usize) -> Option<(usize, usize)> {
 	let start = from + body[from..].find(label)? + label.len();
 	let end = start + body[start..].find(']')?;
@@ -291,25 +290,25 @@ fn next_group_label(body: &str, label: &str, from: usize) -> Option<(usize, usiz
 	Some((group, end + 1))
 }
 
+fn quoted_name(section: &str) -> Option<&str> {
+	let start = section.find('"')? + 1;
+	let len = section[start..].find('"')?;
+	Some(&section[start..start + len])
+}
 fn parse_group_types(body: &str) -> HashMap<usize, String> {
 	let mut types = HashMap::new();
 	let mut offset = 0;
 	while let Some((group, end)) = next_group_label(body, "type[", offset) {
-		let remainder = &body[end..];
-		if let Some(first_quote) = remainder.find('"')
-			&& let Some(second_quote) = remainder[first_quote + 1..].find('"')
-		{
-			types.insert(group, remainder[first_quote + 1..first_quote + 1 + second_quote].to_owned());
+		if let Some(name) = quoted_name(&body[end..]) {
+			types.insert(group, name.to_owned());
 		}
 		offset = end;
 	}
+	// A key that labels no group declares one type for all of them.
 	if types.is_empty()
-		&& let Some(start) = body.find("type=")
-		&& let Some(first_quote) = body[start..].find('"')
-		&& let Some(second_quote) = body[start + first_quote + 1..].find('"')
+		&& let Some(name) = body.find("type=").and_then(|at| quoted_name(&body[at..]))
 	{
-		let value_start = start + first_quote + 1;
-		types.insert(0, body[value_start..value_start + second_quote].to_owned());
+		types.insert(0, name.to_owned());
 	}
 	types
 }
@@ -329,6 +328,9 @@ fn parse_group_symbols(body: &str) -> HashMap<usize, Vec<String>> {
 		symbols.insert(group, split_symbols(&body[open + 1..close]));
 		offset = close + 1;
 	}
+	// A key with a single unlabeled list takes the first `[` in its body; it
+	// only reaches here when no group label was found at all, so a labeled body
+	// is never mis-read as the bare `Group1` text inside its own label.
 	if symbols.is_empty()
 		&& let Some(open) = body.find('[')
 		&& let Some(close_relative) = body[open + 1..].find(']')
@@ -561,10 +563,9 @@ fn has_candidate(
 mod tests {
 	use std::{
 		fs::File,
-		io::Write,
+		io::{Seek, SeekFrom, Write},
 		os::fd::{FromRawFd, OwnedFd},
 	};
-
 	use super::{KeyStroke, KeyboardLayout};
 
 	const FR: &str = include_str!("testdata/fr.xkb");
@@ -574,42 +575,85 @@ mod tests {
 		KeyStroke { keycode, modifiers: modifiers.to_vec() }
 	}
 
-	/// Newer libxkbcommon (e.g. 1.13) serializes group labels as `symbols[1]`.
-	fn numeric_group_labels(keymap: &str) -> String {
-		keymap
-			.replace("symbols[Group", "symbols[")
-			.replace("type[Group", "type[")
-	}
-
-	#[test]
-	fn reads_the_keymap_from_the_start_of_a_shared_fd() {
-		// SAFETY: `memfd_create` returns a fresh descriptor or -1; ownership
-		// moves into the `File` exactly once.
-		let mut file = unsafe {
+	/// libei announces a keymap as a duplicate of the compositor's descriptor,
+	/// so both share one open file description and therefore one offset. The
+	/// compositor leaves that offset at EOF once the keymap is serialized, and
+	/// that shared descriptor is exactly what `read_keymap` hands over.
+	fn shared_keymap_fd(keymap: &str) -> (File, OwnedFd) {
+		// SAFETY: `memfd_create` returns a fresh descriptor or -1, which the
+		// assertion rejects; ownership moves into `File` exactly once.
+		let mut composer = unsafe {
 			let fd = libc::memfd_create(c"xkb".as_ptr(), 0);
 			assert!(fd >= 0, "memfd_create failed");
 			File::from_raw_fd(fd)
 		};
-		// The compositor writes the keymap and leaves the shared offset at EOF.
-		file.write_all(FR.as_bytes()).unwrap();
-		let fd = OwnedFd::from(file.try_clone().unwrap());
+		let written = composer.write_all(keymap.as_bytes());
+		written.expect("write the keymap");
+		let reader = OwnedFd::from(composer.try_clone().expect("duplicate the keymap fd"));
+		(composer, reader)
+	}
 
-		let layout = KeyboardLayout::from_fd(fd, FR.len()).expect("keymap at offset 0 must compile");
+	/// libxkbcommon's keymap serializer labels groups numerically
+	/// (`symbols[1]`, `type[2]`) where xkbcomp writes `symbols[Group1]`. Only
+	/// the numeric spelling reaches a compositor that hands the serialized
+	/// keymap over as a keymap fd.
+	fn numeric_group_labels(keymap: &str) -> String {
+		let symbols = keymap.replace("symbols[Group", "symbols[");
+		symbols.replace("type[Group", "type[")
+	}
+
+	/// Reading from the shared offset would find nothing, and every printable
+	/// character would then fail with "no usable XKB keymap was announced".
+	#[test]
+	fn reads_a_keymap_left_at_end_of_file_in_the_shared_fd() {
+		let (mut composer, reader) = shared_keymap_fd(FR);
+		let offset = composer.stream_position();
+		assert_eq!(offset.expect("shared offset"), FR.len() as u64);
+
+		let keymap = KeyboardLayout::from_fd(reader, FR.len());
+		let layout = keymap.expect("a keymap left at EOF must compile");
 		assert_eq!(layout.resolve_char('a'), Some(stroke(16, &[])));
 	}
 
+	/// The descriptor belongs to the compositor as much as to us: moving its
+	/// offset would make the compositor read the wrong bytes out of it next.
 	#[test]
-	fn resolves_numeric_group_labels() {
-		let mut layout = KeyboardLayout::compile(&numeric_group_labels(US_FR))
-			.expect("US/French fixture must compile");
+	fn reading_the_keymap_leaves_the_shared_fd_offset_untouched() {
+		let (mut composer, reader) = shared_keymap_fd(FR);
+		let rewound = composer.seek(SeekFrom::Start(0));
+		rewound.expect("rewind the shared offset");
+
+		let keymap = KeyboardLayout::from_fd(reader, FR.len());
+		keymap.expect("the keymap must compile");
+
+		let offset = composer.stream_position();
+		assert_eq!(offset.expect("shared offset"), 0, "the read moved the offset");
+	}
+
+	/// A numeric `symbols[2]` is the whole second layout. Without it every
+	/// character of the non-US group is unresolvable on KWin and GNOME.
+	#[test]
+	fn resolves_a_second_group_labelled_numerically() {
+		let source = numeric_group_labels(US_FR);
+		let compiled = KeyboardLayout::compile(&source);
+		let mut layout = compiled.expect("US/French fixture must compile");
 		assert_eq!(layout.resolve_char('a'), Some(stroke(30, &[])));
-		assert_eq!(layout.resolve_char('@'), Some(stroke(3, &[42])));
+
 		layout.update_modifiers(0, 0, 0, 1);
+		assert_eq!(layout.active_group(), 1);
 		assert_eq!(layout.resolve_char('a'), Some(stroke(16, &[])));
 		assert_eq!(layout.resolve_char('é'), Some(stroke(3, &[])));
+	}
 
-		let layout =
-			KeyboardLayout::compile(&numeric_group_labels(FR)).expect("French fixture must compile");
+	/// Most desktops announce one layout, whose keys carry a `symbols[1]`
+	/// label and no `type[` label at all. Reading that label must not cost the
+	/// AltGr and shift levels the single-group body already declares.
+	#[test]
+	fn keeps_single_group_levels_under_numeric_group_labels() {
+		let source = numeric_group_labels(FR);
+		let compiled = KeyboardLayout::compile(&source);
+		let layout = compiled.expect("French fixture must compile");
+		assert_eq!(layout.resolve_char('1'), Some(stroke(2, &[42])));
 		assert_eq!(layout.resolve_char('#'), Some(stroke(4, &[100])));
 	}
 

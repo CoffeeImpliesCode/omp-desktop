@@ -4,15 +4,16 @@ use image::RgbaImage;
 
 use super::{
 	ax::{AxHandle, AxProps, WalkBounds},
-	control::OperationToken,
+	control::{ControlAction, OperationToken},
 	error::{CoreResult, DesktopError, ErrorCode},
 	frame::FrameGeometry,
 	keys::KeyName,
 	menus::DesktopMenuItem,
 	text_range::TextSelectRequest,
 	types::{
-		AxTextSelection, CaptureCaps, DesktopCapabilities, DesktopDisplay, DesktopWindow,
-		DisplaySelector, ScreenState, Target,
+		AxTextSelection, CaptureCaps, DesktopCapabilities, DesktopControlCapabilities,
+		DesktopDisplay, DesktopWindow, DesktopWindowState, DesktopWorkspace, DisplaySelector,
+		ScreenState, Target,
 	},
 };
 
@@ -397,6 +398,62 @@ pub trait Backend: Send {
 		))
 	}
 	fn raise_window(&mut self, id: &str, token: &OperationToken) -> CoreResult<()>;
+	/// Window-control surface this backend really serves. The default covers a
+	/// platform whose only native focus primitive is `raise_window`; a backend
+	/// with a real control surface overrides this and advertises nothing it
+	/// cannot prove.
+	fn control_capabilities(&mut self) -> DesktopControlCapabilities {
+		DesktopControlCapabilities {
+			backend:                self.capabilities().backend,
+			operations:             vec!["focusWindow".to_string()],
+			coordinate_space:       None,
+			focus_may_warp_pointer: false,
+		}
+	}
+
+	/// Runs one validated control request. Success means the request was
+	/// dispatched and accepted, not that the application obeyed it.
+	fn control(&mut self, action: &ControlAction) -> CoreResult<()> {
+		match action {
+			ControlAction::FocusWindow(id) => match super::control::current_token() {
+				Some(token) => self.raise_window(id, &token),
+				None => Err(DesktopError::cancelled("desktop control has no active operation token")),
+			},
+			_ => Err(DesktopError::control_unsupported(format!(
+				"the {} backend does not support the '{}' control",
+				self.control_capabilities().backend,
+				action.operation()
+			))),
+		}
+	}
+
+	fn workspaces(&mut self) -> CoreResult<Vec<DesktopWorkspace>> {
+		Err(DesktopError::control_unsupported(format!(
+			"the {} backend does not report workspaces",
+			self.control_capabilities().backend
+		)))
+	}
+
+	/// Fresh read of one window. A backend that knows nothing beyond what
+	/// [`DesktopWindow`] already carries leaves every state field absent.
+	fn window_state(&mut self, id: &str) -> CoreResult<DesktopWindowState> {
+		let window = self
+			.windows()?
+			.into_iter()
+			.find(|window| window.id == id)
+			.ok_or_else(|| DesktopError::window_not_found(format!("window '{id}' was not found")))?;
+		Ok(DesktopWindowState {
+			window,
+			workspace_id: None,
+			display_id: None,
+			floating: None,
+			urgent: None,
+			maximized: None,
+			minimized: None,
+			fullscreen: None,
+		})
+	}
+
 	fn ax(&mut self) -> Option<&mut dyn AxBackend>;
 }
 

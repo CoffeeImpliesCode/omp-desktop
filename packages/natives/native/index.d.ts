@@ -103,7 +103,14 @@ export declare class DesktopSession {
   scroll(target: string, x: number, y: number, dx: number, dy: number, opts?: PointerOptions | undefined | null): Promise<DesktopFocusReturn | undefined | null>
   typeText(target: string, text: string, opts?: PointerOptions | undefined | null): Promise<DesktopFocusReturn | undefined | null>
   keyChord(target: string, keys: Array<string>, opts?: PointerOptions | undefined | null): Promise<DesktopFocusReturn | undefined | null>
+  /**
+   * Runs one window-control request. Success means the compositor or window
+   * manager accepted it, not that the application obeyed it.
+   */
+  control(action: DesktopControlAction): Promise<undefined>
   raiseWindow(windowId: string): Promise<undefined>
+  listWorkspaces(): Promise<Array<DesktopWorkspace>>
+  windowState(windowId: string): Promise<DesktopWindowState>
   axSnapshot(target: string, opts?: AxSnapshotOptions | undefined | null): Promise<AxSnapshot>
   axQuery(target: string, query: AxQuery): Promise<Array<AxNode>>
   /**
@@ -1465,6 +1472,11 @@ export interface DesktopCapabilities {
   axPermission: string
   displayCount: number
   /**
+   * Window-control surface of the live backend, absent when the backend
+   * cannot control windows.
+   */
+  windowControl?: DesktopControlCapabilities
+  /**
    * The user session is locked (lock screen up). Only macOS detects this;
    * other backends report `false`.
    */
@@ -1505,6 +1517,53 @@ export interface DesktopCapture {
    * last frame behind it. Only macOS detects this; others report `false`.
    */
   screenLocked: boolean
+}
+
+/**
+ * One window-control request. Only the fields its `operation` names are read;
+ * every other field must stay absent.
+ */
+export interface DesktopControlAction {
+  operation: string
+  /** Exact id from `listWindows`. */
+  windowId?: string
+  /** Exact id from `listWorkspaces`. */
+  workspaceId?: string
+  /** Exact id from `listDisplays`. */
+  displayId?: string
+  x?: number
+  y?: number
+  dx?: number
+  dy?: number
+  width?: number
+  height?: number
+  enabled?: boolean
+  focus?: boolean
+}
+
+/**
+ * Window-control surface of the live backend. A missing
+ * [`DesktopCapabilities::window_control`] block means the backend cannot
+ * control windows at all.
+ */
+export interface DesktopControlCapabilities {
+  /**
+   * Backend serving these operations, matching
+   * `DesktopCapabilities::backend`.
+   */
+  backend: string
+  /**
+   * CamelCase operations this backend really implements. Absent or empty
+   * means control is unavailable; the list is a promise, not a hint.
+   */
+  operations: Array<string>
+  /**
+   * Coordinate space `moveWindow`/`moveWindowBy` use, absent when the backend
+   * offers no window movement.
+   */
+  coordinateSpace?: string
+  /** Focusing may move the physical pointer under compositor/WM policy. */
+  focusMayWarpPointer: boolean
 }
 
 export interface DesktopControlState {
@@ -1591,13 +1650,15 @@ export interface DesktopSessionOptions {
   escapeStopKey?: string
 }
 
-/** One capturable top-level window in global logical desktop coordinates. */
+/**
+ * One capturable top-level window. Origins are global only when
+ * `position_known`.
+ */
 export interface DesktopWindow {
   /**
    * Backend-defined opaque window id, valid as a capture target while the
-   * window lives. Numeric on X11/Win32/macOS; a composite AT-SPI string on
-   * Wayland (e.g. `atspi::1.31:/org/a11y/atspi/accessible/1`). Never parse
-   * it.
+   * window lives. Numeric on X11/Win32/macOS; compositor or AT-SPI ids on
+   * Wayland. Never parse it.
    */
   id: string
   /** Window title; may be empty for untitled windows. */
@@ -1606,12 +1667,47 @@ export interface DesktopWindow {
   app: string
   /** Owning process id when the platform exposes it. */
   pid?: number
+  /**
+   * False when the compositor/toolkit cannot expose a global screen origin.
+   * In that case x/y must not be used for global input or desktop cropping.
+   */
+  positionKnown?: boolean
   x: number
   y: number
   width: number
   height: number
   /** Whether the window currently holds input focus. */
   focused: boolean
+}
+
+/**
+ * Fresh read of one window plus the state the backend really knows. An absent
+ * field means unknown, never `false`.
+ */
+export interface DesktopWindowState {
+  window: DesktopWindow
+  workspaceId?: string
+  displayId?: string
+  floating?: boolean
+  urgent?: boolean
+  maximized?: boolean
+  minimized?: boolean
+  fullscreen?: boolean
+}
+
+/**
+ * One workspace as the backend reports it. `id` is opaque and stable, and
+ * only an id returned here is ever a valid mutation target.
+ */
+export interface DesktopWorkspace {
+  id: string
+  index: number
+  name?: string
+  displayId?: string
+  active: boolean
+  focused: boolean
+  urgent: boolean
+  activeWindowId?: string
 }
 
 /**

@@ -128,7 +128,12 @@ interface TabSessionBase<TBrowser extends BrowserHandle = BrowserHandle> {
 export interface WorkerTabSession extends TabSessionBase<PuppeteerBrowserHandle> {
 	backend: "worker";
 	worker: WorkerHandle;
-	/** omp created this page (headless, or a relay open without a target): closing the tab closes it. */
+	activateForScreenshot: boolean;
+	/**
+	 * Whether this tab's page was created for it and may therefore be destroyed
+	 * on release, including after a worker recycle or debugger detach.
+	 * False means the page belongs to the user and must survive teardown.
+	 */
 	ownsPage: boolean;
 	/**
 	 * The tab's upload staging folder. It outlives the tab's workers, since Chrome reads a picked file only when the page
@@ -620,6 +625,7 @@ async function acquireTabImpl(
 		dialogPolicy: opts.dialogs,
 		allowedDomains: opts.allowedDomains ? [...opts.allowedDomains] : undefined,
 		kindTag: browser.kind.kind,
+		activateForScreenshot: initPayload.mode === "headless" || initPayload.activateForScreenshot !== false,
 		ownsPage: ownsPage(initPayload),
 		ownerSessionId: opts.ownerSessionId,
 		persist: opts.persist ?? false,
@@ -1357,35 +1363,36 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 	let targetCloseFailed = false;
 	if (wasAlive && !(tab.worker as ExitTrackedWorker)[kWorkerExited]) {
 		try {
+			const closed = waitForClosed(tab);
+			closed.catch(() => undefined);
 			tab.worker.send({ type: "close" });
-			await waitForClosed(tab);
+			await closed;
 		} catch {
 			// The close by id below confirms an owned page is gone either way.
 		}
 	}
 	await tab.worker.terminate().catch(() => undefined);
-	// omp closes the pages it owns, and with them goes the last reader of their staged uploads.
-	if (tab.ownsPage) await removeUploadStaging(tab.uploadDir);
-	// Close a live tab's owned page by id as well, which confirms it is gone: a worker's own
-	// close can fail and still report `closed` (its CDP socket broke), and the relay retracts a
-	// target whose debugger the user dismissed, so the worker cannot close it at all. A dead
-	// tab's page was closed by the teardown that killed it.
+	// Confirm every live owned page is gone, even if the worker already reported
+	// it closed after losing its CDP connection or debugger attachment.
 	if (tab.ownsPage && wasAlive) {
 		try {
-			// `false` is "not confirmed closed" (the CDP session could not be
-			// created, or `Target.getTargets` failed) — the same unconfirmed
-			// state the timeout reports as an error, so both mark the tab.
+			// `false` is "not confirmed closed" (the root connection was gone,
+			// or the close failed) — the same unconfirmed state the timeout
+			// reports as an error, so both mark the tab.
 			targetCloseFailed = !(await waitForTabCleanup(
 				tab,
 				timeoutMs,
-				`orphan CDP target ${JSON.stringify(tab.targetId)} (Page.close)`,
-				closeOrphanTarget(tab, timeoutMs),
+				`owned CDP target ${JSON.stringify(tab.targetId)} (Target.closeTarget)`,
+				closeOwnedTarget(tab, timeoutMs),
 			));
 		} catch (error) {
 			targetCloseFailed = true;
 			cleanupError = error;
 		}
 	}
+	// The page is the last reader of its staged uploads. Borrowed pages and
+	// unconfirmed closes keep their copies until the stale-folder sweep.
+	if (tab.ownsPage && !targetCloseFailed) await removeUploadStaging(tab.uploadDir);
 	try {
 		await releaseBrowser(tab.browser, {
 			kill: opts.kill ?? false,
@@ -1422,11 +1429,24 @@ async function releaseTabInner(tab: TabSession, name: string, opts: ReleaseTabOp
 	return true;
 }
 
+/**
+ * Release every managed tab. Never throws: cleanup failures are logged so one
+ * tab cannot strand the workers and browser holds queued behind it. Returns
+ * successful releases, including owned pages whose close remains unconfirmed;
+ * those warn and retain their staged uploads for the stale-folder sweep.
+ */
 export async function releaseAllTabs(opts: ReleaseTabOptions = {}): Promise<number> {
 	const names = [...tabs.keys()];
 	let count = 0;
 	for (const name of names) {
-		if (await releaseTab(name, opts)) count++;
+		try {
+			if (await releaseTab(name, opts)) count++;
+		} catch (error) {
+			logger.warn("Failed to close browser tab; continuing release", {
+				name,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 	return count;
 }
@@ -1448,13 +1468,23 @@ export async function dropHeadlessTabs(): Promise<void> {
  * session opened will not yank teardown responsibility away from the
  * creator. Tabs opened with no owner (e.g. from an SDK caller that doesn't
  * identify a session) are skipped and must be released explicitly.
+ *
+ * Never throws for the same reason as {@link releaseAllTabs}; the returned
+ * count covers successful releases, not confirmed physical page closes.
  */
 export async function releaseTabsForOwner(ownerId: string, opts: ReleaseTabOptions = {}): Promise<number> {
 	if (!ownerId) return 0;
 	const names = [...tabs.values()].filter(tab => tab.ownerSessionId === ownerId).map(tab => tab.name);
 	let count = 0;
 	for (const name of names) {
-		if (await releaseTab(name, opts)) count++;
+		try {
+			if (await releaseTab(name, opts)) count++;
+		} catch (error) {
+			logger.warn("Failed to close session browser tab; continuing release", {
+				name,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 	return count;
 }
@@ -1817,8 +1847,6 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 			browserWSEndpoint,
 			safeDir,
 			uploadDir,
-			// Visible launches still need an OMP-owned page, stealth setup, and
-			// independent lifecycle; only their fixed device emulation is disabled.
 			emulateViewport: browser.kind.headless,
 			viewport: opts.viewport,
 			dialogs: opts.dialogs,
@@ -1829,7 +1857,6 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 			ignoreHttpsErrors: opts.ignoreHttpsErrors,
 		};
 	}
-
 	const userDriven = browser.kind.kind === "connected" || browser.kind.kind === "relay";
 	let page: AttachPage;
 	if (browser.kind.kind === "relay" && !opts.target) {
@@ -1854,6 +1881,7 @@ async function buildInitPayload(browser: PuppeteerBrowserHandle, opts: AcquireTa
 		safeDir,
 		uploadDir,
 		page,
+		activateForScreenshot: page.kind !== "create" && (!userDriven || Boolean(opts.target)),
 		dialogs: opts.dialogs,
 		allowedDomains: opts.allowedDomains,
 		initScripts: opts.initScripts,
@@ -2063,6 +2091,7 @@ async function recycleTimedOutWorkerTab(
 		// Unblock a wedged page (open JS dialog, hung navigation) before adopting it —
 		// otherwise init stalls, times out, and the tab gets force-killed.
 		recover: opts.recover ?? true,
+		activateForScreenshot: tab.activateForScreenshot,
 		userDriven: tab.kindTag === "connected" || tab.kindTag === "relay",
 	};
 	// A release can land while the new worker starts: it tore down the worker it saw, so a
@@ -2153,26 +2182,38 @@ async function forceKillSurfaceTab(tab: CmuxTabSession | TernTabSession, name: s
  * `releaseTabInner` bounds it — a release joining this teardown must not inherit
  * an unbounded CDP wait (Puppeteer's protocol timeout is 60 s). Teardown must
  * still finish: the tab is already dead to its callers.
+ *
+ * Only a shared headless browser has a durable record to fall back on. A relay
+ * tab has none — nobody can retry its close once this returns — so an
+ * unconfirmed close there is reported instead of vanishing with the tab.
  */
 async function forceKillTabTeardown(tab: WorkerTabSession): Promise<void> {
 	await tab.worker.terminate().catch(() => undefined);
-	if (tab.ownsPage) await removeUploadStaging(tab.uploadDir);
 	let targetClosed = true;
 	if (tab.ownsPage) {
 		targetClosed = await waitForTabCleanup(
 			tab,
 			DEFAULT_TAB_CLOSE_TIMEOUT_MS,
-			`orphan CDP target ${JSON.stringify(tab.targetId)} (Page.close)`,
-			closeOrphanTarget(tab, DEFAULT_TAB_CLOSE_TIMEOUT_MS),
+			`owned CDP target ${JSON.stringify(tab.targetId)} (Target.closeTarget)`,
+			closeOwnedTarget(tab, DEFAULT_TAB_CLOSE_TIMEOUT_MS),
 		).catch(() => false);
 	}
+	if (tab.ownsPage && targetClosed) await removeUploadStaging(tab.uploadDir);
 	await releaseBrowser(tab.browser, { kill: false });
 	tabs.delete(tab.name);
 	const scope = sharedScopeOf(tab.browser);
-	if (scope) {
-		if (targetClosed) void forgetSharedTarget(scope, tab.targetId);
-		else recheckSharedBrowser(scope);
+	if (!scope) {
+		if (!targetClosed) {
+			logger.warn("Owned target not confirmed closed; the page may still be open", {
+				name: tab.name,
+				targetId: tab.targetId,
+				kind: tab.kindTag,
+			});
+		}
+		return;
 	}
+	if (targetClosed) void forgetSharedTarget(scope, tab.targetId);
+	else recheckSharedBrowser(scope);
 }
 
 /**
@@ -2186,7 +2227,10 @@ async function closeTargetById(
 	targetId: string,
 	confirmTimeoutMs?: number,
 ): Promise<boolean> {
-	if (browser.kind.kind === "relay") return await closeRelayTarget(browserConnection(browser.browser), targetId);
+	if (browser.kind.kind === "relay") {
+		if (!browser.browser.connected) return false;
+		return await closeRelayTarget(browserConnection(browser.browser), targetId);
+	}
 	return await closeCdpTarget(browser.browser, targetId, confirmTimeoutMs);
 }
 
@@ -2219,15 +2263,17 @@ function recheckSharedBrowser(scope: SharedTargetScope): void {
 }
 
 /**
- * Best-effort cleanup for a forced-kill path: close the page the tab's worker
- * reported as created. A run caller is never a browser ref holder, so the
- * browser is still in the registry; the tab's browser is the only place that
- * page can be, so no targetId guesswork across multiple sessions.
+ * Best-effort close of the page target a tab owns, used whenever the worker's
+ * own close cannot be trusted to have happened: a forced kill, or a normal
+ * relay release where the relay already retracted the target. A run caller is
+ * never a browser ref holder, so the browser is still in the registry; the
+ * tab's browser is the only place that page can be, so no targetId guesswork
+ * across multiple sessions.
  *
  * `budgetMs` is the caller's bound on the whole close. The `targetDestroyed`
  * wait gets half of it, leaving the rest for the `Target.getTargets` fallback.
  */
-async function closeOrphanTarget(tab: WorkerTabSession, budgetMs: number): Promise<boolean> {
+async function closeOwnedTarget(tab: WorkerTabSession, budgetMs: number): Promise<boolean> {
 	return await closeTargetById(tab.browser, tab.targetId, budgetMs / 2);
 }
 

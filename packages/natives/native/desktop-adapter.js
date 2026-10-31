@@ -19,6 +19,9 @@ const REQUIRED_METHODS = [
 	"axSelectText",
 	"holdDisplayUntilReleased",
 	"releaseDisplayAwake",
+	"control",
+	"listWorkspaces",
+	"windowState",
 ];
 
 /** Getters the computer worker reads; without `escapeStops` it would read every run as stopped by the user's Escape. */

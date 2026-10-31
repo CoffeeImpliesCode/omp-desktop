@@ -3,6 +3,35 @@ import { adaptDesktopSession } from "../native/desktop-adapter.js";
 import { desktopEscapeStops, forgetDesktopEscapeStops } from "../native/desktop.js";
 import * as loaderState from "../native/loader-state.js";
 
+class CurrentDesktopSession {
+	click() {}
+	capture() {}
+	captureRegion() {}
+	cancel() {}
+	retire() {}
+	setRunDeadline() {}
+	observe() {}
+	listApplications() {}
+	openApplication() {}
+	menuItems() {}
+	menuSelect() {}
+	holdKeys() {}
+	holdMouse() {}
+	acquireControl() {}
+	releaseControl() {}
+	controlState() {}
+	bringToCurrentSpace() {}
+	axSelectText() {}
+	holdDisplayUntilReleased() {}
+	releaseDisplayAwake() {}
+	control() {}
+	listWorkspaces() {}
+	windowState() {}
+	get escapeStops() {
+		return 0;
+	}
+}
+
 describe("desktop native ABI requirements", () => {
 	it.each([
 		["missing desktop export", undefined],
@@ -12,20 +41,6 @@ describe("desktop native ABI requirements", () => {
 				execute() {}
 			},
 		],
-		[
-			"pre-zoom ABI",
-			class {
-				click() {}
-				cancel() {}
-			},
-		],
-		[
-			"uncancellable ABI",
-			class {
-				click() {}
-				captureRegion() {}
-			},
-		],
 	])("defers rejection of %s until desktop use without constructing the addon", (_label, NativeSession) => {
 		// Importing the shared native module must remain safe for non-desktop tools.
 		const DesktopSession = adaptDesktopSession(NativeSession);
@@ -33,8 +48,20 @@ describe("desktop native ABI requirements", () => {
 	});
 
 	it("rejects an addon built before the turn-scoped display hold", () => {
-		const Stale = adaptDesktopSession(class {});
+		class StaleDesktopSession extends CurrentDesktopSession {}
+		Object.defineProperties(StaleDesktopSession.prototype, {
+			holdDisplayUntilReleased: { value: undefined },
+			releaseDisplayAwake: { value: undefined },
+		});
+		const Stale = adaptDesktopSession(StaleDesktopSession);
 		expect(() => new Stale({ display: "active" })).toThrow(/holdDisplayUntilReleased, releaseDisplayAwake/);
+	});
+
+	it.each(["control", "listWorkspaces", "windowState"])("rejects an addon missing %s", method => {
+		class StaleDesktopSession extends CurrentDesktopSession {}
+		Object.defineProperty(StaleDesktopSession.prototype, method, { value: undefined });
+		const Stale = adaptDesktopSession(StaleDesktopSession);
+		expect(() => new Stale({ display: "active" })).toThrow(`missing ${method}`);
 	});
 
 	it("rejects an addon built before the Escape stop count", () => {
