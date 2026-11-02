@@ -414,6 +414,7 @@ export class ToolExecutionComponent extends Container {
 	// (versioned by #resultVersion), #showImages, and the image protocol.
 	#textOutput = "";
 	#textOutputKey: string | undefined;
+	#renderContextReleased = false;
 	#tool?: AgentTool;
 	#renderer?: ToolRenderer;
 	#ui: ToolExecutionUi;
@@ -462,7 +463,7 @@ export class ToolExecutionComponent extends Container {
 	readonly #native = new Memo();
 	// LSP diagnostics that arrived after the result (native only), shown in the frame.
 	#lateDiagnostics: readonly FileDiagnosticsResult[] | undefined;
-	readonly #nativeImages = new NativeImageCache();
+	#nativeImages: NativeImageCache | undefined;
 	// Wall clock captured whenever a task card is rebuilt.
 	#taskRenderNowMs = Date.now();
 	// Set on each `render()` when the last painted pending shape must be
@@ -628,9 +629,8 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	/**
-	 * True once a terminal result makes the streaming preview moot: renderResult
-	 * prefers `details.diff` and renders errors from the result text, consulting
-	 * the computed preview only for a non-error result that carries no details.
+	 * Ignore late preview batches once a result settles. Errors may still use
+	 * the preview's location, and detail-free results still need its diff.
 	 */
 	#previewDiffSettled(): boolean {
 		const result = this.#result;
@@ -653,6 +653,22 @@ export class ToolExecutionComponent extends Container {
 		this.#blockVersion++;
 		this.#isPartial = isPartial;
 		this.#displaceableByToolName = displaceableToolName(this.#toolName, result, isPartial);
+		if (!isPartial && this.#editDiffPreview) {
+			const finalDetails = this.#result.details;
+			const first = this.#editDiffPreview[0];
+			if (result.isError === true) {
+				// Refused edits still link to the preview's first changed line,
+				// but never display its diff or the other files' previews.
+				this.#editDiffPreview =
+					first && !first.error && first.firstChangedLine
+						? [{ path: first.path, firstChangedLine: first.firstChangedLine }]
+						: undefined;
+			} else if (finalDetails != null && !(isRecord(finalDetails) && "errorKind" in finalDetails)) {
+				// Authoritative details replace the call-phase preview, including
+				// empty-diff no-op/delete/move results. No-details fallbacks stay.
+				this.#editDiffPreview = undefined;
+			}
+		}
 		// When tool is complete, ensure args are marked complete so spinner stops
 		if (!isPartial) {
 			this.#argsComplete = true;
@@ -1223,7 +1239,7 @@ export class ToolExecutionComponent extends Container {
 			executionStarted: this.#executionStarted,
 			elapsedMs: this.#elapsedMs(status),
 			cancelled: status === "cancelled",
-			renderContext: this.#buildRenderContext(),
+			renderContext: this.#buildRenderContext(false),
 		};
 		// Custom tools (MCP, extensions) carry their own describe hooks, mirroring
 		// the ANSI path's preference for the tool's renderCall/renderResult.
@@ -1304,7 +1320,12 @@ export class ToolExecutionComponent extends Container {
 		const images: NativeNode[] = [];
 		this.#getAllImageBlocks().forEach((image, index) => {
 			if (!image.data || !image.mimeType) return;
-			const described = this.#nativeImages.get(`img${index}`, image.data, image.mimeType, mediaPath);
+			const described = (this.#nativeImages ??= new NativeImageCache()).get(
+				`img${index}`,
+				image.data,
+				image.mimeType,
+				mediaPath,
+			);
 			if (!shown.blobs.has((described.p as { blob?: string } | undefined)?.blob ?? "")) images.push(described);
 		});
 		return images;
@@ -1329,6 +1350,21 @@ export class ToolExecutionComponent extends Container {
 	override invalidate(): void {
 		super.invalidate();
 		this.#updateDisplay();
+	}
+
+	override releaseRenderCaches(): void {
+		super.releaseRenderCaches();
+		this.#native.clear();
+		this.#nativeImages = undefined;
+		this.#textOutput = "";
+		this.#textOutputKey = undefined;
+		this.#renderContextReleased ||= this.#renderState.renderContext !== undefined;
+		this.#renderState.renderContext = undefined;
+		// FenceFigure has no release hook. Its invalidate only drops layout
+		// state; retain the raster so scrollback replay stays synchronous.
+		this.#figure?.invalidate();
+		// Keep mounted children and Kitty PNGs: replacing them would lose
+		// renderer state or require async conversion after shared-cache eviction.
 	}
 
 	#updateDisplay(): void {
@@ -1381,6 +1417,10 @@ export class ToolExecutionComponent extends Container {
 	override render(width: number): readonly string[] {
 		if (!this.#toolActivityVisible || this.#allocation === 0 || (this.#toolName === "wait" && this.#isBenignSkip())) {
 			return [];
+		}
+		if (this.#renderContextReleased) {
+			this.#renderState.renderContext = this.#buildRenderContext(false);
+			this.#renderContextReleased = false;
 		}
 		let lines = super.render(width);
 		if (this.#allocation < 3) {
@@ -1463,6 +1503,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	#rebuildDisplay(): void {
+		this.#renderContextReleased = false;
 		// Sync shared mutable render state for component closures
 		this.#renderState.expanded = this.#expanded;
 		this.#renderState.isPartial = this.#isPartial;
@@ -1851,7 +1892,7 @@ export class ToolExecutionComponent extends Container {
 	/**
 	 * Build render context for tools that need extra state (bash, python, edit)
 	 */
-	#buildRenderContext(): Record<string, unknown> {
+	#buildRenderContext(refreshClock = true): Record<string, unknown> {
 		const context: Record<string, unknown> = {};
 		const normalizeTimeoutSeconds = (value: unknown, maxSeconds: number): number | undefined => {
 			if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
@@ -1882,14 +1923,15 @@ export class ToolExecutionComponent extends Container {
 			// draws every dispatched agent as a progress/result line, so tell
 			// `renderCall` to drop its duplicate streaming preview list.
 			context.hasResult = Boolean(this.#result);
-			this.#taskRenderNowMs = Date.now();
+			// Native descriptions and released-cache replay reuse this snapshot's clock.
+			if (refreshClock) this.#taskRenderNowMs = Date.now();
 			context.nowMs = this.#taskRenderNowMs;
 		} else if (isEditLikeToolName(this.#toolName)) {
 			context.editMode = this.#editMode;
 			const previews = this.#editDiffPreview;
 			if (previews && previews.length > 0) {
 				const first = previews[0];
-				if (first?.diff || first?.error) {
+				if (first?.diff || first?.error || (this.#result?.isError === true && first?.firstChangedLine)) {
 					context.editDiffPreview = first.error
 						? { error: first.error }
 						: { diff: first.diff ?? "", firstChangedLine: first.firstChangedLine };
@@ -1898,7 +1940,7 @@ export class ToolExecutionComponent extends Container {
 					context.perFileDiffPreview = previews;
 				}
 			}
-			if (!previews?.some(preview => preview.diff)) {
+			if (!this.#previewDiffSettled() && !previews?.some(preview => preview.diff)) {
 				const editMode = this.#editMode;
 				const fallback = editMode ? renderStreamingFallback(editMode, this.#args, theme) : "";
 				if (fallback) context.editStreamingFallback = fallback;

@@ -44,14 +44,14 @@ await tool.<name>(args) — session tool; `args` is its parameter object
 {{{inlineTopics}}}
 {{else}}
 <namespaces>
-More globals; `read` the linked docs before first use:
+More globals; `read` the linked docs before first use{{#if deliveredDocs}}, except where a line says its doc arrives unasked{{/if}}:
 - `judge`, `{{#if py}}judge_batch{{else}}judgeBatch{{/if}}`, `completion`: classification, bulk judgment, model calls → `xd://eval/judge`
 - `%load`{{#if py}}, `%pip`{{/if}}{{#if js}}, `%bun add`{{/if}}, `budget`{{#if evalTools}}, `@tool`/`tool(fn)`{{/if}}: setup, installs, utilities → `xd://eval/helpers`
 {{#if spawns}}
 - `agent`, `workpool`: background subagents, DAG waves → `xd://eval/agents`
 {{/if}}
 {{#each preludes}}
-- `{{name}}`: {{summary}} → `xd://eval/{{name}}`
+- `{{name}}`: {{summary}} → `xd://eval/{{name}}`{{#if delivery}}; {{delivery}}{{/if}}
 {{/each}}
 </namespaces>
 {{#each inlinePreludes}}

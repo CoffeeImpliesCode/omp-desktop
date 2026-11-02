@@ -11,7 +11,7 @@ import { ToolAbortError } from "../../tools/tool-errors";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { safeSend as safeSendIpc } from "../../utils/ipc";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../bridge-timeout";
-import { getEnabledEvalPreludes } from "../preludes";
+import { type EvalPreludeCell, getActiveEvalPreludeCell, getEnabledEvalPreludes } from "../preludes";
 import {
 	attachSessionOwner,
 	EvalKernelNotRunningError,
@@ -69,6 +69,8 @@ interface PendingRun {
 	runState: VmRunState;
 	toolSession: ToolSession;
 	shadowCell?: EvalShadowCellSession;
+	/** The eval cell this run executes, handed to prelude calls it makes. */
+	preludeCell?: EvalPreludeCell;
 	resolve(value: { value: unknown }): void;
 	reject(error: Error): void;
 	toolCalls: Map<string, AbortController>;
@@ -524,6 +526,7 @@ async function runOnce(
 		runState: options.runState,
 		toolSession: options.session,
 		shadowCell: getActiveEvalShadowCell(),
+		preludeCell: getActiveEvalPreludeCell(),
 		resolve,
 		reject,
 		toolCalls: new Map(),
@@ -832,6 +835,7 @@ async function handleToolCall(session: JsSession, msg: Extract<WorkerOutbound, {
 			signal: ctrl.signal,
 			identity: msg.identity,
 			shadowCell: pending.shadowCell,
+			cell: pending.preludeCell,
 			onReply: pending.runState.onReply,
 			emitStatus: (event: JsStatusEvent) => {
 				trackDeferPhase(pending, event);

@@ -193,6 +193,8 @@ class TabState {
 	 * tab is not adoptable. Cleared on navigation.
 	 */
 	refusal: string | undefined;
+	/** Only tabs created by a downstream createTarget may be closed by the relay. */
+	createdByRelay = false;
 	/** Whether targets for this tab were announced to discovering connections. */
 	announced = false;
 	attaching: Promise<boolean> | null = null;
@@ -208,6 +210,8 @@ class TabState {
 	reattachedAfterDetach = false;
 	/** The relay asked the extension to close this tab (`Target.closeTarget`); its coming detach is not Chrome's own. */
 	closing = false;
+	/** Share the close across worker and supervisor connections until the removal event arrives. */
+	closeRequest: Promise<unknown> | null = null;
 	/** True after the relay put this tab in the omp group; `ompGroupId` holds that group. */
 	grouped = false;
 	/** Group RPC in flight — suppresses duplicate requests from load-time tabUpdated bursts. */
@@ -1052,6 +1056,10 @@ export class RelayBridge {
 			this.#replyError(conn, msg, `No tab with key ${tabKey}`);
 			return false;
 		}
+		if (msg.method === "Page.close" && !tab.createdByRelay) {
+			this.#replyError(conn, msg, "Refusing to close a borrowed user tab");
+			return false;
+		}
 		const inst = this.#instances.get(tab.instanceId);
 		if (!inst || !inst.socket) {
 			this.#replyError(conn, msg, "relay extension is not connected");
@@ -1280,6 +1288,8 @@ export class RelayBridge {
 				}
 				// Creating a tab is an explicit act of driving it.
 				const createdKey = tabKeyOf(inst.code, result.tab.tabId);
+				const createdTab = this.#tabs.get(createdKey);
+				if (createdTab) createdTab.createdByRelay = true;
 				this.#claimTab(conn, createdKey);
 				// Puppeteer waits for the new page's auto-attach. Answer once it settled: a tab Chrome refuses (an
 				// extension debugger policy refuses every tab) would otherwise hold the open for its whole timeout.
@@ -1302,6 +1312,10 @@ export class RelayBridge {
 				const removedTab = this.#tabs.get(parsed.key);
 				if (!removedTab) {
 					this.#replyError(conn, msg, `No target with id ${String(msg.params?.targetId)}`);
+					return;
+				}
+				if (!removedTab.createdByRelay) {
+					this.#replyError(conn, msg, "Refusing to close a borrowed user tab");
 					return;
 				}
 				await this.#closeTab(parsed.key, removedTab.tabId, this.#instanceFor(removedTab));
@@ -1999,12 +2013,21 @@ export class RelayBridge {
 	 */
 	async #closeTab(key: string, tabId: number, inst: ExtInstance): Promise<void> {
 		const tab = this.#tabs.get(key);
+		if (tab?.closeRequest) {
+			await tab.closeRequest;
+			return;
+		}
 		if (tab) tab.closing = true;
+		const close = this.#rpc({ op: "removeTab", tabId }, inst);
+		if (tab) tab.closeRequest = close;
 		try {
-			await this.#rpc({ op: "removeTab", tabId }, inst);
+			await close;
 		} catch (err) {
 			// The tab stays open, so a later detach is Chrome's own again.
-			if (tab) tab.closing = false;
+			if (tab?.closeRequest === close) {
+				tab.closeRequest = null;
+				tab.closing = false;
+			}
 			this.#closeOnHello.set(key, tab?.url ?? "");
 			throw err;
 		}

@@ -135,27 +135,28 @@ export function screenshotQuality(opts: ScreenshotOptions): number | undefined {
  */
 async function waitForRenderFrame(page: Page, signal: AbortSignal | undefined): Promise<void> {
 	await untilAborted(signal, () =>
-		page.evaluate(
-			() =>
-				new Promise<void>(resolve => {
-					const pageGlobal = globalThis as unknown as {
-						document: {
-							visibilityState: string;
-							addEventListener(type: string, listener: () => void): void;
-							removeEventListener(type: string, listener: () => void): void;
-						};
-						requestAnimationFrame(callback: () => void): number;
-					};
-					const { document } = pageGlobal;
-					if (document.visibilityState === "hidden") return resolve();
-					const done = (): void => {
-						document.removeEventListener("visibilitychange", done);
-						resolve();
-					};
-					document.addEventListener("visibilitychange", done);
-					pageGlobal.requestAnimationFrame(done);
-				}),
-		),
+		page.evaluate(() => {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			const pageGlobal = globalThis as unknown as {
+				document: {
+					visibilityState: string;
+					addEventListener(type: string, listener: () => void): void;
+					removeEventListener(type: string, listener: () => void): void;
+				};
+				requestAnimationFrame(callback: () => void): number;
+			};
+			const { document } = pageGlobal;
+			if (document.visibilityState === "hidden") return resolve();
+			const done = (): void => {
+				clearTimeout(timer);
+				document.removeEventListener("visibilitychange", done);
+				resolve();
+			};
+			const timer = setTimeout(done, 50);
+			document.addEventListener("visibilitychange", done);
+			pageGlobal.requestAnimationFrame(done);
+			return promise;
+		}),
 	);
 }
 

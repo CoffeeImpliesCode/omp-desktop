@@ -42,7 +42,7 @@ export type FindToolInput = typeof findSchema.infer;
 const RANGES_SHOWN = 3;
 
 /** Wall-clock budget for one `find` call; a stalled judge fails instead of blocking the turn. */
-const FIND_TIMEOUT_MS = 20_000;
+const FIND_TIMEOUT_MS = 300_000;
 
 /**
  * Resolve `find.enabled` for a session: `auto` enables `find` only when the

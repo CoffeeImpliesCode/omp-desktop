@@ -107,6 +107,7 @@ impl AtSpiAx {
 							title,
 							app: app_name.clone(),
 							pid,
+							position_known: Some(position_known),
 							x,
 							y,
 							width: width as u32,
@@ -136,10 +137,14 @@ impl AtSpiAx {
 		root.get_children().await.map_err(|err| err.to_string())
 	}
 
+	/// The AT-SPI application serving `win`, with the process that owns its
+	/// accessibility connection when ownership, not the application name,
+	/// established the match.
 	async fn app_for_window(
 		connection: &atspi::AccessibilityConnection,
 		win: &DesktopWindow,
-	) -> Result<ObjectRefOwned, String> {
+		compositor: Option<u32>,
+	) -> Result<(ObjectRefOwned, Option<u32>), String> {
 		let apps = Self::apps(connection).await?;
 		let mut matches = Vec::new();
 		for app in apps {
@@ -148,37 +153,49 @@ impl AtSpiAx {
 					.name()
 					.is_some_and(|name| win.id.starts_with(&format!("atspi:{name}:")))
 				{
-					matches.push(app);
+					matches.push((0, app, None));
 				}
 				continue;
 			}
-			let proxy = app
-				.as_accessible_proxy(connection.connection())
-				.await
-				.map_err(|err| err.to_string())?;
-			let name = proxy.name().await.unwrap_or_default();
-			if win.pid.is_none() && name.eq_ignore_ascii_case(&win.app) {
-				matches.push(app.clone());
-			}
-			if let Some(pid) = win.pid {
-				let Some(bus_name) = app.name() else {
-					continue;
-				};
-				let dbus = atspi::zbus::fdo::DBusProxy::new(connection.connection())
+			// A niri window without a pid is one whose client could not be
+			// identified; an application name alone does not prove which of
+			// its windows this is.
+			if win.pid.is_none() && !win.id.starts_with("niri:") {
+				let proxy = app
+					.as_accessible_proxy(connection.connection())
 					.await
 					.map_err(|err| err.to_string())?;
-				if dbus
-					.get_connection_unix_process_id(bus_name.clone().into())
+				if proxy
+					.name()
 					.await
-					.ok()
-					== Some(pid)
+					.unwrap_or_default()
+					.eq_ignore_ascii_case(&win.app)
 				{
-					matches.push(app);
+					matches.push((0, app, None));
 				}
+				continue;
+			}
+			let Some(bus_name) = app.name() else {
+				continue;
+			};
+			let dbus = atspi::zbus::fdo::DBusProxy::new(connection.connection())
+				.await
+				.map_err(|err| err.to_string())?;
+			if let Ok(owner) = dbus
+				.get_connection_unix_process_id(bus_name.clone().into())
+				.await
+				&& let Some(rank) = ownership_rank(owner, win, compositor)
+			{
+				matches.push((rank, app, Some(owner)));
 			}
 		}
+		// The closest owner wins: a terminal or launcher that started the app is
+		// an ancestor too and has its own accessibility tree.
+		let best = matches.iter().map(|(rank, ..)| *rank).min();
+		matches.retain(|(rank, ..)| Some(*rank) == best);
 		if matches.len() == 1 {
-			Ok(matches.remove(0))
+			let (_, app, owner) = matches.remove(0);
+			Ok((app, owner))
 		} else {
 			Err(format!(
 				"application '{}' (pid {:?}) has {} AT-SPI matches; refusing ambiguous ownership",
@@ -209,6 +226,18 @@ impl AtSpiAx {
 			}
 		}
 		Ok(frames)
+	}
+
+	/// Whether `frame` is the only top-level frame of its application.
+	async fn sole_frame(
+		connection: &atspi::AccessibilityConnection,
+		frame: &atspi::proxy::accessible::AccessibleProxy<'_>,
+	) -> Result<bool, String> {
+		let app = frame.parent().await.map_err(|err| err.to_string())?;
+		if app.is_null() {
+			return Ok(false);
+		}
+		Ok(Self::frames(connection, &app).await?.len() == 1)
 	}
 
 	async fn component<'a>(
@@ -282,19 +311,174 @@ fn atspi_window_id(frame: &ObjectRefOwned) -> String {
 	format!("atspi:{name}:{}", frame.path())
 }
 
-fn native_window_for_frame(windows: &[DesktopWindow], pid: u32, title: &str) -> CoreResult<String> {
-	let mut matches = windows.iter().filter(|window| {
-		!window.id.starts_with("atspi:") && window.pid == Some(pid) && window.title == title
-	});
-	let first = matches.next().ok_or_else(|| {
-		DesktopError::window_not_found("AT-SPI frame has no matching native window")
-	})?;
-	if matches.next().is_some() {
-		return Err(DesktopError::ax_failed(
-			"AT-SPI frame matches multiple native windows; refusing ambiguous input ownership",
-		));
+/// Generations from `client` up to its ancestor `owner`, if `owner` is one.
+fn ancestor_distance(owner: u32, mut client: u32) -> Option<u32> {
+	// Browser Wayland connections can belong to a child process while AT-SPI
+	// belongs to its parent. Only ancestry, never shared titles/apps, proves it.
+	for distance in 0..32 {
+		if owner == client {
+			return Some(distance);
+		}
+		let stat = std::fs::read_to_string(format!("/proc/{client}/stat")).ok()?;
+		let parent = stat
+			.rsplit_once(')')?
+			.1
+			.split_whitespace()
+			.nth(1)?
+			.parse::<u32>()
+			.ok()?;
+		if parent == client || parent <= 1 {
+			return None;
+		}
+		client = parent;
 	}
-	Ok(first.id.clone())
+	None
+}
+
+/// How closely the accessibility connection owned by process `owner` is tied
+/// to the native `window`, lower being closer, or `None` when it is not.
+///
+/// The owner is the window's own client (rank 0) or, for a niri window, whose
+/// pid the compositor reads from the Wayland socket, a process of the same
+/// Flatpak instance (rank 1) or an ancestor of that client (2 plus the
+/// generations between them; browsers draw from a child process). A sandboxed
+/// app reaches the accessibility bus through `xdg-dbus-proxy`, which runs
+/// beside the app's process tree, not above it. The `compositor` is an
+/// ancestor of everything it spawned, so ancestry from it proves nothing and
+/// is accepted only when the compositor is known.
+fn ownership_rank(owner: u32, window: &DesktopWindow, compositor: Option<u32>) -> Option<u32> {
+	if window.id.starts_with("atspi:") {
+		return None;
+	}
+	let client = window.pid?;
+	if client == owner {
+		return Some(0);
+	}
+	if !window.id.starts_with("niri:") {
+		return None;
+	}
+	if same_flatpak_instance(owner, client) {
+		return Some(1);
+	}
+	compositor
+		.filter(|compositor| *compositor != owner)
+		.and_then(|_| ancestor_distance(owner, client))
+		.map(|distance| distance + 2)
+}
+
+/// Whether the accessibility connection owned by `owner` serves `window`.
+fn owner_serves_window(owner: u32, window: &DesktopWindow, compositor: Option<u32>) -> bool {
+	ownership_rank(owner, window, compositor).is_some()
+}
+
+/// Whether both processes run in one Flatpak instance.
+///
+/// Flatpak bind-mounts the instance's `.flatpak-info` at the root of every
+/// process it sandboxes, its D-Bus proxies included; xdg-desktop-portal
+/// identifies a proxied D-Bus peer the same way.
+fn same_flatpak_instance(owner: u32, client: u32) -> bool {
+	let instance = |pid: u32| {
+		std::fs::read_to_string(format!("/proc/{pid}/root/.flatpak-info"))
+			.ok()
+			.and_then(|info| flatpak_instance_id(&info).map(str::to_owned))
+	};
+	instance(owner).is_some_and(|owner| instance(client).is_some_and(|client| owner == client))
+}
+
+/// `instance-id` of the `[Instance]` group of a `.flatpak-info` key file.
+fn flatpak_instance_id(info: &str) -> Option<&str> {
+	let mut in_instance = false;
+	for line in info.lines().map(str::trim) {
+		if line.starts_with('[') {
+			in_instance = line == "[Instance]";
+		} else if in_instance && let Some(id) = line.strip_prefix("instance-id=") {
+			return Some(id.trim()).filter(|id| !id.is_empty());
+		}
+	}
+	None
+}
+
+/// Top-level frames of the application serving a window, with their names.
+struct FrameCandidates<T = ObjectRefOwned> {
+	/// Process owning the application's accessibility connection, when
+	/// ownership rather than the application name matched it.
+	owner:  Option<u32>,
+	frames: Vec<(T, String)>,
+}
+
+/// The frame of native window `win`.
+///
+/// The one frame titled like the window is it. A toolkit may also publish a
+/// frame without the window's title: unnamed, or with a title it never
+/// updated. Such a frame stands for the window only when it is the
+/// application's only frame, the window is a niri window, the application was
+/// matched by process ownership, and the compositor shows no other window that
+/// owner serves (`sole_window`). Anything else is refused as ambiguous.
+fn select_frame<T>(
+	candidates: FrameCandidates<T>,
+	win: &DesktopWindow,
+	sole_window: impl FnOnce(u32) -> bool,
+) -> Result<T, String> {
+	let FrameCandidates { owner, mut frames } = candidates;
+	let total = frames.len();
+	let mut titled = frames
+		.iter()
+		.enumerate()
+		.filter(|(_, (_, name))| name == &win.title)
+		.map(|(index, _)| index);
+	match (titled.next(), titled.next()) {
+		(Some(index), None) => return Ok(frames.swap_remove(index).0),
+		(Some(_), Some(_)) => {
+			return Err(format!(
+				"window '{}' has several AT-SPI frames with its title; refusing ambiguous ownership",
+				win.title
+			));
+		},
+		(None, _) => {},
+	}
+	if total == 1 && win.id.starts_with("niri:") && owner.is_some_and(sole_window) {
+		return Ok(frames.swap_remove(0).0);
+	}
+	Err(format!(
+		"window '{}' matches none of its application's {total} AT-SPI frames by title, and no frame \
+		 is provably its own",
+		win.title
+	))
+}
+
+/// The native window an AT-SPI frame belongs to.
+///
+/// `serves` says whether the frame's accessibility owner serves a native
+/// window. The one served window titled like the frame is it. A frame without
+/// such a title that is its application's only frame (`sole_frame`) stands
+/// for the owner's window only when the owner serves exactly one niri window.
+fn native_window_for_frame(
+	windows: &[DesktopWindow],
+	serves: impl Fn(&DesktopWindow) -> bool,
+	title: &str,
+	sole_frame: bool,
+) -> CoreResult<String> {
+	let served = windows
+		.iter()
+		.filter(|window| serves(window))
+		.collect::<Vec<_>>();
+	let mut titled = served.iter().filter(|window| window.title == title);
+	match (titled.next(), titled.next()) {
+		(Some(window), None) => return Ok(window.id.clone()),
+		(Some(_), Some(_)) => {
+			return Err(DesktopError::ax_failed(
+				"AT-SPI frame matches multiple native windows; refusing ambiguous input ownership",
+			));
+		},
+		(None, _) => {},
+	}
+	if let [window] = served.as_slice()
+		&& sole_frame
+		&& window.id.starts_with("niri:")
+	{
+		return Ok(window.id.clone());
+	}
+	Err(DesktopError::window_not_found("AT-SPI frame has no matching native window"))
 }
 
 /// Generic press means activation, not action zero (GTK4 text views put
@@ -332,15 +516,22 @@ fn action_index<'a>(
 
 impl AxBackend for AtSpiAx {
 	fn window_root(&mut self, win: &DesktopWindow) -> CoreResult<AxHandle> {
+		// niri IPC drives its own runtime, which cannot start inside this one,
+		// so compositor state is read before and after the AT-SPI work.
+		let compositor = win
+			.id
+			.starts_with("niri:")
+			.then(super::wayland::compositor_pid)
+			.flatten();
 		let result = self.rt.block_on(async {
-			let app = Self::app_for_window(&self.connection, win).await?;
+			let (app, owner) = Self::app_for_window(&self.connection, win, compositor).await?;
 			let frames = Self::frames(&self.connection, &app).await?;
-			let mut matches = Vec::new();
+			let mut named = Vec::new();
 			for frame in frames {
 				let id = atspi_window_id(&frame);
 				if win.id.starts_with("atspi:") {
 					if id == win.id {
-						return Ok(frame);
+						return Ok(FrameCandidates { owner, frames: vec![(frame, win.title.clone())] });
 					}
 					continue;
 				}
@@ -348,23 +539,35 @@ impl AxBackend for AtSpiAx {
 					.as_accessible_proxy(self.connection.connection())
 					.await
 					.map_err(|err| err.to_string())?;
-				if proxy.name().await.map_err(|err| err.to_string())? == win.title {
-					matches.push(frame);
-				}
+				let name = proxy.name().await.map_err(|err| err.to_string())?;
+				named.push((frame, name));
 			}
-			if matches.len() == 1 {
-				Ok(matches.remove(0))
-			} else {
-				Err(format!("window '{}' has {} matching AT-SPI frames", win.title, matches.len()))
-			}
+			Ok(FrameCandidates { owner, frames: named })
 		});
 		result
+			.and_then(|candidates| {
+				let sole_window = |owner: u32| {
+					super::wayland::compositor_windows().is_some_and(|windows| {
+						windows
+							.iter()
+							.filter(|window| owner_serves_window(owner, window, compositor))
+							.count()
+							== 1
+					})
+				};
+				select_frame(candidates, win, sole_window)
+			})
 			.map(AxHandle::AtSpi)
 			.map_err(|err: String| DesktopError::ax_failed(format!("AT-SPI window root: {err}")))
 	}
 
 	fn window_id(&mut self, h: &AxHandle, windows: &[DesktopWindow]) -> CoreResult<String> {
 		let mut object = Self::object(h).clone();
+		let compositor = windows
+			.iter()
+			.any(|window| window.id.starts_with("niri:"))
+			.then(super::wayland::compositor_pid)
+			.flatten();
 		self.rt.block_on(async {
 			// Follow ownership, never screen containment: overlapping windows and
 			// same-process dialogs are distinct input destinations.
@@ -396,7 +599,47 @@ impl AxBackend for AtSpiAx {
 						.name()
 						.await
 						.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window title: {err}")))?;
-					return native_window_for_frame(windows, pid, &title);
+					let sole_frame = Self::sole_frame(&self.connection, &proxy)
+						.await
+						.map_err(|err| DesktopError::ax_failed(format!("AT-SPI frames: {err}")))?;
+					let id = native_window_for_frame(
+						windows,
+						|window| owner_serves_window(pid, window, compositor),
+						&title,
+						sole_frame,
+					)?;
+					if id.starts_with("niri:") {
+						let window = windows
+							.iter()
+							.find(|window| window.id == id)
+							.ok_or_else(|| DesktopError::window_not_found("AT-SPI owner is gone"))?;
+						if window.position_known == Some(false) {
+							return Err(DesktopError::invalid_coordinate_frame(
+								"window has no known global origin; use an accessibility action or \
+								 desktop screenshot coordinates",
+							));
+						}
+						let component =
+							Self::component(&self.connection, &object)
+								.await
+								.map_err(|err| {
+									DesktopError::ax_failed(format!("AT-SPI window component: {err}"))
+								})?;
+						let (x, y, ..) =
+							component
+								.get_extents(CoordType::Screen)
+								.await
+								.map_err(|err| {
+									DesktopError::ax_failed(format!("AT-SPI window origin: {err}"))
+								})?;
+						if (x, y) != (window.x, window.y) {
+							return Err(DesktopError::invalid_coordinate_frame(
+								"AT-SPI coordinates do not match the compositor's window origin; use an \
+								 accessibility action or window screenshot coordinates",
+							));
+						}
+					}
+					return Ok(id);
 				}
 				let parent = proxy
 					.parent()
@@ -777,24 +1020,123 @@ mod tests {
 		assert_eq!(action_index(std::iter::empty(), "press"), None);
 	}
 
+	fn window(id: &str, pid: u32, title: &str) -> DesktopWindow {
+		DesktopWindow {
+			id:             id.to_owned(),
+			pid:            Some(pid),
+			position_known: Some(true),
+			title:          title.into(),
+			app:            "Editor".into(),
+			x:              0,
+			y:              0,
+			width:          100,
+			height:         100,
+			focused:        false,
+		}
+	}
+
 	#[test]
 	fn frame_ownership_requires_unique_process_and_title() {
-		let window = |id: &str, pid: u32| DesktopWindow {
-			id:      id.to_owned(),
-			pid:     Some(pid),
-			title:   "Document".into(),
-			app:     "Editor".into(),
-			x:       0,
-			y:       0,
-			width:   100,
-			height:  100,
-			focused: false,
+		let owned_by = |owner: u32| move |window: &DesktopWindow| window.pid == Some(owner);
+		let mut windows = vec![window("1", 10, "Document"), window("2", 20, "Document")];
+		assert_eq!(native_window_for_frame(&windows, owned_by(20), "Document", false).unwrap(), "2");
+		assert!(native_window_for_frame(&windows, owned_by(30), "Document", false).is_err());
+		windows.push(window("3", 20, "Document"));
+		assert!(native_window_for_frame(&windows, owned_by(20), "Document", false).is_err());
+	}
+
+	/// A frame without the window's title maps to the owner's window only when
+	/// the owner serves exactly one; with two windows of one application either
+	/// could be meant.
+	#[test]
+	fn untitled_frame_needs_a_sole_served_window() {
+		let owned_by = |owner: u32| move |window: &DesktopWindow| window.pid == Some(owner);
+		let mut windows = vec![window("niri:1", 10, "Part A"), window("niri:2", 20, "Other")];
+		// AccessKit frames may be unnamed or keep a title the app never updated.
+		for frame_title in ["", "Untitled"] {
+			assert_eq!(
+				native_window_for_frame(&windows, owned_by(10), frame_title, true).unwrap(),
+				"niri:1"
+			);
+		}
+		assert!(
+			native_window_for_frame(&windows, owned_by(10), "", false).is_err(),
+			"another frame of the application could be this window"
+		);
+		windows.push(window("niri:3", 10, "Part B"));
+		assert!(native_window_for_frame(&windows, owned_by(10), "", true).is_err());
+		let x11 = [window("0x1", 10, "Part A")];
+		assert!(
+			native_window_for_frame(&x11, owned_by(10), "", true).is_err(),
+			"only the compositor's complete window list proves a sole window"
+		);
+	}
+
+	#[test]
+	fn titled_frame_wins_and_untitled_frame_needs_proven_ownership() {
+		let candidates = |frames: &[(u8, &str)]| FrameCandidates {
+			owner:  Some(10),
+			frames: frames
+				.iter()
+				.map(|&(id, name)| (id, name.to_owned()))
+				.collect(),
 		};
-		let mut windows = vec![window("1", 10), window("2", 20)];
-		assert_eq!(native_window_for_frame(&windows, 20, "Document").unwrap(), "2");
-		assert!(native_window_for_frame(&windows, 30, "Document").is_err());
-		windows.push(window("3", 20));
-		assert!(native_window_for_frame(&windows, 20, "Document").is_err());
+		let win = window("niri:1", 10, "Part A");
+		assert_eq!(select_frame(candidates(&[(1, ""), (2, "Part A")]), &win, |_| false), Ok(2));
+		assert_eq!(select_frame(candidates(&[(1, "")]), &win, |_| true), Ok(1));
+		assert_eq!(select_frame(candidates(&[(1, "Untitled")]), &win, |_| true), Ok(1));
+		// Two windows of one application: the compositor reports another
+		// window the same owner serves, so the frame may be either's.
+		assert!(select_frame(candidates(&[(1, "")]), &win, |_| false).is_err());
+		assert!(select_frame(candidates(&[(1, ""), (2, "Settings")]), &win, |_| true).is_err());
+		assert!(select_frame(candidates(&[(1, "Part A"), (2, "Part A")]), &win, |_| true).is_err());
+		let named_only = FrameCandidates { owner: None, frames: vec![(1_u8, String::new())] };
+		assert!(
+			select_frame(named_only, &win, |_| true).is_err(),
+			"a name-matched application proves no ownership"
+		);
+		let x11 = window("0x1", 10, "Part A");
+		assert!(select_frame(candidates(&[(1, "")]), &x11, |_| true).is_err());
+	}
+
+	/// The compositor spawns Xwayland bridges and launched apps, so its own
+	/// accessibility tree must never be taken for one of their windows.
+	#[test]
+	fn compositor_ancestry_proves_no_ownership() {
+		let parent_of = |pid: u32| {
+			let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
+			stat
+				.rsplit_once(')')
+				.and_then(|(_, fields)| fields.split_whitespace().nth(1))
+				.and_then(|pid| pid.parse::<u32>().ok())
+				.expect("parent pid")
+		};
+		let client = std::process::id();
+		let parent = parent_of(client);
+		let win = window("niri:1", client, "Part A");
+		assert!(owner_serves_window(parent, &win, Some(1)), "an ancestor owns a child's window");
+		assert!(!owner_serves_window(parent, &win, Some(parent)), "the compositor owns nothing");
+		assert!(!owner_serves_window(parent, &win, None), "ancestry needs a known compositor");
+		assert!(owner_serves_window(client, &win, Some(client)), "the client owns its window");
+		// A terminal that launched the app is a farther ancestor than the app's
+		// own process, so the app's accessibility tree ranks first.
+		let grandparent = parent_of(parent);
+		let rank = |owner| ownership_rank(owner, &win, Some(1));
+		assert!(rank(client) < rank(parent));
+		if grandparent > 1 {
+			assert!(rank(parent) < rank(grandparent));
+		}
+	}
+
+	#[test]
+	fn flatpak_instance_id_comes_from_the_instance_group() {
+		let info = concat!(
+			"[Application]\nname=ai.storyteller.pdfcraft\ninstance-id=decoy\n\n",
+			"[Instance]\ninstance-id=1280135730\napp-path=/app\n",
+		);
+		assert_eq!(flatpak_instance_id(info), Some("1280135730"));
+		assert_eq!(flatpak_instance_id("[Instance]\ninstance-id=\n"), None);
+		assert_eq!(flatpak_instance_id("[Application]\nname=x\n"), None);
 	}
 
 	#[test]

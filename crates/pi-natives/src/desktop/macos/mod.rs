@@ -97,6 +97,8 @@ impl Backend for MacosBackend {
 			input_permission: permission_label(permission::post_events()),
 			ax_permission: permission_label(ax_trusted),
 			display_count,
+			// Control capabilities are filled in by the core worker.
+			window_control: None,
 			screen_locked: screen.locked,
 			display_asleep: screen.display_asleep,
 		}

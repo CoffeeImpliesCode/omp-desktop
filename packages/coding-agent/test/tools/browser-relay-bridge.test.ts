@@ -212,6 +212,146 @@ describe("RelayBridge target discovery", () => {
 	});
 });
 
+describe("RelayBridge borrowed-tab protection", () => {
+	it("rejects root, tab, page, and session-scoped closes of a borrowed user tab", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 }), tab({ tabId: 2, windowId: 2 })]);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
+		await claimTab(bridge, ext, cdp, connId, 1);
+
+		// A claimed tab is still the user's tab: adopting it proves only that omp
+		// drives it, never that omp may destroy it. Every route a raw CDP client
+		// could take to the close — browser-level page and tab ids, the page
+		// session's own `Page.close`, and a session-scoped target close aimed at a
+		// tab in another window — must refuse rather than reach `chrome.tabs.remove`.
+		const commands: Array<{ route: string; command: Record<string, unknown> }> = [
+			{ route: "root page id", command: { method: "Target.closeTarget", params: { targetId: `PAGE${ANON}.1` } } },
+			{ route: "root tab id", command: { method: "Target.closeTarget", params: { targetId: `TAB${ANON}.2` } } },
+			{ route: "page session", command: { method: "Page.close", sessionId } },
+			{
+				route: "session-scoped target id",
+				command: { method: "Target.closeTarget", sessionId, params: { targetId: `PAGE${ANON}.2` } },
+			},
+		];
+		for (const { route, command } of commands) {
+			const id = ++msgSeq;
+			bridge.cdpMessage(connId, JSON.stringify({ id, ...command }));
+			await flush();
+			expect(cdp.messages.find(message => message.id === id)?.error, route).toEqual({
+				code: -32000,
+				message: "Refusing to close a borrowed user tab",
+			});
+		}
+
+		expect(ext.rpcs("removeTab")).toEqual([]);
+		expect(
+			ext.rpcs("send").filter(command => command.method === "Page.close" || command.method === "Target.closeTarget"),
+		).toEqual([]);
+	});
+
+	it("lets any connection close a relay-created tab while still refusing a borrowed one", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, [tab({ tabId: 1 })]);
+		const creator = new FakeCdpSocket();
+		const creatorId = bridge.cdpConnected(creator);
+		bridge.cdpMessage(creatorId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 9 }) });
+		await flush();
+
+		// Ownership cleanup runs on its own supervisor connection (the one whose
+		// worker died), so the created tab must stay closable from a peer that
+		// never created it — while the user's pre-existing tab stays refused.
+		const cleanup = new FakeCdpSocket();
+		const cleanupId = bridge.cdpConnected(cleanup);
+		const borrowedId = ++msgSeq;
+		bridge.cdpMessage(
+			cleanupId,
+			JSON.stringify({ id: borrowedId, method: "Target.closeTarget", params: { targetId: `PAGE${ANON}.1` } }),
+		);
+		await flush();
+		expect(cleanup.messages.find(message => message.id === borrowedId)?.error).toEqual({
+			code: -32000,
+			message: "Refusing to close a borrowed user tab",
+		});
+
+		const ownedId = ++msgSeq;
+		bridge.cdpMessage(
+			cleanupId,
+			JSON.stringify({ id: ownedId, method: "Target.closeTarget", params: { targetId: `PAGE${ANON}.9` } }),
+		);
+		ack(bridge, ext, "removeTab");
+		await flush();
+		expect(cleanup.messages.find(message => message.id === ownedId)?.result).toEqual({ success: true });
+		expect(ext.rpcs("removeTab").map(command => command.tabId)).toEqual([9]);
+	});
+
+	it("shares an owned tab close across connections until Chrome reports removal", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const creator = new FakeCdpSocket();
+		const creatorId = bridge.cdpConnected(creator);
+		bridge.cdpMessage(creatorId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 9 }) });
+		await flush();
+		const cleanup = new FakeCdpSocket();
+		const cleanupId = bridge.cdpConnected(cleanup);
+		const close = (connection: number, id: number) =>
+			bridge.cdpMessage(
+				connection,
+				JSON.stringify({ id, method: "Target.closeTarget", params: { targetId: `PAGE${ANON}.9` } }),
+			);
+		const first = ++msgSeq;
+		const second = ++msgSeq;
+		close(creatorId, first);
+		close(cleanupId, second);
+		expect(ext.rpcs("removeTab").map(command => command.tabId)).toEqual([9]);
+		ack(bridge, ext, "removeTab");
+		await flush();
+		expect(creator.messages.find(message => message.id === first)?.result).toEqual({ success: true });
+		expect(cleanup.messages.find(message => message.id === second)?.result).toEqual({ success: true });
+		// The removal event can trail the successful RPC and the supervisor's close.
+		const later = ++msgSeq;
+		close(cleanupId, later);
+		await flush();
+		expect(cleanup.messages.find(message => message.id === later)?.result).toEqual({ success: true });
+		expect(ext.rpcs("removeTab")).toHaveLength(1);
+	});
+
+	it("allows retry after an owned close fails and reports subsequent Chrome detaches", async () => {
+		const bridge = new RelayBridge({});
+		const ext = new FakeExtSocket();
+		connect(bridge, ext, []);
+		const cdp = new FakeCdpSocket();
+		const connId = bridge.cdpConnected(cdp);
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 9 }) });
+		await flush();
+		const sessionId = await attachPage(bridge, ext, cdp, connId, 9);
+		const first = ++msgSeq;
+		const command = { method: "Target.closeTarget", params: { targetId: `PAGE${ANON}.9` } };
+		bridge.cdpMessage(connId, JSON.stringify({ id: first, ...command }));
+		nack(bridge, ext, "removeTab", "close refused");
+		await flush();
+		expect(cdp.messages.find(message => message.id === first)?.error).toMatchObject({ message: "close refused" });
+		bridge.extMessage(ext, JSON.stringify({ t: "detached", tabId: 9, reason: "target_closed" }));
+		await flush();
+		expect(
+			cdp.messages.some(message => message.method === "OMP.debuggerDetached" && message.sessionId === sessionId),
+		).toBe(true);
+		const retry = ++msgSeq;
+		bridge.cdpMessage(connId, JSON.stringify({ id: retry, ...command }));
+		ack(bridge, ext, "removeTab");
+		await flush();
+		expect(ext.rpcs("removeTab")).toHaveLength(2);
+		expect(cdp.messages.find(message => message.id === retry)?.result).toEqual({ success: true });
+	});
+});
+
 describe("RelayBridge tab grouping", () => {
 	it("groups nothing on hello or tab lifecycle events — only claimed tabs join the omp group", () => {
 		const bridge = new RelayBridge({ group: { title: "omp", color: "cyan" } });
@@ -901,9 +1041,12 @@ describe("RelayBridge attachment release", () => {
 	it("neither reports nor re-announces the detach of a tab the relay is closing", async () => {
 		const bridge = new RelayBridge({});
 		const ext = new FakeExtSocket();
-		connect(bridge, ext, [tab({ tabId: 1 })]);
+		connect(bridge, ext, []);
 		const cdp = new FakeCdpSocket();
 		const connId = bridge.cdpConnected(cdp);
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, ext, "createTab", { tab: tab({ tabId: 1 }) });
+		await flush();
 		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.setDiscoverTargets", params: {} }));
 		await flush();
 		const sessionId = await attachPage(bridge, ext, cdp, connId, 1);
@@ -1633,7 +1776,11 @@ describe("closeRelayTarget", () => {
 	it("does not report a tab closed while its browser's extension is offline, and closes it once that browser reconnects", async () => {
 		const bridge = new RelayBridge({});
 		const chrome = new FakeExtSocket();
-		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 7 }), tab({ tabId: 8 })]);
+		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 8 })]);
+		const connId = bridge.cdpConnected(new FakeCdpSocket());
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, chrome, "createTab", { tab: tab({ tabId: 7 }) });
+		await flush();
 		bridge.extClosed(chrome);
 		expect(await closeRelayTarget(channel(bridge), `PAGE${instanceCode("chrome")}.7`)).toBeFalse();
 		const back = new FakeExtSocket();
@@ -1650,8 +1797,11 @@ describe("closeRelayTarget", () => {
 	it("closes a tab whose close its browser dropped mid-call once that browser reconnects", async () => {
 		const bridge = new RelayBridge({});
 		const chrome = new FakeExtSocket();
-		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 7 })]);
+		connectInstance(bridge, chrome, "chrome", []);
 		const connId = bridge.cdpConnected(new FakeCdpSocket());
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, chrome, "createTab", { tab: tab({ tabId: 7 }) });
+		await flush();
 		bridge.cdpMessage(
 			connId,
 			JSON.stringify({
@@ -1672,7 +1822,11 @@ describe("closeRelayTarget", () => {
 	it("does not close a tab whose id now shows another page when its browser reconnects", async () => {
 		const bridge = new RelayBridge({});
 		const chrome = new FakeExtSocket();
-		connectInstance(bridge, chrome, "chrome", [tab({ tabId: 7 })]);
+		connectInstance(bridge, chrome, "chrome", []);
+		const connId = bridge.cdpConnected(new FakeCdpSocket());
+		bridge.cdpMessage(connId, JSON.stringify({ id: ++msgSeq, method: "Target.createTarget" }));
+		ack(bridge, chrome, "createTab", { tab: tab({ tabId: 7 }) });
+		await flush();
 		bridge.extClosed(chrome);
 		expect(await closeRelayTarget(channel(bridge), `PAGE${instanceCode("chrome")}.7`)).toBeFalse();
 		// Chrome restarted meanwhile: tab 7 is a page the user opened.
