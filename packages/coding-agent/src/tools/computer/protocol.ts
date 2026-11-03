@@ -20,6 +20,12 @@ export interface ComputerSessionSnapshot {
 	/** `computer.backgroundFallback`: what a refused background input call does. */
 	backgroundFallback: "takeover" | "refuse";
 	/**
+	 * Opaque identity of the eval cell this request belongs to, stable across
+	 * that cell's runs and its settle. Absent for callers that are not eval
+	 * cells; the worker then treats each request id as its own cell.
+	 */
+	cellId?: string;
+	/**
 	 * The agent turn the run belongs to, if any: once it acts, the display stays awake until that turn's
 	 * `release-display` rather than for the native grace period after its last request.
 	 */
@@ -55,6 +61,16 @@ export type ComputerWorkerInbound =
 	  }
 	| { type: "capabilities"; id: string; session: ComputerSessionSnapshot; escape: ComputerEscapeScope }
 	| { type: "abort"; id: string }
+	/**
+	 * Forget everything an eval cell left pending: it was cancelled and will
+	 * never settle. Answered by nothing, and never captured or reported.
+	 */
+	| { type: "discard"; cellId: string }
+	/**
+	 * Re-read what the cell that just ended touched; the result's `returnValue` is the report text or undefined.
+	 * `output` is what the cell printed: an `ax()` tree it carries counts as seen by the model.
+	 */
+	| { type: "settle"; id: string; timeoutMs: number; session: ComputerSessionSnapshot; output: string }
 	| { type: "revoke-control"; id: string }
 	/** Agent turn `turn` ended: let the display sleep now, keeping every other piece of session state. */
 	| { type: "release-display"; turn: number }

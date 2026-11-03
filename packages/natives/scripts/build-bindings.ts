@@ -7,9 +7,11 @@
  *
  * `OMP_NATIVE_CARGO_PROFILE` selects the cargo profile (default `local`:
  * incremental, unstripped). Image builds set `ci` for a stripped addon.
- *
- * `OMP_NATIVE_FEATURES` passes extra cargo features to `napi build --features`
- * (e.g. `wayland-pipewire`). Cargo path only; Bazel builds ignore it.
+ * `OMP_NATIVE_FEATURES` adds comma- or space-separated Cargo features to the
+ * local napi build while retaining the default Wayland PipeWire capture feature.
+ * Cargo passes them to `napi build --features`; Bazel builds ignore this option.
+ * `OMP_NATIVE_RUNTIME_LIBRARY_PATH` adds Linux runtime library directories to
+ * the addon's RUNPATH before embedding; the Nix shell supplies audio clients.
  */
 
 import * as fsSync from "node:fs";
@@ -68,7 +70,15 @@ const localAddon = resolveLocalHostAddon({
 	arch: process.arch,
 	avx2: detectHostAvx2Support(),
 });
-const effectiveVariant = localAddon.x64Variant;
+// An x64 host only ever emits the variant matching its own AVX2 support, so
+// producing both variants from one machine needs an override. Unset keeps the
+// host-detected behaviour. This also has to agree with the RUSTFLAGS
+// target-cpu selection below.
+const forcedX64Variant = Bun.env.OMP_NATIVE_X64_VARIANT?.trim();
+if (forcedX64Variant !== undefined && forcedX64Variant !== "modern" && forcedX64Variant !== "baseline") {
+	throw new Error(`OMP_NATIVE_X64_VARIANT must be "modern" or "baseline" when set, got "${forcedX64Variant}"`);
+}
+const effectiveVariant = forcedX64Variant ?? localAddon.x64Variant;
 const variantSuffix = effectiveVariant ? `-${effectiveVariant}` : "";
 
 // Pin Rust target-cpu so x64 baseline/modern variants get a reproducible ISA floor
@@ -178,7 +188,13 @@ async function installGeneratedBindings(outputDir: string): Promise<void> {
 	}
 }
 
-const canonicalAddonFilename = localAddon.filename;
+// Derive from effectiveVariant, not localAddon: a forced variant must emit
+// under its own name or the normalized file would claim the wrong ISA floor.
+const canonicalAddonFilename = resolveLocalHostAddon({
+	platform: process.platform,
+	arch: process.arch,
+	avx2: effectiveVariant === "modern",
+}).filename;
 const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
 
 console.log(`Building pi-natives bindings for ${process.platform}-${process.arch}${variantSuffix} (local)…`);
@@ -216,6 +232,7 @@ const napiBin = path.join(path.dirname(napiManifestPath), napiBinEntry);
 // Profiles live in the root Cargo.toml; `local` trades size for iteration
 // speed, `ci` strips and drops incremental state.
 const cargoProfile = Bun.env.OMP_NATIVE_CARGO_PROFILE?.trim() || "local";
+const extraFeatures = Bun.env.OMP_NATIVE_FEATURES?.trim();
 
 const napiArgs = [
 	"build",
@@ -231,14 +248,14 @@ const napiArgs = [
 	buildOutputDir,
 	"--profile",
 	cargoProfile,
+	// Local builds enable the Wayland PipeWire capture path. The shipped Bazel
+	// addons build with `crate_features = []`, so `capture()` is compiled down to
+	// a hard error and desktop capture can never work on a Wayland session.
+	"--features",
+	extraFeatures ? `wayland-pipewire,${extraFeatures}` : "wayland-pipewire",
 ];
 
-// Local-only opt-in: pass extra cargo features through to napi build, e.g.
-// OMP_NATIVE_FEATURES=wayland-pipewire bun --cwd=packages/natives run build
-const extraFeatures = Bun.env.OMP_NATIVE_FEATURES?.trim();
-if (extraFeatures) {
-	napiArgs.push("--features", extraFeatures);
-}
+// Optional features accompany the default PipeWire capture feature above.
 
 // napi-rs / cargo route much failure detail to stdout (e.g. `cargo metadata`
 // errors), so a stderr-only error collapses real failures to a bare message.
@@ -267,6 +284,11 @@ try {
 	}
 
 	const builtAddonPath = await resolveBuiltAddonPath(buildOutputDir, canonicalAddonFilename);
+	if (process.platform === "linux" && Bun.env.OMP_NATIVE_RUNTIME_LIBRARY_PATH) {
+		// Audio clients are loaded by name, so linking cannot discover them.
+		// Retain the shell's declared runtime paths in the embedded addon.
+		await $`patchelf --add-rpath ${Bun.env.OMP_NATIVE_RUNTIME_LIBRARY_PATH} ${builtAddonPath}`;
+	}
 	// Stamp the release version post-link, before the addon becomes visible
 	// under its canonical name, so a version bump never recompiles the crate.
 	const { version } = (await Bun.file(packageJsonPath).json()) as { version: string };

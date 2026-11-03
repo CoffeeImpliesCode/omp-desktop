@@ -20,7 +20,9 @@ export class RunOutput {
 	/** Append a runtime display output (image/status), flushing buffered text first. Views add nothing: their text is already in the stream. */
 	pushDisplay(output: EvalDisplayOutput): void {
 		if (output.type === "image") {
-			this.push({ type: "image", data: output.data, mimeType: output.mimeType });
+			const image: ImageContent = { type: "image", data: output.data, mimeType: output.mimeType };
+			if (output.detail !== undefined) image.detail = output.detail;
+			this.push(image);
 			return;
 		}
 		if (output.type === "view") return;

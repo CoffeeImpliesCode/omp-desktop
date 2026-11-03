@@ -45,7 +45,9 @@
 		}
 	};
 
-	const windowFields = ["id", "app", "title", "pid", "bounds", "focused"];
+	const windowFields = ["id", "app", "title", "pid", "bounds", "positionKnown", "focused"];
+	// `move` stays pointer movement, `close` closes exactly this window and leaves the session
+	// alive, and the toggles are explicit, non-idempotent, and never retried by the facade.
 	const windowValueMethods = [
 		"screenshot",
 		"zoom",
@@ -56,7 +58,23 @@
 		"scroll",
 		"type",
 		"press",
-		"raise",
+		"state",
+		"focus",
+		"close",
+		"moveTo",
+		"moveBy",
+		"resize",
+		"maximize",
+		"minimize",
+		"restore",
+		"toggleMaximized",
+		"toggleFullscreen",
+		"toggleWindowedFullscreen",
+		"setFullscreen",
+		"setFloating",
+		"center",
+		"moveToWorkspace",
+		"moveToDisplay",
 		"ax",
 		"holdKeys",
 		"holdMouse",
@@ -82,6 +100,7 @@
 		"holdMouse",
 		"displays",
 		"windows",
+		"workspaces",
 		"screenshot",
 		"zoom",
 		"click",
@@ -91,6 +110,9 @@
 		"scroll",
 		"type",
 		"press",
+		"focusWorkspace",
+		"focusDisplay",
+		"moveWorkspaceToDisplay",
 	];
 
 	const copyFields = (target, fields, snapshot) => {

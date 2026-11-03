@@ -5,6 +5,8 @@ declare const devicePixelRatio: number;
 declare const window: { open(url: string, target: string, features: string): unknown };
 
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { buildStealthInjectionScriptForTest } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
+import { TempDir } from "@oh-my-pi/pi-utils";
 import {
 	acquireBrowser,
 	type BrowserHandle,
@@ -148,6 +150,114 @@ describe("browser tab worker startup", () => {
 
 describe("OMP-owned browser evaluation", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"keeps stealth bootstraps out of live DOM while patching parser, dynamic, srcdoc, and OOPIF frames",
+		async () => {
+			const project = TempDir.createSync("@stealth-frame-preload-");
+			const name = `stealth-frame-preload-${process.pid}`;
+			const server = Bun.serve({
+				hostname: "0.0.0.0",
+				port: 0,
+				fetch(request) {
+					const { pathname, port } = new URL(request.url);
+					const headers = { "content-type": "text/html" };
+					if (pathname === "/frame") {
+						return new Response("<!doctype html><title>frame</title><p>frame</p>", { headers });
+					}
+					const oopif = `http://localhost:${port}/frame?kind=oopif`;
+					return new Response(
+						`<!doctype html><title>stealth-frame-fixture</title><body>
+							<iframe id="parser" src="/frame?kind=parser"></iframe>
+							<iframe id="srcdoc" srcdoc="<p>srcdoc</p>"></iframe>
+							<iframe id="oopif" src="${oopif}"></iframe>
+							<script>
+								addEventListener("load", () => {
+									const frame = document.createElement("iframe");
+									frame.id = "dynamic";
+									frame.addEventListener("load", () => {
+										document.body.dataset.dynamicReady = "true";
+									}, { once: true });
+									frame.src = "/frame?kind=dynamic";
+									document.body.append(frame);
+								});
+							</script>
+						</body>`,
+						{ headers },
+					);
+				},
+			});
+			let browser: BrowserHandle | undefined;
+			try {
+				browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: project.path() });
+				if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
+				await acquireTab(name, browser, {
+					url: `http://127.0.0.1:${server.port}/page`,
+					timeoutMs: 30_000,
+				});
+				const session = {
+					cwd: project.path(),
+					hasUI: false,
+					settings: Settings.isolated(),
+					getSessionFile: () => null,
+				} as unknown as ToolSession;
+				const bootstrap = JSON.stringify(buildStealthInjectionScriptForTest());
+				const result = await runInTab(name, {
+					code: `
+						await page.waitForFunction(() => document.body?.dataset.dynamicReady === "true", { timeout: 10_000 });
+						const frames = await Promise.all(page.frames().map(async frame => ({
+							url: frame.url(),
+							getterSource: await frame.evaluate(() => {
+								//!world=main
+								const sample = { get status() { return 1; } };
+								const getter = Object.getOwnPropertyDescriptor(sample, "status")?.get;
+								return getter ? Function.prototype.toString.call(getter) : null;
+							}),
+						})));
+						const helperMutations = await tab.evaluate(source => {
+							//!world=main
+							const observer = new MutationObserver(() => {});
+							observer.observe(document.head, { childList: true });
+							(0, eval)(source);
+							const records = observer.takeRecords();
+							observer.disconnect();
+							return {
+								added: records.flatMap(record => Array.from(record.addedNodes)).filter(node => node.nodeName === "IFRAME").length,
+								removed: records.flatMap(record => Array.from(record.removedNodes)).filter(node => node.nodeName === "IFRAME").length,
+							};
+						}, ${bootstrap});
+						return { frames, helperMutations };
+					`,
+					timeoutMs: 30_000,
+					session,
+				});
+				const value = result.returnValue as {
+					frames: Array<{ url: string; getterSource: string | null }>;
+					helperMutations: { added: number; removed: number };
+				};
+				expect(value.frames).toHaveLength(5);
+				expect(value.frames.map(frame => frame.url)).toContain("about:srcdoc");
+				expect(value.frames.some(frame => frame.url.includes("kind=parser"))).toBe(true);
+				expect(value.frames.some(frame => frame.url.includes("kind=dynamic"))).toBe(true);
+				expect(
+					value.frames.some(
+						frame => frame.url.includes("kind=oopif") && frame.url.startsWith("http://localhost:"),
+					),
+				).toBe(true);
+				expect(value.frames.every(frame => frame.getterSource === "function get status() { [native code] }")).toBe(
+					true,
+				);
+				expect(value.helperMutations).toEqual({ added: 0, removed: 0 });
+			} finally {
+				await releaseTab(name, { kill: true });
+				if (browser && "browser" in browser && browser.browser.connected)
+					await releaseBrowser(browser, { kill: true });
+				server.stop(true);
+				await project.remove();
+			}
+		},
+		60_000,
+	);
+
+	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"adopts isolated element arguments into the main world without consuming caller handles",
 		async () => {
 			const browser = headless();
@@ -235,6 +345,101 @@ describe("OMP-owned browser evaluation", () => {
 		},
 		45_000,
 	);
+
+	// Puppeteer attributes evaluation failures from the structured stack Bun
+	// hands its `Error.prepareStackTrace` hook, and a compiled binary can expose
+	// fewer than the three frames that hook assumes. Unhardened, every raw
+	// evaluation dies inside `PuppeteerURL.fromCallSite` with
+	// "undefined is not an object" before the page callback ever runs.
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"keeps raw collection evaluation usable when the callsite stack is one frame deep",
+		async () => {
+			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
+			const page = await browser.browser.newPage();
+			const stackTraceLimit = Error.stackTraceLimit;
+			try {
+				await page.goto(
+					`data:text/html,${encodeURIComponent('<button id="first">First</button><button id="second">Second</button>')}`,
+				);
+				Error.stackTraceLimit = 1;
+				const collected = await page.$$eval("button", elements => elements.map(element => element.textContent));
+				const frameCount = await page.mainFrame().$$eval("button", elements => elements.length);
+				const single = await page.$eval("button", element => element.textContent);
+				const direct = await page.evaluate("document.querySelectorAll('button').length");
+				Error.stackTraceLimit = stackTraceLimit;
+				expect({ collected, frameCount, single, direct }).toEqual({
+					collected: ["First", "Second"],
+					frameCount: 2,
+					single: "First",
+					direct: 2,
+				});
+			} finally {
+				Error.stackTraceLimit = stackTraceLimit;
+				await page.close().catch(() => undefined);
+				if (browser.browser.connected) await releaseBrowser(browser, { kill: true });
+			}
+		},
+		45_000,
+	);
+
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"returns computed DOM collections through raw page and frame evaluation",
+		async () => {
+			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+			if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
+			const name = `collection-evaluate-${process.pid}`;
+			const session = {
+				cwd: process.cwd(),
+				hasUI: false,
+				settings: Settings.isolated(),
+				getSessionFile: () => null,
+			} as unknown as ToolSession;
+			try {
+				await acquireTab(name, browser, {
+					url: `data:text/html,${encodeURIComponent('<button id="first">First</button><button id="second">Second</button>')}`,
+					timeoutMs: 30_000,
+				});
+				const result = await runInTab(name, {
+					code: `
+						const handles = await page.$$("button");
+						const viaHandles = [];
+						for (const handle of handles) {
+							viaHandles.push(await handle.evaluate(element => element.textContent));
+						}
+						await Promise.all(handles.map(handle => handle.dispose()));
+						return {
+							viaHandles,
+							pageCollection: await page.$$eval("button", elements => elements.map(element => element.textContent)),
+							frameCollection: await page.mainFrame().$$eval("button", elements => elements.map(element => element.textContent)),
+							collectionWithArg: await page.$$eval(
+								"button",
+								(elements, suffix) => elements.map(element => String(element.textContent) + suffix),
+								"!",
+							),
+							single: await page.$eval("button", element => element.textContent),
+							direct: await page.evaluate(() => document.querySelectorAll("button").length),
+						};
+					`,
+					timeoutMs: 20_000,
+					session,
+				});
+				expect(result.returnValue).toEqual({
+					viaHandles: ["First", "Second"],
+					pageCollection: ["First", "Second"],
+					frameCollection: ["First", "Second"],
+					collectionWithArg: ["First!", "Second!"],
+					single: "First",
+					direct: 2,
+				});
+			} finally {
+				await releaseTab(name, { kill: true });
+				if (browser.browser.connected) await releaseBrowser(browser, { kill: true });
+			}
+		},
+		45_000,
+	);
+
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"tells a caller running calls on one tab together to await each one or use one run",
 		async () => {

@@ -1,4 +1,4 @@
-import { isDeepStrictEqual } from "node:util";
+import { stableStringifyJson } from "@oh-my-pi/pi-utils/json";
 import { isRecord } from "@oh-my-pi/pi-utils/type-guards";
 import type { RpcChunkFrame } from "./rpc-types";
 
@@ -137,6 +137,12 @@ function jsonSnapshot(value: unknown): unknown {
 	return json === undefined ? undefined : JSON.parse(json);
 }
 
+/** Immutable wire receipts without retaining another copy of every message payload. */
+function messageFingerprint(snapshot: unknown): string {
+	const json = snapshot === undefined ? "\0" : stableStringifyJson(snapshot);
+	return new Bun.CryptoHasher("sha256").update(json).digest("hex");
+}
+
 function encodedMessageSnapshot(encoded: string): { message: unknown } | undefined {
 	const frame = JSON.parse(encoded);
 	return isRecord(frame) && frame.type === "message_end" && Object.hasOwn(frame, "message")
@@ -251,18 +257,18 @@ export class RpcFrameDecoder {
 function compactTerminalFrame(
 	frame: object,
 	streamedMessageCount: number,
-	streamedMessages?: readonly unknown[],
+	streamedFingerprints?: readonly string[],
 ): object {
 	if (!isRecord(frame) || frame.type !== "agent_end" || !Array.isArray(frame.messages)) return frame;
 	let streamed = Number.isSafeInteger(streamedMessageCount)
 		? Math.min(Math.max(0, streamedMessageCount), frame.messages.length)
 		: 0;
-	if (streamedMessages) {
+	if (streamedFingerprints) {
 		streamed = 0;
-		const limit = Math.min(streamedMessages.length, frame.messages.length);
+		const limit = Math.min(streamedFingerprints.length, frame.messages.length);
 		while (
 			streamed < limit &&
-			isDeepStrictEqual(streamedMessages[streamed], jsonSnapshot(frame.messages[streamed]))
+			streamedFingerprints[streamed] === messageFingerprint(jsonSnapshot(frame.messages[streamed]))
 		) {
 			streamed++;
 		}
@@ -303,14 +309,14 @@ function encodeRpcFrameFromJson(
 	frame: object,
 	json: string,
 	streamedMessageCount: number,
-	streamedMessages?: readonly unknown[],
+	streamedFingerprints?: readonly string[],
 ): string {
 	if (serializedFrameBytes(json) <= MAX_RPC_FRAME_BYTES) return `${json}\n`;
 	if (isRecord(frame) && frame.type === "response") {
 		return `${JSON.stringify(overflowFrame(frame))}\n`;
 	}
 
-	const compacted = compactTerminalFrame(frame, streamedMessageCount, streamedMessages);
+	const compacted = compactTerminalFrame(frame, streamedMessageCount, streamedFingerprints);
 	json = JSON.stringify(compacted);
 	if (serializedFrameBytes(json) <= MAX_RPC_FRAME_BYTES) return `${json}\n`;
 
@@ -324,12 +330,17 @@ function encodeRpcFrameFromJson(
 
 /** Serialize a complete JSONL frame while enforcing the transport byte ceiling. */
 export function encodeRpcFrame(frame: object, streamedMessageCount = 0, streamedMessages?: readonly unknown[]): string {
-	return encodeRpcFrameFromJson(frame, serializeFrame(frame), streamedMessageCount, streamedMessages);
+	return encodeRpcFrameFromJson(
+		frame,
+		serializeFrame(frame),
+		streamedMessageCount,
+		streamedMessages?.map(message => messageFingerprint(jsonSnapshot(message))),
+	);
 }
 
-/** Stateful encoder that tracks which messages a client has already received. */
+/** Stateful encoder that retains immutable receipts, not duplicate message payloads. */
 export class RpcFrameEncoder {
-	#streamedMessages: unknown[] = [];
+	#streamedFingerprints: string[] = [];
 	#protocolVersion: RpcProtocolVersion = 1;
 	#chunkCounter = 0;
 
@@ -353,12 +364,12 @@ export class RpcFrameEncoder {
 	 * returned iterable MUST be fully consumed exactly once.
 	 */
 	encodeFrames(frame: object): Iterable<string> {
-		if (isRecord(frame) && frame.type === "agent_start") this.#streamedMessages = [];
+		if (isRecord(frame) && frame.type === "agent_start") this.#streamedFingerprints = [];
 		const json = serializeFrame(frame);
 		let frames: Iterable<string>;
 		let singleFrame: string | undefined;
 		if (this.#protocolVersion === 2 && serializedFrameBytes(json) > MAX_RPC_FRAME_BYTES) {
-			const compacted = compactTerminalFrame(frame, this.#streamedMessages.length, this.#streamedMessages);
+			const compacted = compactTerminalFrame(frame, this.#streamedFingerprints.length, this.#streamedFingerprints);
 			// Reuse the original serialization when compaction was a no-op.
 			const compactedJson = compacted === frame ? json : JSON.stringify(compacted);
 			if (serializedFrameBytes(compactedJson) > MAX_RPC_FRAME_BYTES) {
@@ -368,7 +379,12 @@ export class RpcFrameEncoder {
 				frames = [singleFrame];
 			}
 		} else {
-			singleFrame = encodeRpcFrameFromJson(frame, json, this.#streamedMessages.length, this.#streamedMessages);
+			singleFrame = encodeRpcFrameFromJson(
+				frame,
+				json,
+				this.#streamedFingerprints.length,
+				this.#streamedFingerprints,
+			);
 			frames = [singleFrame];
 		}
 		if (!isRecord(frame)) return frames;
@@ -379,8 +395,8 @@ export class RpcFrameEncoder {
 					: singleFrame !== undefined
 						? encodedMessageSnapshot(singleFrame)
 						: undefined;
-			if (snapshot) this.#streamedMessages.push(snapshot.message);
-		} else if (frame.type === "agent_end" && frame.willContinue !== true) this.#streamedMessages = [];
+			if (snapshot) this.#streamedFingerprints.push(messageFingerprint(snapshot.message));
+		} else if (frame.type === "agent_end" && frame.willContinue !== true) this.#streamedFingerprints = [];
 		return frames;
 	}
 
