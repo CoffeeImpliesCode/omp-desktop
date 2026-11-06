@@ -75,6 +75,11 @@ export type WorkerInitPayload =
 			userAgent?: string;
 			/** Ignore invalid HTTPS certificates for this page. */
 			ignoreHttpsErrors?: boolean;
+			/**
+			 * The user drives this browser (connected, relay): downloads keep its one browser-wide folder and real file
+			 * names, since the user's own downloads land there too. Unset means an OMP-launched browser.
+			 */
+			userDriven?: boolean;
 	  }
 	| {
 			mode: "attach";
@@ -84,6 +89,8 @@ export type WorkerInitPayload =
 			uploadDir: string;
 			page: AttachPage;
 			viewport?: { width: number; height: number; deviceScaleFactor?: number };
+			/** Raise an explicitly selected target before capture. False preserves the user's selected tab. */
+			activateForScreenshot?: boolean;
 			dialogs?: "accept" | "dismiss";
 			/** Hostname patterns allowed for every page request. */
 			allowedDomains?: string[];

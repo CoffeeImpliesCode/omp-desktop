@@ -146,6 +146,25 @@ describe("RPC frame encoding", () => {
 		});
 	});
 
+	it("recognizes streamed message receipts despite reordered object keys", () => {
+		const messages = oversizedMessageHistory("reordered");
+		for (const version of [1, 2]) {
+			const encoder = new RpcFrameEncoder();
+			encoder.setProtocolVersion(version);
+			for (const message of messages) encoder.encode({ type: "message_end", message });
+			const reordered = messages.map(message => ({
+				content: message.content.map(block => ({ text: block.text, type: block.type })),
+				role: message.role,
+			}));
+
+			expect(decode(encoder.encode({ type: "agent_end", messages: reordered }))).toEqual({
+				type: "agent_end",
+				messages: [],
+				messageCount: messages.length,
+			});
+		}
+	});
+
 	it("does not let later mutation rewrite the message_end snapshot", () => {
 		const messages = oversizedMessageHistory("before");
 		const encoder = new RpcFrameEncoder();
