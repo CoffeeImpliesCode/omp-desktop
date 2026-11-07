@@ -1,9 +1,14 @@
 import { afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
 import { stripVTControlCharacters } from "node:util";
 import type { AgentTool } from "@oh-my-pi/pi-agent-core";
-import { ToolExecutionComponent } from "@oh-my-pi/pi-tui/chat/tool-execution";
-import { initTheme } from "@oh-my-pi/pi-tui/theme";
+import { ToolExecutionComponent, type ToolExecutionUi } from "@oh-my-pi/pi-tui/chat/tool-execution";
+import { initTheme, setTheme } from "@oh-my-pi/pi-tui/theme";
 import { Text, type TUI } from "@oh-my-pi/pi-tui";
+import { ImageBudget } from "@oh-my-pi/pi-tui/components/image";
+import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui/terminal-capabilities";
+import { convertImageToPngShared } from "@oh-my-pi/pi-tui/chat/image-loading";
+import { getNativeBlob } from "@oh-my-pi/pi-tui/native/blobs";
+import type { DescribeContext, NativeNode } from "@oh-my-pi/pi-tui/native/node";
 
 /**
  * Contract under test (tool-result render memoization):
@@ -146,4 +151,170 @@ describe("ToolExecutionComponent tool-result render memoization", () => {
 	// which the render context consumes (context.frozen) — so it must be in the memo
 	// key. The bug: the key omitted it, so once the display was built seal()'s
 	// #updateDisplay() early-returned and the row stayed styled as live progress.
+});
+
+describe("ToolExecutionComponent released cache replay", () => {
+	const ui: ToolExecutionUi = { requestRender() {}, requestComponentRender() {}, resetDisplay() {} };
+	const nativeContext: DescribeContext = {
+		cols: 80,
+		dark: true,
+		reduceMotion: false,
+		supports: () => true,
+		feature: () => true,
+	};
+	const terminal = TERMINAL as unknown as { imageProtocol: ImageProtocol | null };
+	const originalProtocol = TERMINAL.imageProtocol;
+	const components: ToolExecutionComponent[] = [];
+	const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGNgAAAAAgABSK+kcQAAAABJRU5ErkJggg==";
+
+	beforeAll(async () => {
+		await initTheme(false, undefined, undefined, "dark", "light");
+	});
+
+	afterEach(async () => {
+		for (const component of components) component.dispose();
+		components.length = 0;
+		terminal.imageProtocol = originalProtocol;
+		vi.restoreAllMocks();
+		await setTheme("dark");
+	});
+
+	function settled(name: string, custom = false): ToolExecutionComponent {
+		const tool = custom
+			? ({
+					name,
+					label: "Custom",
+					renderCall: (args: { command: string }) => new Text(args.command, 0, 0),
+					renderResult: (result: { content: { text?: string }[] }) =>
+						new Text(result.content.map(block => block.text ?? "").join("\n"), 0, 0),
+				} as unknown as AgentTool)
+			: undefined;
+		const component = new ToolExecutionComponent(name, { command: "printf REPLAY_COMMAND" }, {}, tool, ui);
+		components.push(component);
+		component.updateResult({
+			content: Array.from({ length: 24 }, (_, index) => ({
+				type: "text",
+				text: `REPLAY_ROW_${index} with enough synthetic text to wrap in a narrow terminal.`,
+			})),
+		});
+		return component;
+	}
+
+	for (const name of ["unknown_replay_tool", "bash", "eval", "custom_replay_tool"]) {
+		it(`replays ${name} output at new widths, expansion states, and themes`, async () => {
+			const component = settled(name, name === "custom_replay_tool");
+			const twin = settled(name, name === "custom_replay_tool");
+			for (const expanded of [false, true]) {
+				component.setExpanded(expanded);
+				twin.setExpanded(expanded);
+				const rows = component.render(80);
+				const native = component.describe(nativeContext);
+				component.releaseRenderCaches();
+				expect(component.render(80)).toEqual(rows);
+				expect(component.describe(nativeContext)).toEqual(native);
+				expect(component.render(43)).toEqual(twin.render(43));
+				expect(Bun.stripANSI(component.render(43).join("\n"))).toContain("REPLAY_ROW_");
+			}
+			component.releaseRenderCaches();
+			expect((await setTheme("light")).success).toBe(true);
+			component.invalidate();
+			twin.invalidate();
+			expect(component.render(43)).toEqual(twin.render(43));
+			expect(component.describe({ ...nativeContext, dark: false })).toEqual(
+				twin.describe({ ...nativeContext, dark: false }),
+			);
+		});
+	}
+
+	it("keeps a task snapshot's retry countdown and native ages stable during replay", () => {
+		let now = 100_000;
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+		const component = new ToolExecutionComponent("task", { task: "Synthetic retry assignment" }, {}, undefined, ui);
+		components.push(component);
+		component.updateResult({
+			content: [],
+			details: {
+				projectAgentsDir: null,
+				results: [],
+				totalDurationMs: 0,
+				progress: [
+					{
+						index: 0,
+						id: "ReplayAgent",
+						agent: "task",
+						agentSource: "bundled",
+						status: "running",
+						task: "Synthetic retry assignment",
+						assignment: "Synthetic retry assignment",
+						description: "Retry snapshot",
+						recentTools: [],
+						recentOutput: [],
+						toolCount: 0,
+						requests: 0,
+						tokens: 0,
+						cost: 0,
+						durationMs: 0,
+						retryState: {
+							attempt: 1,
+							maxAttempts: 3,
+							startedAtMs: 90_000,
+							delayMs: 60_000,
+							errorMessage: "Synthetic provider retry",
+						},
+					},
+				],
+			},
+		});
+		const rows = component.render(100);
+		const native = component.describe(nativeContext);
+		expect(Bun.stripANSI(rows.join("\n"))).toContain("retrying 1/3");
+		expect(JSON.stringify(native)).toContain("Synthetic provider retry");
+		component.releaseRenderCaches();
+		now += 30_000;
+		expect(component.render(100)).toEqual(rows);
+		expect(component.describe(nativeContext)).toEqual(native);
+	});
+
+	it("replays native image blobs and Kitty conversions without losing graphics placements", async () => {
+		terminal.imageProtocol = ImageProtocol.Kitty;
+		const jpeg = await new Bun.Image(Buffer.from(png, "base64")).jpeg().toBase64();
+		const image = { type: "image" as const, data: jpeg, mimeType: "image/jpeg" };
+		await convertImageToPngShared(image);
+		const budget = new ImageBudget(2);
+		const component = new ToolExecutionComponent("unknown_image_tool", {}, {}, undefined, {
+			...ui,
+			imageBudget: budget,
+		});
+		components.push(component);
+		component.updateResult({ content: [image] });
+
+		function imageNode(node: NativeNode): NativeNode | undefined {
+			if (node.k === "image") return node;
+			for (const child of node.c ?? []) {
+				if (!("k" in child)) continue;
+				const found = imageNode(child);
+				if (found) return found;
+			}
+			return undefined;
+		}
+
+		const rows = component.render(80);
+		expect(rows.join("")).toContain("\x1b_Ga=p");
+		expect(budget.takeTransmits()).toHaveLength(1);
+		const native = component.describe(nativeContext);
+		component.releaseRenderCaches();
+		expect(component.render(80)).toEqual(rows);
+		expect(budget.takeTransmits()).toEqual([]);
+		const replayed = component.describe(nativeContext);
+		expect(replayed).toEqual(native);
+		const blob = (imageNode(replayed)?.p as { blob: string } | undefined)?.blob;
+		expect(blob).toBeDefined();
+		expect(Buffer.from(getNativeBlob(blob!)!.bytes).toString("base64")).toBe(jpeg);
+		expect(getNativeBlob(blob!)?.mime).toBe("image/jpeg");
+		component.setShowImages(false);
+		expect(Bun.stripANSI(component.render(43).join("\n"))).toContain("[Image:");
+		component.releaseRenderCaches();
+		component.setShowImages(true);
+		expect(component.render(43).join("")).toContain("\x1b_Ga=p");
+	});
 });

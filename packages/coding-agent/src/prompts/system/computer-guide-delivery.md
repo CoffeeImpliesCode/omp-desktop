@@ -1,0 +1,1 @@
+arrives unasked, once, after the output of the Eval cell that makes this conversation's first direct `computer.window(…)`/`computer.focusedWindow()` call, hit or miss; read it only if that output has left your context

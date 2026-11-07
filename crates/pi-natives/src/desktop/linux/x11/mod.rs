@@ -1,4 +1,5 @@
 mod capture;
+mod control;
 mod input;
 mod keymap;
 mod mpx;
@@ -7,6 +8,7 @@ mod uinput;
 mod wm;
 
 use capture::X11Capture;
+use control::X11Control;
 use image::RgbaImage;
 use input::X11Input;
 
@@ -14,18 +16,22 @@ use super::ax::{AtSpiAx, ElementFocus};
 use crate::desktop::{
 	ax::AxHandle,
 	backend::{AxBackend, Backend, DeliveryMode, ElementDelivery, ElementInput, PointerEvent},
-	control::OperationToken,
+	control::{ControlAction, OperationToken},
 	error::{CoreResult, DesktopError},
 	frame::FrameGeometry,
 	keys::KeyName,
 	types::{
-		CaptureCaps, DesktopCapabilities, DesktopDisplay, DesktopWindow, DisplaySelector, Target,
+		CaptureCaps, DesktopCapabilities, DesktopControlCapabilities, DesktopDisplay, DesktopWindow,
+		DesktopWindowState, DesktopWorkspace, DisplaySelector, Target,
 	},
 };
 
 pub struct X11Backend {
 	capture:        X11Capture,
 	input:          X11Input,
+	/// EWMH/ICCCM control on the same connection as capture and input, so a
+	/// window request never needs a second session.
+	control:        X11Control,
 	ax:             Option<AtSpiAx>,
 	display_server: Option<String>,
 }
@@ -34,8 +40,9 @@ impl X11Backend {
 	pub(crate) fn new(display: DisplaySelector) -> CoreResult<Self> {
 		let capture = X11Capture::new(display)?;
 		let input = X11Input::new(capture.connection(), capture.root())?;
+		let control = X11Control::new(capture.connection(), capture.root(), capture.root_size())?;
 		let ax = AtSpiAx::new().ok();
-		Ok(Self { capture, input, ax, display_server: std::env::var("DISPLAY").ok() })
+		Ok(Self { capture, input, control, ax, display_server: std::env::var("DISPLAY").ok() })
 	}
 }
 
@@ -71,6 +78,9 @@ impl Backend for X11Backend {
 			}
 			.to_string(),
 			display_count: displays.map_or(0, |items| u32::try_from(items.len()).unwrap_or(u32::MAX)),
+			// The worker attaches the live `control_capabilities()` read; a
+			// literal here would go stale the moment the window manager changes.
+			window_control: None,
 			screen_locked: false,
 			display_asleep: false,
 		}
@@ -189,6 +199,23 @@ impl Backend for X11Backend {
 		deliver_element_keys(&window, mode, &mut route)
 	}
 
+	/// Only what this window manager actually implements. Everything else is
+	/// refused instead of being approximated through input or a client kill.
+	fn control_capabilities(&mut self) -> DesktopControlCapabilities {
+		self.control.capabilities()
+	}
+
+	fn control(&mut self, action: &ControlAction) -> CoreResult<()> {
+		self.control.run(&self.capture, action)
+	}
+
+	fn workspaces(&mut self) -> CoreResult<Vec<DesktopWorkspace>> {
+		self.control.workspaces()
+	}
+
+	fn window_state(&mut self, id: &str) -> CoreResult<DesktopWindowState> {
+		self.control.window_state(&self.capture, id)
+	}
 	fn ax(&mut self) -> Option<&mut dyn AxBackend> {
 		self.ax.as_mut().map(|ax| ax as &mut dyn AxBackend)
 	}

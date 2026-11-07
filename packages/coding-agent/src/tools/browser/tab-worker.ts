@@ -1505,6 +1505,28 @@ export function describeScreenshot(opts?: ScreenshotOptions): string {
 	if (opts?.fullPage) return "tab.screenshot({ fullPage: true })";
 	return "tab.screenshot()";
 }
+/**
+ * Prepare capture without changing the user's selected tab unless activation is requested.
+ * Owned background pages can be captured in place. A borrowed page must already be visible.
+ */
+export async function preparePageForScreenshot(
+	page: Pick<Page, "bringToFront" | "evaluate">,
+	signal: AbortSignal | undefined,
+	activate: boolean,
+	ownedPage: boolean,
+): Promise<void> {
+	if (activate) {
+		await untilAborted(signal, () => page.bringToFront()).catch(() => undefined);
+		return;
+	}
+	if (ownedPage) return;
+	const visible = await untilAborted(signal, () => page.evaluate(() => document.visibilityState === "visible")).catch(
+		() => false,
+	);
+	if (!visible) {
+		throw new ToolError("The attached browser tab is not visible; switch to it before taking a screenshot");
+	}
+}
 
 /** Summarize still-running helpers (oldest first) so a cell timeout names what stalled. */
 export function describeInflight(inflight: Map<number, InflightOp>): string {
@@ -1531,7 +1553,9 @@ export class WorkerCore {
 	#isolated: boolean;
 	#uninstallRejectionGuard: () => void;
 	#mode?: WorkerInitPayload["mode"];
+	/** Whether this worker owns the page and may therefore destroy it. */
 	#ownsPage = false;
+	#activateForScreenshot = true;
 	/** The upload route this worker's browser connection takes, and the tab's staging folder. */
 	#uploads?: UploadStaging;
 	#dialogs?: RuntimeDialogController;
@@ -1735,6 +1759,7 @@ export class WorkerCore {
 		try {
 			this.#mode = payload.mode;
 			this.#ownsPage = ownsPage(payload);
+			this.#activateForScreenshot = payload.mode === "headless" || payload.activateForScreenshot !== false;
 			this.#uploads = new UploadStaging(payload.uploadDir);
 			const puppeteer = await loadPuppeteerInWorker(payload.safeDir);
 			registerSemanticQueryHandlers(puppeteer);
@@ -1772,6 +1797,9 @@ export class WorkerCore {
 					);
 				}
 				this.#observeDialogs();
+				// Stealth and fixed device emulation are launch-profile concerns:
+				// the relay drives the user's own Chrome, where patching the
+				// browser or pinning the viewport would alter what they see.
 				if (payload.mode === "headless") {
 					await applyStealthPatches(this.#browser, this.#page, { browserSession: null, override: null });
 					if (payload.emulateViewport !== false) await applyViewport(this.#page, payload.viewport);
@@ -1843,13 +1871,12 @@ export class WorkerCore {
 			this.#started = true;
 			this.#transport.send({ type: "ready", info });
 		} catch (error) {
-			// A page this attempt created would be orphaned (the supervisor retries
-			// with a fresh worker), so close it before reporting. An adopted target —
-			// a borrowed page, or an owned one a recycle retries — is never closed here.
+			// A page this attempt created would be orphaned, so close it before reporting.
+			// A borrowed page, or an owned target a recovery retries, must stay open.
 			const page = this.#page;
 			await this.#webmcp?.dispose().catch(() => undefined);
 			this.#webmcp = undefined;
-			if (payload.mode === "headless" && page && !page.isClosed()) {
+			if (payload.mode !== "attach" && page && !page.isClosed()) {
 				await page.close().catch(() => undefined);
 			}
 			// Attached browsers also own tabs created by omp, including spawned Chrome.
@@ -3253,6 +3280,7 @@ export class WorkerCore {
 		opts: ScreenshotOptions = {},
 	): Promise<string | ScreenshotChangeResult> {
 		const page = this.#requirePage();
+		await preparePageForScreenshot(page, signal, this.#activateForScreenshot, this.#ownsPage);
 		screenshotQuality(opts);
 		const threshold = screenshotThreshold(opts.threshold);
 		const changeDetection = opts.ifChanged === true || opts.threshold !== undefined;
@@ -3359,6 +3387,7 @@ export class WorkerCore {
 		opts: DiffScreenshotOptions = {},
 	): Promise<DiffScreenshotResult> {
 		const page = this.#requirePage();
+		await preparePageForScreenshot(page, signal, this.#activateForScreenshot, this.#ownsPage);
 		const absoluteBaseline = resolveToCwd(baselinePath, session.cwd);
 		const baseline = await untilAborted(signal, () => fs.promises.readFile(absoluteBaseline));
 		const current = await whileDrawing(page, signal, () =>
@@ -3646,6 +3675,7 @@ export class WorkerCore {
 
 	async #close(keepPage: boolean): Promise<void> {
 		if (!this.#stop()) return;
+		this.#active?.ac.abort(postmortem.markExpectedCleanupError(new ToolAbortError("Tab worker closed")));
 		this.#clearElementCache();
 		const page = this.#page;
 		await this.#recording.close().catch(error => {
