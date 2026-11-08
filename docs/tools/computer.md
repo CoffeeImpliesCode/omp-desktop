@@ -22,9 +22,10 @@ User setup, permissions, safety guidance, examples, and platform limitations: [S
 
 - `computer.enabled` gates the Eval prelude and defaults to `false`. `/computer` toggles it for the current session without persisting settings.
 - The prelude is available only through enabled Eval runtimes; it is not an AgentTool.
-- The worker queues direct helpers, runs, and per-cell observation settlement in FIFO order. Capability inspection remains available during a run. Concurrent JS/Python cells keep their own observation and cancellation state. The active Eval documentation and globals update with the current enabled state.
+- The worker serializes direct helpers, runs, and settlement. Before another cell runs, it saves the prior cell's pending observation. Late reports use that snapshot, not another cell's current state. Capability inspection remains available during a run. Globals follow the current enabled state.
 - Unlike `browser`, this prelude can operate IDEs, terminals, native applications, browser windows, and system dialogs. It has no browser DOM or web ARIA surface; its accessibility methods use the host OS.
-- When enabled at session start, the computer guide is included in the Eval tool description before the first call. It also remains readable at `xd://eval/computer`. Enabling it mid-session announces that link instead, since the advertised description is frozen.
+- At session start, Eval includes the computer guide inline. It remains readable at `xd://eval/computer`. A mid-session notice links the guide when `read` is available, or includes it when `read` is unavailable. Window lookups do not inject another copy.
+- Desktop use requires native ABI 1. A stale addon fails before session construction without preventing shared non-desktop imports. Rebuild the native addon and restart omp.
 
 ## Settings
 
@@ -35,6 +36,10 @@ User setup, permissions, safety guidance, examples, and platform limitations: [S
 | `computer.maxWidth`           | number  |     `3840` | Maximum screenshot width.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `computer.maxHeight`          | number  |     `2400` | Maximum screenshot height.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `computer.backgroundFallback` | enum    | `takeover` | When a window input call's background route is unavailable: `takeover` reruns that call once in takeover, returns focus to the user's app and reports it in the run output; `refuse` throws `BackgroundUnavailable` without taking over, and also refuses, before anything is sent, `takeover: true`, `raise()` and AX `raise`, `apps.open(…, { activate: true })` or `{ reveal: true }`, `control.acquire`, input to the desktop or a display, off macOS `el.focus()`, and on macOS every call that opens a menu (right-click or Control-click, `perform("AXShowMenu")`, `press()`/`perform("AXPress")` or a left click, hold or drag on a popup button or menu button, `setValue` on a popup button) or passes `menu`, since an open menu takes the user's keyboard. |
+
+Under `refuse`, macOS AX `open` is refused too, since it can bring an Open panel's app forward, and each AX action the setting refuses is refused in every spelling `perform()` runs it by.
+
+Under `refuse`, compositor focus (`focus()`, `focusWorkspace()`, and `focusDisplay()`) and `moveToWorkspace({ focus: true })` also fail before dispatch. Unfocused window moves remain available.
 
 There is no `computer.backend` setting. The native addon selects the platform backend.
 
@@ -84,7 +89,7 @@ The same surface is reachable as `computer.*` directly and as `desktop.*` inside
 - `desktop.window(id | { id?, app?, title?, wait? })` returns one persistent window facade. An id may be a string or a number (`74` is the id `"74"`, never matched against app or title). A filter's optional `wait` polls every 100 ms for a window to appear; it accepts finite milliseconds from 0 to 10000 and is cancellable, including in read-only runs. Without `wait`, lookup lists windows once. Python keyword filters support the same option: `await computer.window(app="Preview", title="report.pdf", wait=3000)`. Zero matches throw with the open windows grouped by app as `id "title"`: apps matching the filter's `app` first (up to 10 windows each, titled before untitled), then the focused window's app, then the rest (up to 3 each), at most 12 apps, with overflow and unlisted windows counted, plus a line when no app matches. Multiple matches throw with the candidates.
 - `desktop.focusedWindow()` returns a window facade or `null`.
 - `desktop.displays()` returns `DesktopDisplay[]`.
-- `desktop.workspaces()` returns `DesktopWorkspace[]` entries with `{ id, index, name, displayId, active, focused, urgent, activeWindowId }`. Workspace IDs are opaque and stable (`niri-workspace:<n>` on niri, `x11-workspace:<n>` on X11).
+- `desktop.workspaces()` returns `DesktopWorkspace[]` entries with `{ id, index, name, displayId, active, focused, urgent, activeWindowId }`. IDs are backend-specific. Niri IDs are compositor-stable. X11 IDs name volatile EWMH positions: removal or reordering can reuse an in-range ID. Read fresh workspaces/state before choosing a target and re-enumerate after topology changes. Never construct an ID from an index.
 - `desktop.capabilities()` returns capture/input/AX availability, `backgroundWindowInput` and `takeover` support, permission states, display server, backend, display count, on macOS `screenLocked`/`displayAsleep`, and the optional `windowControl` block `{ backend, operations, coordinateSpace, focusMayWarpPointer }`. A missing block means the session has no window control.
 
 A window facade exposes immutable `id`, `app`, `title`, optional `pid`, `bounds`, `positionKnown`, and `focused` fields.
@@ -106,12 +111,12 @@ Both a selected window and `desktop` expose:
 - `click(x, y, { button?, count?, modifiers?, menu?, takeover? })`
 - `doubleClick(x, y, { button?, modifiers?, takeover? })`
 - `move(x, y, { takeover? })`
-- `drag([[x, y], ...], { modifiers?, takeover? })`
+- `drag([[x, y], ...], { modifiers?, takeover? }) -> { start, length, text, focused } | undefined`: the selection when a macOS background drag was made as one (below), otherwise `undefined`
 - `scroll(x, y, { dx?, dy?, takeover? })`
 - `type(text, { takeover? })`
 - `press(chord | string[], { takeover? })`
 
-Windows also expose `raise()`, `focus()`, `ax(...)`, `find(...)`, `ref(...)`, `state()`, and the window-control helpers.
+Windows also expose `raise()`, `focus()`, `ax(...)`, `find(...)`, `ref(...)`, `state()`, and the window-control helpers. `focus()` uses the compositor's advertised focus operation. `raise()` uses the native foreground route and honors the foreground-refusal policy. Python `raise_()` calls that same route, not `focus()`.
 
 `positionKnown` indicates whether window bounds have a verified global origin. If false, exact window capture may still work, but input requiring that origin fails with `InvalidCoordinateFrame`; AT-SPI window-relative bounds are not a safe substitute.
 
@@ -125,7 +130,9 @@ Window/workspace controls call the compositor or window manager, not synthetic i
 
 On niri, movement requires a floating window, tiled resize changes the column or row, and minimize, restore, idempotent maximize, and idempotent fullscreen are not advertised. Focusing may warp the pointer. X11 advertises only operations supported by the running window manager; `focusDisplay` is absent.
 
-Window input defaults to background delivery without deliberate activation or pointer movement. On macOS, background keys, key-event typing, left clicks, left-button drags and holds, and menu actions make the target window key only within its own application, so the user's application keeps keyboard focus; keystrokes wait until the application reports the target as focused and stop with `InputFailed` if another of its windows becomes key, keys for a window whose attached sheet or panel has focus throw `InvalidTarget` naming that window, and these actions on a non-key window of the frontmost application have no background route. macOS background modified clicks, right-clicks, Electron scrolls, middle-button drags and holds, and left-button drags and holds that start on a slider, scroll bar, splitter or stepper are delivered without moving the user's pointer; a left-button drag or hold that starts anywhere else has no background route, since it could start a drag and drop that macOS completes at the user's real pointer; a right-click or Control-click, or a click, `press()` or `perform("AXShowMenu")` on a menu button or popup button, that opens a menu in a background application closes it and throws `InputFailed` listing its items, because it was delivered (a takeover rerun would close it again when focus returns), unless the call passed `menu`: an item path, matched like `win.menu.select`, that the call presses in the menu it opened, returning with the menu closed. Right-button or Control drags and holds, right-clicks or Control-clicks with `count` above 1, gestures with modifiers or keys into Apple Screen Sharing, and presses into Tk 8.6 or later have no background route. When a call has no background route, `computer.backgroundFallback` decides: `takeover` reruns it once in takeover and returns focus to the user's app, `refuse` throws `BackgroundUnavailable`. `takeover: true` briefly activates the target and posts real input at once; reserve it for a background call a screenshot proves did nothing when AX cannot perform the action. Never replay uncertain input blindly. Desktop-root pointer helpers drive the user's real pointer, so prefer window handles. Pixel coordinates belong to the most recent full screenshot of the same target. Coordinate input before capture, after target/layout changes, or with another target's frame throws.
+Window input defaults to background delivery without deliberate activation or pointer movement. On macOS, background keys, key-event typing, left clicks, left-button drags and holds, and menu actions make the target window key only within its own application, so the user's application keeps keyboard focus; keystrokes wait until the application reports the target as focused and stop with `InputFailed` if another of its windows becomes key, keys for a window whose attached sheet or panel has focus throw `InvalidTarget` naming that window, and these actions on a non-key window of the frontmost application have no background route. macOS background modified clicks, right-clicks, Electron scrolls, middle-button drags and holds, and left-button drags and holds that start on a slider, scroll bar, splitter or stepper are delivered without moving the user's pointer; a left-button drag with no modifiers or keys whose first and last points lie on the text of one native text element (not web content or a terminal) is made as that element's selection between the carets a press and release there would leave, through `AXSelectedTextRange` with no mouse event, and returns the selection read back or throws as `selectText` does, unless its press lands on selected text, a link or an attachment or the text holds right-to-left script; any other left-button drag or hold has no background route, since it could start a drag and drop that macOS completes at the user's real pointer; a right-click or Control-click, or a click, `press()` or `perform("AXShowMenu")` on a menu button or popup button, that opens a menu in a background application closes it and throws `InputFailed` listing its items, because it was delivered (a takeover rerun would close it again when focus returns), unless the call passed `menu`: an item path, matched like `win.menu.select`, that the call presses in the menu it opened, returning with the menu closed. Right-button or Control drags and holds, right-clicks or Control-clicks with `count` above 1, gestures with modifiers or keys into Apple Screen Sharing, and presses into Tk 8.6 or later have no background route. When a call has no background route, `computer.backgroundFallback` decides: `takeover` reruns it once in takeover and returns focus to the user's app, `refuse` throws `BackgroundUnavailable`. `takeover: true` briefly activates the target and posts real input at once; reserve it for a background call a screenshot proves did nothing when AX cannot perform the action. Never replay uncertain input blindly. Desktop-root pointer helpers drive the user's real pointer, so prefer window handles. Pixel coordinates belong to the most recent full screenshot of the same target. Coordinate input before capture, after target/layout changes, or with another target's frame throws.
+
+The macOS drag-selection shortcut also falls back when the text view's insertion-caret bounds are vertical or unavailable, or its current selection cannot be read: horizontal glyph edges cannot place a vertical caret, and an unreadable selection cannot rule out picking up selected text.
 
 On macOS, Screen Sharing and iPhone Mirroring forward key codes, not text, so `type` there presses each character's key on the current keyboard layout (holding Shift or Option where needed) and throws `InvalidKey` before typing anything when no key types a character; takeover does not change that. Characters in `press` and `holdKeys` there take the layout's key the same way. Other targets receive typed text as event text. Screen Sharing reads modifiers and Caps Lock from the physical keyboard: background text, shortcuts or held keys needing Shift, Option, Control or Command throw `BackgroundUnavailable`, as does a background key while the user holds a modifier key or Caps Lock is on (`InputFailed` once earlier keys went out, so it is not rerun in takeover); takeover sends them as key presses.
 
@@ -152,6 +159,8 @@ Menu/app labels are untrusted data. A takeover grant does not authorize unrelate
 - `win.find({ role?, title?, value?, limit? }) -> El[]` returns all native matches within the requested limit as an array; calling an element method or reading an element field on the array itself throws a `TypeError` that says to pick one first (`const [el] = await win.find(...)`).
 - `await win.ref("e5") -> El` and `await desktop.ref("e5") -> El` resolve a live native reference. The handle `ref()` returns also takes element methods directly, so `win.ref("e5").click()` needs no inner `await`.
 - `desktop.elementAt(x, y)` and `desktop.focusedElement()` return `El | null`.
+
+Each `ax()` line is `- role "label" [ref=eN]: "value"` followed by states. A label is the title, else the description; on macOS a window's unlabeled close, minimize, zoom and full-screen buttons take that name. On macOS, labels and values are quoted with `\n`, `\t`, `\"` and `\\` escapes. One longer than 200 characters plus the note that would replace the rest shows its first 200 characters and ends `… (+N chars; (await computer.ref("eN")).value())` (`.title` or `.description` for a label); that call returns it whole, and a script slices or searches it (`v.slice(-300)`, `v.indexOf(…)`, a regex) rather than printing all of it. Linux and Windows retain 80-character previews without a full-value recovery note; backend limits may also clip the accessor's result (AT-SPI values are capped at 16,384 characters). `(focused)` marks the window's line when it is the focused window, and the element holding keyboard focus: on macOS only the application's focused element, since a focused table reports every cell focused. On macOS a line also shows `(selected)` on selected rows, cells, buttons and Finder file icons, `(settable)` on a date `setValue` can write (never inside web content, which `setValue` refuses; text fields are not marked), `(readonly)` on a web page's text field or text area the page declares read-only (`readonly`, `aria-readonly`), so typing into it is expected to change nothing, and `actions=` with the actions the element offers beyond its role: a control's press, a text field's confirm and cancel, and the scroll-into-view, context-menu, raise, page-scroll and hover actions nearly every element has go unlisted, except on a control without press, which lists all it has. Each name is listed once; past 16 the list ends `… (+N more; (await computer.ref("eN")).actions())`, the call that lists every action. `perform()` takes a listed name in any case, with or without its `AX` prefix. A date value reads as local ISO-8601 with its UTC offset (`2026-10-16T09:00:00-04:00`).
 
 `El` exposes snapshot fields `ref`, `role`, `nativeRole`, optional `title`/`description`, `enabled`, `focused`, and `childCount`, plus:
 
@@ -188,15 +197,26 @@ Result details contain the resolved `code`, `readOnly`, `screenshots`, optional 
 On macOS a screenshot taken behind the lock screen sets `screenLocked: true` and adds a note to its status text; a native error raised while the screen is locked or the display asleep ends with that state in parentheses; and a run that ends locked or asleep returns a leading `Note:` text block. None of these refuse input. While it is in use, the native session keeps the display awake with a `PreventUserIdleDisplaySleep` assertion held from an agent turn's first desktop call until the turn ends or a prompt waits for the user's answer (outside an agent turn or in a subagent, until five minutes after the last desktop call) or on close; see [macOS display sleep and the lock screen](../computer-use.md#macos-display-sleep-and-the-lock-screen).
 
 After input, Eval waits until 500 ms after the last input completes, then appends
-fresh AX feedback for affected windows and window-roster changes. Explicitly
-printed AX reads take precedence over older automatic baselines. Targets whose
-screenshots have been shown also receive after-input images. Automatic full
-window/root AX trees use a 16 KiB UTF-8 budget, retain complete rows, and mark
-truncation.
+AX feedback and window-roster changes. A full AX tree printed by the cell can
+supply the baseline. Ref tokens alone cannot suppress readback.
 
-The usage guide appears once per prelude session after the first direct window
-lookup, even if the cell catches a lookup failure. Cancelled cells discard only
-their pending observations; late callbacks cannot contribute to another cell.
+Before another cell runs, the worker saves pending feedback under the queue.
+A late report is historical evidence. It omits actionable ref tokens and deferred
+images, preserves current baselines and coordinate frames, and requires a fresh
+read before another action. A cell does not reserve the queue between helpers.
+Observation reads have a 10-second bound.
+
+Normal settlement retains after-input images for targets whose screenshots were
+shown. Full AX trees have a 16 KiB UTF-8 budget and retain complete rows.
+Inspection failures have bounded summaries with omitted-occurrence counts.
+Dispatched input still pending at ordinary run retirement remains an unconfirmed
+attempt in the report. Synchronous native preflight failures do not count as
+dispatched input. Cancelled settlement cannot append late text or images.
+
+Printed AX trees and automatic reports remain provisional until Eval assembles
+its complete output. Cancellation or output-formatting failure discards only
+that cell's provisional baseline, not newer observations or accepted output.
+Ordinary runtime failures still retain input feedback when their output is published.
 
 ## Flow and lifecycle
 
@@ -231,7 +251,7 @@ Native errors are surfaced as `ToolError` text prefixed by the stable code name:
 
 Prelude/worker errors include `Computer session is closed`, `Timed out starting computer worker`, `Computer code execution timed out after <ms>ms`, read-only mutation errors, and the worker-restart message above. A missing or mistyped text argument fails before any native call, naming the helper and parameter: `setValue(value) requires a string, got undefined`.
 
-`AxUnconfirmed` (macOS) means an AX action was requested but its outcome could not be confirmed: the app did not reply in time or messaging failed, for example because the action opened a modal dialog. It may already have taken effect, so observe the window before repeating it.
+`AxUnconfirmed` (macOS) means an AX action was requested but its outcome could not be confirmed: the app did not reply in time or messaging failed, for example because the action opened a modal dialog, or the app answered with an attribute error that does not apply to actions, as Preview does after following a PDF link and Finder after opening an item. It may already have taken effect, so observe the window it names, with its app, before repeating it.
 
 `UserIntervened` (macOS) means the user pressed a key or clicked in the app the call was aimed at. A listen-only tap, started when the session first reads or acts on an app, records the user's keys and clicks (and input a tool such as dictation posts for them) per app the session has touched; a later process that reuses a touched app's process id starts untouched. Input into a process that draws a window for the app, such as the one that draws its Open or Save panel, counts as input into the app. Keys already being typed, including keys held around a takeover click, drag or `holdMouse`, stop at the user's first key or click there: keys sent before it may have landed, nothing more is sent, and releases still go out. A click, background or takeover, does not press once the user has pressed a key or clicked there since the call began, so a multi-click can stop after its first click; a press under way, drags and scrolls are not interrupted mid-gesture. Later input or mutation aimed at that app (window input, `menu.select`, `raise`, `bringToCurrentSpace` including for a window on another Space, and element `setValue`/`selectText`/`perform`/`press`/`type`/`click`/`focus`) waits until the user has left it alone for 5 s, or until 250 ms before the run's timeout or the native request's 3-minute limit, then throws `UserIntervened` without sending anything, naming the app and how long ago its last input came. Each such call throws until a `screenshot`, `zoom`, `observe`, `ax` or `find` of one of the app's windows begins at least 5 s after that input and its result is delivered; reads before then still succeed. Other apps are unaffected, as is desktop- or display-level input. Without event-listening access (Input Monitoring) the tap sees no input and nothing is detected.
 
@@ -240,6 +260,18 @@ Prelude/worker errors include `Computer session is closed`, `Timed out starting 
 Recover by refreshing the exact target screenshot after coordinate-frame errors, taking a new AX snapshot after `StaleRef`, and inspecting `desktop.capabilities()` for platform/permission failures. A background refusal reaches the script as `BackgroundUnavailable` only when `computer.backgroundFallback` is `refuse`, the call set `takeover: false`, or the backend has no takeover; otherwise the tool has already rerun the call in takeover and the run output says `<method> ran in takeover because <reason>; the input was delivered, and <where focus ended>`. Under `refuse`, a foreground request is `BackgroundUnavailable` too: the message says the user's setting keeps the agent in the background and names the background route where there is one. After partial-delivery or restoration errors, inspect the target before retrying because input may already have landed. After `UserIntervened`, read that window again and continue from what it shows, keeping the user's edits.
 
 After `ControlUnsupported`, check `windowControl.operations` and change approach. After `ControlFailed` or `Timeout`, read `state()` or capture a screenshot before deciding; the request may already have been applied.
+
+On Linux, each native AT-SPI wait is bounded by five seconds or the shorter
+run/request deadline. Cancellation interrupts the wait and AX walks stop between
+nodes; interrupted child reads are errors, not missing controls. An AX action
+can already have taken effect when `Timeout` is returned. Inspect before retrying.
+Niri window-capture setup shares one deadline across connection, service identity,
+session creation, and stream setup. Known sessions receive bounded cleanup.
+
+Capability reads use the last completed native snapshot while backend work is
+queued or running, including work whose caller already timed out. Without a
+completed snapshot they return temporary unavailability instead of joining that
+queue. Cached capabilities remain advisory; operations still validate current state.
 
 Desktop use requires the current native ABI, including cancellation, display wake holds, and window controls. An outdated addon fails with `Unsupported` instead of emulating these operations. Update the addon or run `bun run build:native` from the repository root.
 

@@ -11,7 +11,7 @@ target/
 .xwin-cache/
 *.tsbuildinfo
 *.node
-# Embedded addon archive emitted by `bun --cwd=packages/natives run gen:native`.
+# Ignore legacy embedded addon archives; current builds embed addons in memory.
 packages/natives/native/embedded-addons.*.tar.gz
 *.b64.js
 /result

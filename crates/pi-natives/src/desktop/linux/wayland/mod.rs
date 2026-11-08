@@ -7,11 +7,7 @@ mod portal;
 mod xkb;
 mod xwayland;
 
-use std::{
-	cell::OnceCell,
-	os::{fd::AsRawFd, unix::net::UnixStream},
-	path::PathBuf,
-};
+use std::{cell::OnceCell, os::fd::AsRawFd, path::PathBuf};
 
 #[cfg(any(feature = "wayland-pipewire", test))]
 use geometry::PortalGeometry;
@@ -42,7 +38,6 @@ pub(super) fn compositor_windows() -> Option<Vec<DesktopWindow>> {
 		.map(|windows| windows.into_iter().map(|entry| entry.window).collect())
 }
 
-
 pub struct WaylandBackend {
 	#[cfg_attr(
 		not(feature = "wayland-pipewire"),
@@ -62,7 +57,8 @@ pub struct WaylandBackend {
 	compositor_pid:    Option<u32>,
 }
 
-/// Reads the compositor's PID from niri IPC or from peer credentials of the Wayland socket.
+/// Reads the compositor's PID from niri IPC or from peer credentials of the
+/// Wayland socket.
 pub(super) fn compositor_pid() -> Option<u32> {
 	if let Ok(pid) = niri::compositor_pid() {
 		return Some(pid);
@@ -73,7 +69,7 @@ pub(super) fn compositor_pid() -> Option<u32> {
 	} else {
 		PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join(display)
 	};
-	let socket = UnixStream::connect(path).ok()?;
+	let socket = super::connect_compositor(&path).ok()?;
 	let mut credentials = libc::ucred { pid: 0, uid: 0, gid: 0 };
 	let mut length = size_of::<libc::ucred>() as libc::socklen_t;
 	// SAFETY: `credentials` and `length` are live, correctly sized out-params
@@ -322,11 +318,9 @@ impl Backend for WaylandBackend {
 			// to enrich display names and match known monitors.
 			let known = niri::displays().ok().flatten().unwrap_or_default();
 			let frames = capture::capture()?;
-			self.displays = geometry::metadata(&frames, &known);
+			self.displays = geometry::metadata(&frames, &known)?;
 			let explicit = target.display_selector();
-			let selected = selector
-				.or(explicit.as_ref())
-				.unwrap_or(&self.display);
+			let selected = selector.or(explicit.as_ref()).unwrap_or(&self.display);
 			match target {
 				Target::Desktop | Target::Display(_) => {
 					let (image, displays) = geometry::compose(frames, selected, &known)?;
@@ -347,8 +341,8 @@ impl Backend for WaylandBackend {
 							 is unavailable"
 						)));
 					}
-					let displays = geometry::metadata(&frames, &known);
-					for ((image, geometry), display) in frames.iter().zip(&displays) {
+					let displays = &self.displays;
+					for ((image, geometry), display) in frames.iter().zip(displays) {
 						if matches!(selected, DisplaySelector::Id(id) if id != &display.id && id != &display.name)
 						{
 							continue;
@@ -649,6 +643,8 @@ mod tests {
 			assert_eq!(err.code.as_str(), "AxFailed");
 		});
 	}
+
+	#[test]
 	fn desktop_input_connects_to_libei_lazily() {
 		let connected = with_fake_libei(|backend| {
 			let _ = backend.type_text(

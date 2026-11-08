@@ -262,6 +262,21 @@ fn wm_failed(error: impl std::fmt::Display) -> DesktopError {
 	DesktopError::input_failed(format!("X11 window query failed: {error}"))
 }
 
+/// EWMH requires the root's check window to exist and point back to itself.
+/// A failed child-property read (including `BadWindow`) is no manager, not
+/// permission to trust the root's leftover support list.
+fn ewmh_wm_check<E>(
+	root: Window,
+	mut read_check: impl FnMut(Window) -> Result<Option<Window>, E>,
+) -> bool {
+	let Ok(Some(check)) = read_check(root) else {
+		return false;
+	};
+	check != NONE
+		&& check != root
+		&& matches!(read_check(check), Ok(Some(reciprocal)) if reciprocal == check)
+}
+
 /// An axis-aligned rectangle in root (desktop) coordinates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Rect {
@@ -750,13 +765,28 @@ impl Wm<'_> {
 			.is_some_and(|mut atoms| atoms.any(|atom| self.atoms.passive_popup_types.contains(&atom)))
 	}
 
-	/// Whether a window manager that honours EWMH owns this screen. Without
-	/// one there is no real route for window control, only bare X requests a
-	/// reparenting window manager would swallow.
+	/// Whether the EWMH check window exists and points to itself. Reading its
+	/// property proves liveness at that read: a destroyed window returns
+	/// `BadWindow`. It does not prove responsiveness or prevent a later WM exit.
+	/// Core focus and ICCCM client-close routes do not need this check.
 	pub(super) fn has_ewmh_wm(&self) -> bool {
-		self
-			.property32(self.root, self.atoms.control.supporting_wm_check, AtomEnum::WINDOW)
-			.is_some_and(|check| check != NONE)
+		ewmh_wm_check(self.root, |window| -> Result<_, x11rb::errors::ReplyError> {
+			let reply = self
+				.conn
+				.get_property(
+					false,
+					window,
+					self.atoms.control.supporting_wm_check,
+					AtomEnum::WINDOW,
+					0,
+					1,
+				)?
+				.reply()?;
+			if reply.type_ != u32::from(AtomEnum::WINDOW) || reply.bytes_after != 0 {
+				return Ok(None);
+			}
+			Ok(reply.value32().and_then(|mut values| values.next()))
+		})
 	}
 
 	/// `_NET_SUPPORTED`: the atoms this window manager says it implements. A
@@ -1020,12 +1050,7 @@ impl Wm<'_> {
 		if reply.type_ == NONE {
 			return None;
 		}
-		Some(
-			reply
-				.value32()
-				.map(|values| values.collect())
-				.unwrap_or_default(),
-		)
+		Some(reply.value32().map_or_default(|values| values.collect()))
 	}
 
 	/// Whether `state` is in the client's `_NET_WM_STATE`.
@@ -1152,8 +1177,39 @@ impl Wm<'_> {
 
 #[cfg(test)]
 mod tests {
-	use super::{Rect, frame_origin, refusal, resize_message, split_desktop_names, work_area_rect};
+	use super::{
+		Rect, ewmh_wm_check, frame_origin, refusal, resize_message, split_desktop_names,
+		work_area_rect,
+	};
 	use crate::desktop::error::{DesktopError, ErrorCode};
+
+	#[test]
+	fn ewmh_requires_a_live_reciprocal_check_window() {
+		let root = 1;
+		let check = 42;
+		let validate = |root_check, child_check| {
+			ewmh_wm_check(root, |window| -> Result<_, ()> {
+				Ok(if window == root {
+					root_check
+				} else {
+					child_check
+				})
+			})
+		};
+		assert!(validate(Some(check), Some(check)));
+		assert!(!validate(None, Some(check)), "no root check");
+		assert!(!validate(Some(0), Some(0)), "NONE is not a check window");
+		assert!(!validate(Some(root), Some(root)), "the root is not a WM check window");
+		assert!(!validate(Some(check), None), "a dead or unmarked check window is not a WM");
+		assert!(!validate(Some(check), Some(root)), "the check must point to itself");
+		assert!(!validate(Some(check), Some(check + 1)), "another window is not reciprocal");
+	}
+
+	#[test]
+	fn ewmh_query_errors_mean_no_manager_instead_of_trusting_root_properties() {
+		assert!(!ewmh_wm_check(1, |_| -> Result<Option<u32>, ()> { Err(()) }));
+		assert!(!ewmh_wm_check(1, |window| { if window == 1 { Ok(Some(42)) } else { Err(()) } }));
+	}
 
 	/// Desktop names are positional: slot `i` names desktop `i`, so an unnamed
 	/// desktop keeps its place and the names after it stay on their own

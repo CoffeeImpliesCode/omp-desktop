@@ -4,6 +4,12 @@ import { desktopEscapeStops, forgetDesktopEscapeStops } from "../native/desktop.
 import * as loaderState from "../native/loader-state.js";
 
 class CurrentDesktopSession {
+	static abiVersion() {
+		return 1;
+	}
+	drag() {
+		return { selection: undefined, focusReturn: undefined };
+	}
 	click() {}
 	capture() {}
 	captureRegion() {}
@@ -33,6 +39,47 @@ class CurrentDesktopSession {
 }
 
 describe("desktop native ABI requirements", () => {
+	it("permits current ABI construction without constructing during adaptation", () => {
+		let constructions = 0;
+		class Compatible extends CurrentDesktopSession {
+			constructor() {
+				super();
+				constructions++;
+			}
+		}
+		const Session = adaptDesktopSession(Compatible);
+		expect(constructions).toBe(0);
+		new Session();
+		expect(constructions).toBe(1);
+	});
+
+	it.each([
+		undefined,
+		() => 0,
+		() => 2,
+		() => "1",
+		() => {
+			throw new Error("old");
+		},
+	])("rejects a method-complete old fork before construction with incompatible ABI %s", abiVersion => {
+		let constructions = 0;
+		class OldFork extends CurrentDesktopSession {
+			constructor() {
+				super();
+				constructions++;
+			}
+		}
+		Object.defineProperty(OldFork, "abiVersion", { value: abiVersion });
+		Object.defineProperty(OldFork.prototype, "drag", {
+			value: () => ({ app: "old flat focus return" }),
+		});
+		// The gate itself must remain safe when the shared entrypoint is imported.
+		const Session = adaptDesktopSession(OldFork);
+		expect(constructions).toBe(0);
+		expect(() => new Session()).toThrow(/^Unsupported: .*desktop ABI/);
+		expect(constructions).toBe(0);
+	});
+
 	it.each([
 		["missing desktop export", undefined],
 		[
@@ -57,7 +104,7 @@ describe("desktop native ABI requirements", () => {
 		expect(() => new Stale({ display: "active" })).toThrow(/holdDisplayUntilReleased, releaseDisplayAwake/);
 	});
 
-	it.each(["control", "listWorkspaces", "windowState"])("rejects an addon missing %s", method => {
+	it.each(["drag", "control", "listWorkspaces", "windowState"])("rejects an addon missing %s", method => {
 		class StaleDesktopSession extends CurrentDesktopSession {}
 		Object.defineProperty(StaleDesktopSession.prototype, method, { value: undefined });
 		const Stale = adaptDesktopSession(StaleDesktopSession);
@@ -74,9 +121,9 @@ describe("desktop native ABI requirements", () => {
 					has: (_target, key) => escapeStops || key !== "escapeStops",
 				},
 			);
-		const Current = { prototype: prototype(true) };
+		const Current = { prototype: prototype(true), abiVersion: () => 1 };
 		expect<unknown>(adaptDesktopSession(Current)).toBe(Current);
-		const Stale = adaptDesktopSession({ prototype: prototype(false) });
+		const Stale = adaptDesktopSession({ prototype: prototype(false), abiVersion: () => 1 });
 		expect(() => new Stale({ display: "active" })).toThrow(/^Unsupported: .*\(missing escapeStops\)/);
 	});
 });

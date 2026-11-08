@@ -222,7 +222,10 @@ describe("eval prelude cell settlement", () => {
 			},
 			async settleCell() {
 				abort.abort();
-				return undefined;
+				return {
+					text: "late settlement text",
+					images: [{ type: "image", data: "late-settlement-image", mimeType: "image/png", detail: "original" }],
+				};
 			},
 		};
 		const tool = new EvalTool(evalSession([cancelling], `prelude-settle-cancel-${crypto.randomUUID()}`));
@@ -234,6 +237,38 @@ describe("eval prelude cell settlement", () => {
 		);
 		expect(result.isError).toBe(true);
 		expect(text(result)).toBe("cell body");
+		expect(result.content.filter(block => block.type === "image")).toEqual([]);
+	});
+
+	it("drops all replies of a cancelled cell but keeps its already emitted text and image", async () => {
+		const abort = new AbortController();
+		const frame =
+			"iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAFklEQVR4nGP8z8DwnwEPYMInOXwUAAASWwIOH0pJXQAAAABJRU5ErkJggg==";
+		const early = countingPrelude([]);
+		early.settleCell = async () => ({
+			text: "early settlement text",
+			images: [{ type: "image", data: "early-settlement-image", mimeType: "image/png", detail: "original" }],
+		});
+		const late = { ...countingPrelude([]), name: "late", exports: [], javascript: "", python: "" };
+		late.settleCell = async () => {
+			abort.abort();
+			return { text: "late settlement text" };
+		};
+		const tool = new EvalTool(evalSession([early, late], `prelude-settle-images-cancel-${crypto.randomUUID()}`));
+		const result = await tool.execute(
+			"cancel-images",
+			{
+				language: "js",
+				code: `print("cell body"); print({ type: "image", data: "${frame}", mimeType: "image/png", detail: "original" })`,
+			},
+			abort.signal,
+		);
+		expect(result.isError).toBe(true);
+		expect(text(result)).not.toContain("settlement text");
+		expect(text(result)).toContain("cell body");
+		expect(result.content.filter(block => block.type === "image")).toEqual([
+			{ type: "image", data: frame, mimeType: "image/png", detail: "original" },
+		]);
 	});
 
 	it("delivers settlement frames marked original as captured, and resizes every other one", async () => {

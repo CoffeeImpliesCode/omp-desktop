@@ -9,6 +9,9 @@ import screenStateTemplate from "../../prompts/tools/computer-screen-state.md" w
 
 export { COMPUTER_WORKER_ARG } from "../../cli/worker-selectors";
 
+/** Callers outside Eval share one logical batch across their runs and settlement. */
+export const UNTAGGED_CELL_ID = "unbatched";
+
 /** Frozen run settings transferred from the host session to the worker. */
 export interface ComputerSessionSnapshot {
 	cwd: string;
@@ -22,7 +25,7 @@ export interface ComputerSessionSnapshot {
 	/**
 	 * Opaque identity of the eval cell this request belongs to, stable across
 	 * that cell's runs and its settle. Absent for callers that are not eval
-	 * cells; the worker then treats each request id as its own cell.
+	 * cells; those callers share the untagged batch lane.
 	 */
 	cellId?: string;
 	/**
@@ -62,10 +65,12 @@ export type ComputerWorkerInbound =
 	| { type: "capabilities"; id: string; session: ComputerSessionSnapshot; escape: ComputerEscapeScope }
 	| { type: "abort"; id: string }
 	/**
-	 * Forget everything an eval cell left pending: it was cancelled and will
-	 * never settle. Answered by nothing, and never captured or reported.
+	 * Forget provisional observations whose cell output was cancelled or could
+	 * not be assembled. Answered by nothing, and never captured or reported.
 	 */
 	| { type: "discard"; cellId: string }
+	/** Eval accepted the complete cell output; commit its provisional AX baseline. */
+	| { type: "accept"; cellId: string }
 	/**
 	 * Re-read what the cell that just ended touched; the result's `returnValue` is the report text or undefined.
 	 * `output` is what the cell printed: an `ax()` tree it carries counts as seen by the model.

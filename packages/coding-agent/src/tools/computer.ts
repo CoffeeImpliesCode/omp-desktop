@@ -135,17 +135,6 @@ export function createComputerPrelude(
 	// JavaScript or Python kernel actually asks for its enabled preludes.
 	const { computerPreludeAssets } = require("./computer/prelude-definition");
 	let closed = false;
-	// Conversations (by session id) that already received the guide. The
-	// prelude outlives `/new` and session switches, so this is per id.
-	const taught = new Set<string | null>();
-	const teachGuide = (): string | undefined => {
-		// A session that cannot `read` has the guide inline in the eval description.
-		if (session.isToolActive?.("read") === false) return undefined;
-		const conversation = session.getSessionId?.() ?? null;
-		if (taught.has(conversation)) return undefined;
-		taught.add(conversation);
-		return computerPreludeAssets.documentation;
-	};
 	/** The post-input report of a cell that reached the desktop. */
 	const settleReport = async (
 		cell: EvalPreludeCell,
@@ -158,7 +147,7 @@ export function createComputerPrelude(
 				output,
 				cell.signal,
 			);
-			if (!report) return undefined;
+			if (cell.signal.aborted || !report) return undefined;
 			// Every computer frame is already the capped capture saved on disk.
 			return { text: report.text, images: report.images?.map(image => ({ ...image, detail: "original" })) };
 		} catch (error) {
@@ -172,8 +161,8 @@ export function createComputerPrelude(
 			};
 		}
 	};
-	// Cells whose cancellation must discard what they left pending, and the
-	// handles that release those listeners: a settled or closed prelude leaves none.
+	// Keep cancellation coverage until Eval accepts all prelude reports, not
+	// merely until this computer settlement returns.
 	const watching = new Set<() => void>();
 	const detachers = new WeakMap<EvalPreludeCell, () => void>();
 	const watched = new WeakSet<EvalPreludeCell>();
@@ -205,10 +194,6 @@ export function createComputerPrelude(
 	};
 	// Cells whose code reached the desktop; only these are settled.
 	const cells = new WeakSet<EvalPreludeCell>();
-	// Cells that looked a window up directly: the conversation's first to settle
-	// carries the guide after its output, whether the lookup hit, missed or was
-	// caught, so the next call is not a guess.
-	const lookups = new WeakSet<EvalPreludeCell>();
 	const lifetime: ComputerLifetime = {
 		isClosed: () => closed,
 		close: async () => {
@@ -245,10 +230,6 @@ export function createComputerPrelude(
 					watched.add(context.cell);
 					watchCell(context.cell);
 				}
-				const [first, ...rest] = parsed.action === "call" ? parsed.chain : [];
-				if (rest.length === 0 && (first?.method === "window" || first?.method === "focusedWindow")) {
-					lookups.add(context.cell);
-				}
 			}
 			return await invokeComputer(session, controller, parsed, context, lifetime);
 		},
@@ -256,16 +237,16 @@ export function createComputerPrelude(
 		settleCell: async (cell, { output }) => {
 			if (!cells.has(cell)) return undefined;
 			cells.delete(cell);
-			try {
-				const report = await settleReport(cell, output);
-				// Taught only once the turn will carry it.
-				const guide = lookups.has(cell) && !cell.signal.aborted ? teachGuide() : undefined;
-				if (guide === undefined) return report;
-				return report?.text ? { ...report, text: `${guide}\n\n${report.text}` } : { text: guide };
-			} finally {
-				// Settled either way: the cell owes no more work, so its listener goes.
-				detachCell(cell);
+			return await settleReport(cell, output);
+		},
+		finishCell: (cell, { published }) => {
+			cells.delete(cell);
+			const cellId = cellIdFor(cell);
+			if (cellId) {
+				if (published) controller.acceptCell?.(cellId);
+				else controller.discardCell?.(cellId);
 			}
+			detachCell(cell);
 		},
 	};
 }

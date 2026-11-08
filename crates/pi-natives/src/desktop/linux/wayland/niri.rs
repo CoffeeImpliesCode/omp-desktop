@@ -79,7 +79,8 @@ const REPLY_LIMIT: usize = 8 * 1024 * 1024;
 /// desktop that answered moments later.
 const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Deadline for the record/start exchange and for the node signal.
+/// Deadline for session-bus setup, owner validation, record/start and the node
+/// signal.
 #[cfg(feature = "wayland-pipewire")]
 const CAST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1335,10 +1336,10 @@ async fn start_window_cast(
 }
 
 #[cfg(feature = "wayland-pipewire")]
-async fn create_session<'a>(
-	connection: &'a Connection,
+async fn create_session(
+	connection: &Connection,
 	owner: &OwnedUniqueName,
-) -> CoreResult<SessionProxy<'a>> {
+) -> CoreResult<SessionProxy<'static>> {
 	let screen_cast = ScreenCastProxy::builder(connection)
 		.destination(owner.clone())
 		.map_err(bus_error)?
@@ -1434,29 +1435,37 @@ pub(super) fn compositor_pid() -> CoreResult<u32> {
 fn capture_frame(window: u64, id: &str) -> CoreResult<RgbaImage> {
 	let runtime = super::portal::portal_runtime()?;
 	let compositor = compositor_pid()?;
-	let connection = runtime
-		.block_on(Connection::session())
-		.map_err(|err| DesktopError::capture_failed(format!("session bus: {err}")))?;
-	let owner = runtime.block_on(service_owner(&connection, compositor))?;
-	let session = runtime.block_on(create_session(&connection, &owner))?;
+	let capture_deadline = std::time::Instant::now() + CAST_TIMEOUT;
+	let deadline = crate::desktop::control::current_token()
+		.and_then(|token| token.deadline())
+		.map_or(capture_deadline, |deadline| deadline.min(capture_deadline));
+	let mut session = None;
 	let node = runtime.block_on(async {
-		tokio::time::timeout(CAST_TIMEOUT, start_window_cast(&connection, &session, window))
-			.await
-			.map_err(|_| {
-				DesktopError::timeout(format!(
-					"niri window {id} cast handshake exceeded {CAST_TIMEOUT:?}"
-				))
-			})?
+		crate::desktop::control::cancellable(tokio::time::timeout_at(deadline.into(), async {
+			let connection = Connection::session()
+				.await
+				.map_err(|err| DesktopError::capture_failed(format!("session bus: {err}")))?;
+			let owner = service_owner(&connection, compositor).await?;
+			// Keep ownership outside the cancellable future: even cancellation
+			// racing a successful reply must stop the session we acquired.
+			let session = session.insert(create_session(&connection, &owner).await?);
+			start_window_cast(&connection, session, window).await
+		}))
+		.await?
+		.map_err(|_| {
+			DesktopError::timeout(format!(
+				"niri window {id} capture setup exceeded its deadline ({CAST_TIMEOUT:?} maximum)"
+			))
+		})?
 	});
-	let frame = match node {
-		Ok(node) => super::capture::grab_pipewire_frame(node, None, super::capture::Formats::Alpha),
-		Err(err) => {
-			stop(runtime, &session);
-			return Err(err);
-		},
-	};
-	stop(runtime, &session);
-	frame.map_err(|err| DesktopError::capture_failed(format!("niri window {id} capture: {err}")))
+	let frame = node.and_then(|node| {
+		super::capture::grab_pipewire_frame(node, None, super::capture::Formats::Alpha)
+			.map_err(|err| DesktopError::capture_failed(format!("niri window {id} capture: {err}")))
+	});
+	if let Some(session) = session {
+		stop(runtime, &session);
+	}
+	frame
 }
 
 /// End a cast session, bounded so a wedged compositor cannot hang the worker.
@@ -1477,6 +1486,283 @@ mod tests {
 	};
 
 	use super::*;
+
+	#[cfg(feature = "wayland-pipewire")]
+	mod capture_setup {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicU32, Ordering},
+			mpsc,
+		};
+
+		use super::*;
+		use crate::desktop::control::CancellationSource;
+
+		const SESSION_PATH: &str = "/org/gnome/Mutter/ScreenCast/Session/test";
+		const STREAM_PATH: &str = "/org/gnome/Mutter/ScreenCast/Stream/test";
+
+		/// The service accepts requests but withholds the selected reply until
+		/// the watchdog releases it. Tests must return before that release.
+		struct Service {
+			silent:  &'static str,
+			entered: mpsc::Sender<&'static str>,
+			release: tokio::sync::Notify,
+			stop:    AtomicU32,
+		}
+
+		impl Service {
+			async fn request(&self, member: &'static str) -> zbus::fdo::Result<()> {
+				self.entered.send(member).expect("record fixture request");
+				if member == self.silent {
+					self.release.notified().await;
+					return Err(zbus::fdo::Error::Failed("fixture watchdog released reply".into()));
+				}
+				Ok(())
+			}
+		}
+
+		struct Bus(Arc<Service>);
+
+		#[zbus::interface(name = "org.freedesktop.DBus")]
+		impl Bus {
+			async fn hello(&self) -> zbus::fdo::Result<OwnedUniqueName> {
+				self.0.request("Hello").await?;
+				Ok(OwnedUniqueName::try_from(":1.8").unwrap())
+			}
+
+			async fn get_name_owner(&self, _name: &str) -> zbus::fdo::Result<OwnedUniqueName> {
+				self.0.request("GetNameOwner").await?;
+				Ok(OwnedUniqueName::try_from(":1.7").unwrap())
+			}
+
+			#[zbus(name = "GetConnectionUnixProcessID")]
+			async fn get_connection_unix_process_id(&self, _name: &str) -> zbus::fdo::Result<u32> {
+				self.0.request("GetConnectionUnixProcessID").await?;
+				Ok(std::process::id())
+			}
+
+			fn add_match(&self, _rule: &str) {}
+
+			fn remove_match(&self, _rule: &str) {}
+		}
+
+		struct ScreenCastService(Arc<Service>);
+
+		#[zbus::interface(name = "org.gnome.Mutter.ScreenCast")]
+		impl ScreenCastService {
+			async fn create_session(
+				&self,
+				_properties: HashMap<String, zbus::zvariant::OwnedValue>,
+			) -> zbus::fdo::Result<OwnedObjectPath> {
+				self.0.request("CreateSession").await?;
+				Ok(OwnedObjectPath::try_from(SESSION_PATH).unwrap())
+			}
+		}
+
+		struct SessionService(Arc<Service>);
+
+		#[zbus::interface(name = "org.gnome.Mutter.ScreenCast.Session")]
+		impl SessionService {
+			async fn record_window(
+				&self,
+				_properties: HashMap<String, zbus::zvariant::OwnedValue>,
+			) -> zbus::fdo::Result<OwnedObjectPath> {
+				self.0.request("RecordWindow").await?;
+				Ok(OwnedObjectPath::try_from(STREAM_PATH).unwrap())
+			}
+
+			async fn start(&self) -> zbus::fdo::Result<()> {
+				self.0.request("Start").await
+			}
+
+			fn stop(&self) {
+				self.0.stop.fetch_add(1, Ordering::Relaxed);
+			}
+		}
+
+		/// A private P2P service also answers the bus handshake and identity
+		/// methods, so capture_frame uses its real Connection::session path.
+		struct FakeBus {
+			path:     std::path::PathBuf,
+			previous: Option<std::ffi::OsString>,
+			service:  Arc<Service>,
+			shutdown: Arc<tokio::sync::Notify>,
+			worker:   Option<thread::JoinHandle<()>>,
+		}
+
+		impl FakeBus {
+			fn start(silent: &'static str) -> (Self, mpsc::Receiver<&'static str>) {
+				static SOCKETS: AtomicU32 = AtomicU32::new(0);
+				let path = std::env::temp_dir().join(format!(
+					"omp-niri-bus-{}-{}",
+					std::process::id(),
+					SOCKETS.fetch_add(1, Ordering::Relaxed)
+				));
+				let listener = UnixListener::bind(&path).expect("bind capture bus fixture");
+				listener.set_nonblocking(true).unwrap();
+				let (entered, requests) = mpsc::channel();
+				let service = Arc::new(Service {
+					silent,
+					entered,
+					release: tokio::sync::Notify::new(),
+					stop: AtomicU32::new(0),
+				});
+				let shutdown = Arc::new(tokio::sync::Notify::new());
+				let worker_service = Arc::clone(&service);
+				let worker_shutdown = Arc::clone(&shutdown);
+				let worker = thread::spawn(move || {
+					let runtime = tokio::runtime::Builder::new_current_thread()
+						.enable_all()
+						.build()
+						.unwrap();
+					runtime.block_on(async {
+						let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+						let (stream, _) = listener.accept().await.unwrap();
+						if silent == "Authenticate" {
+							let _ = worker_service.request("Authenticate").await;
+							return;
+						}
+						let connection = zbus::connection::Builder::unix_stream(stream)
+							.server(zbus::Guid::generate())
+							.unwrap()
+							.p2p()
+							.serve_at("/org/freedesktop/DBus", Bus(Arc::clone(&worker_service)))
+							.unwrap()
+							.serve_at(SERVICE_PATH, ScreenCastService(Arc::clone(&worker_service)))
+							.unwrap()
+							.serve_at(SESSION_PATH, SessionService(worker_service))
+							.unwrap()
+							.build()
+							.await
+							.expect("build fixture bus");
+						worker_shutdown.notified().await;
+						connection.close().await.unwrap();
+					});
+				});
+				let previous = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
+				unsafe {
+					std::env::set_var(
+						"DBUS_SESSION_BUS_ADDRESS",
+						format!("unix:path={}", path.display()),
+					);
+				}
+				(Self { path, previous, service, shutdown, worker: Some(worker) }, requests)
+			}
+		}
+
+		impl Drop for FakeBus {
+			fn drop(&mut self) {
+				match self.previous.take() {
+					Some(previous) => unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", previous) },
+					None => unsafe { std::env::remove_var("DBUS_SESSION_BUS_ADDRESS") },
+				}
+				self.service.release.notify_one();
+				self.shutdown.notify_one();
+				self.worker.take().unwrap().join().unwrap();
+				std::fs::remove_file(&self.path).unwrap();
+			}
+		}
+
+		fn silent_setup(silent: &'static str, cancel: bool, reply_budget: Duration) {
+			let _guard = super::super::super::tests::ENV_LOCK.lock().unwrap();
+			let _compositor = FakeNiri::start(Vec::new());
+			let (bus, requests) = FakeBus::start(silent);
+			let source = CancellationSource::default();
+			let canceller = source.clone();
+			let service = Arc::clone(&bus.service);
+			let limit = if cancel {
+				Duration::ZERO
+			} else {
+				reply_budget.min(CAST_TIMEOUT)
+			};
+			let watchdog_delay = limit + Duration::from_secs(1);
+			let (finished, finish) = mpsc::channel();
+			let watchdog = thread::spawn(move || {
+				loop {
+					let request = requests
+						.recv_timeout(Duration::from_secs(2))
+						.expect("setup reached fixture");
+					if request == silent {
+						break;
+					}
+				}
+				if cancel {
+					canceller.cancel();
+				}
+				let _ = finish.recv_timeout(watchdog_delay);
+				service.release.notify_one();
+			});
+			let token = source
+				.token()
+				.replying_by(std::time::Instant::now() + reply_budget);
+			let started = std::time::Instant::now();
+			let error =
+				crate::desktop::control::with_token_for_test(&token, || capture_frame(47, "niri:47"))
+					.expect_err("a silent setup cannot produce a frame");
+			let elapsed = started.elapsed();
+			let _ = finished.send(());
+			watchdog.join().unwrap();
+			assert_eq!(
+				error.code.as_str(),
+				if cancel { "Cancelled" } else { "Timeout" },
+				"{silent}: {}",
+				error.message
+			);
+			assert!(
+				elapsed < limit + Duration::from_millis(750),
+				"{silent} waited {elapsed:?} for the watchdog"
+			);
+			let created = matches!(silent, "RecordWindow" | "Start");
+			assert_eq!(
+				bus.service.stop.load(Ordering::Relaxed),
+				u32::from(created),
+				"{silent}: only an acquired session must be stopped"
+			);
+		}
+
+		#[test]
+		fn niri_capture_setup_deadline_bounds_silent_authentication() {
+			silent_setup("Authenticate", false, Duration::from_millis(250));
+		}
+
+		#[test]
+		fn niri_capture_setup_cancellation_interrupts_silent_authentication() {
+			silent_setup("Authenticate", true, Duration::from_secs(10));
+		}
+
+		#[test]
+		fn niri_capture_setup_deadline_bounds_each_silent_service_reply() {
+			for member in [
+				"Hello",
+				"GetNameOwner",
+				"GetConnectionUnixProcessID",
+				"CreateSession",
+				"RecordWindow",
+				"Start",
+			] {
+				silent_setup(member, false, Duration::from_millis(250));
+			}
+		}
+
+		#[test]
+		fn niri_capture_setup_cancellation_interrupts_each_silent_service_reply() {
+			for member in [
+				"Hello",
+				"GetNameOwner",
+				"GetConnectionUnixProcessID",
+				"CreateSession",
+				"RecordWindow",
+				"Start",
+			] {
+				silent_setup(member, true, Duration::from_secs(10));
+			}
+		}
+
+		#[test]
+		fn niri_capture_setup_capture_budget_bounds_silent_authentication() {
+			silent_setup("Authenticate", false, Duration::from_secs(10));
+		}
+	}
 
 	/// eDP-1 is enabled at 1920,0; HDMI-A-1 is connected but disabled, which is
 	/// how niri reports an output with no `logical` block.

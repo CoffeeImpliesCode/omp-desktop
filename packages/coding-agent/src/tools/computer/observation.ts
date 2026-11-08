@@ -13,6 +13,7 @@
  * `- role "label" [ref=eN] …`.
  */
 import type { DesktopDisplay, DesktopWindow, DiffRun } from "@oh-my-pi/pi-natives";
+import { truncate } from "@oh-my-pi/pi-utils/format";
 import { elideAxTree } from "./tree-elide";
 
 /**
@@ -95,6 +96,8 @@ interface WindowRecord {
 	pid?: number;
 	/** Tree text the model last received. */
 	shown?: string;
+	/** Printed trees and reports remain provisional until the host accepts the cell output. */
+	provisionalCellId?: string;
 	options: AxReadOptions;
 	/** Pixel mode (see `InputKind`). */
 	pixels: boolean;
@@ -154,12 +157,6 @@ export function treeRefs(text: string): string[] {
 		if (row) refs.push(row.ref);
 	}
 	return refs;
-}
-
-/** Whether the cell's output carries this tree: every ref it names, or the whole text when it names none. */
-function printedIn(printedRefs: ReadonlySet<string>, output: string, text: string): boolean {
-	const refs = treeRefs(text);
-	return refs.length > 0 ? refs.every(ref => printedRefs.has(ref)) : output.includes(text);
 }
 
 /**
@@ -323,6 +320,8 @@ interface CellPending {
 	pids: Set<number>;
 	unattributed: string[];
 	inputs: number;
+	/** Failures are retained even when a later inspection clears live touches. */
+	failures: { entries: Map<string, number>; total: number; bytes: number };
 	/** Whether an input went to the desktop root. */
 	rootInput: boolean;
 	/** Targets this cell showed a screenshot of, or sent pixel input to. */
@@ -331,6 +330,8 @@ interface CellPending {
 	rosterClaimed: boolean;
 	/** When the cell's last input returned (ms since epoch). */
 	lastInputAt: number;
+	/** Changes only for dispatched input, never an inspection failure. */
+	revision: number;
 }
 
 /**
@@ -366,12 +367,14 @@ export class ObservationLedger {
 					touched: new Map(),
 					reads: new Map(),
 					pids: new Set(),
+					failures: { entries: new Map(), total: 0, bytes: 0 },
 					unattributed: [],
 					inputs: 0,
 					rootInput: false,
 					pixelsThisCell: new Set(),
 					rosterClaimed: false,
 					lastInputAt: 0,
+					revision: 0,
 				}),
 			);
 		}
@@ -397,13 +400,14 @@ export class ObservationLedger {
 	}
 
 	/**
-	 * The model received this tree of the window: it is the baseline the next
-	 * read-back is marked against, and the window's post-input state is known.
+	 * Prepare a complete tree as the next read-back baseline. It remains
+	 * provisional until Eval accepts the assembled output.
 	 */
 	recordShown(cellId: string, window: InputWindow, text: string, options: AxReadOptions): void {
 		const record = this.#record(window.id);
 		if (window.pid !== undefined) record.pid = window.pid;
 		record.shown = text;
+		record.provisionalCellId = cellId;
 		record.options = { ...options };
 		this.recordRefs(window.id, treeRefs(text));
 		this.#cells.get(cellId)?.touched.delete(window.id);
@@ -461,6 +465,7 @@ export class ObservationLedger {
 	 */
 	noteInput(cellId: string, window: InputWindow | undefined, label: string, kind: InputKind, root = false): void {
 		const cell = this.#cell(cellId);
+		cell.revision++;
 		cell.inputs++;
 		if (root) cell.rootInput = true;
 		const targetId = root || !window ? DESKTOP_WINDOW_ID : window.id;
@@ -496,10 +501,23 @@ export class ObservationLedger {
 
 	/** A call failed: the settle prints its window's current tree so refs renew. */
 	noteFailure(cellId: string, window: InputWindow | undefined, label: string, message: string): void {
-		const failure = `${label} failed: ${message}`;
+		// A 256-code-unit summary is at most 768 UTF-8 bytes. Original call
+		// errors remain unchanged; only this generated report is shortened.
+		const failure = truncate(`${label} failed: ${message}`, REPORT_TREE_BUDGET_BYTES / 64);
 		const cell = this.#cell(cellId);
+		const failures = cell.failures;
+		const sequence = ++failures.total;
+		const repeated = failures.entries.has(failure);
+		if (repeated) failures.entries.set(failure, sequence);
+		else {
+			const bytes = Buffer.byteLength(failure);
+			if (failures.entries.size < 8 && failures.bytes + bytes <= REPORT_TREE_BUDGET_BYTES / 4) {
+				failures.entries.set(failure, sequence);
+				failures.bytes += bytes;
+			}
+		}
 		if (!window) {
-			cell.unattributed.push(failure);
+			if (!repeated && failures.entries.has(failure)) cell.unattributed.push(failure);
 			return;
 		}
 		const touched = cell.touched.get(window.id);
@@ -509,6 +527,21 @@ export class ObservationLedger {
 		} else cell.touched.set(window.id, { labels: [], failure, sequence: ++this.#sequence });
 	}
 
+	/** Input generation; inspection failures do not supersede a frozen observation. */
+	revision(cellId: string): number {
+		return this.#cells.get(cellId)?.revision ?? 0;
+	}
+
+	/** Errors retained independently of AX/screenshot deduplication. */
+	failures(cellId: string, after = 0): { messages: string[]; omitted: number; total: number } {
+		const failures = this.#cells.get(cellId)?.failures;
+		const messages = failures
+			? [...failures.entries].filter(([, sequence]) => sequence > after).map(([message]) => message)
+			: [];
+		const total = failures?.total ?? 0;
+		return { messages, omitted: Math.max(0, total - after - messages.length), total };
+	}
+
 	/**
 	 * Take what this cell left to settle, or undefined when it sent no input and
 	 * nothing failed. First, each `ax()` read whose tree the cell's `output`
@@ -516,25 +549,32 @@ export class ObservationLedger {
 	 * reached the window after the read. The cell's pending state is gone either
 	 * way: a settle is the last thing a cell owes its report.
 	 */
-	take(cellId: string, output: string): PendingSettle | undefined {
+	take(cellId: string, output: string, promote = true): PendingSettle | undefined {
 		const cell = this.#cells.get(cellId);
 		if (!cell) return undefined;
 		if (cell.reads.size > 0) {
-			const printedRefs = new Set(Array.from(output.matchAll(/\[ref=(e\d+)\]/g), match => match[1]!));
 			for (const read of cell.reads.values()) {
-				if (!printedIn(printedRefs, output, read.text)) continue;
+				if (read.text.length === 0 || !output.includes(read.text)) continue;
 				const touched = cell.touched.get(read.window.id);
-				this.recordShown(cellId, read.window, read.text, read.options);
+				if (promote) this.recordShown(cellId, read.window, read.text, read.options);
+				else cell.touched.delete(read.window.id);
 				if (touched && touched.sequence > read.sequence) cell.touched.set(read.window.id, touched);
 			}
 		}
+		const pending = this.pending(cellId);
 		this.#cells.delete(cellId);
-		if (cell.inputs === 0 && cell.touched.size === 0 && cell.unattributed.length === 0) return undefined;
+		return pending;
+	}
+
+	/** A detached view for a pre-mutation snapshot; it consumes and promotes nothing. */
+	pending(cellId: string): PendingSettle | undefined {
+		const cell = this.#cells.get(cellId);
+		if (!cell || (cell.inputs === 0 && cell.touched.size === 0 && cell.unattributed.length === 0)) return undefined;
 		const touched: TouchedWindow[] = [...cell.touched].map(([id, { labels, failure }]) => {
 			const record = this.#windows.get(id);
 			return {
 				id,
-				labels,
+				labels: [...labels],
 				failure,
 				baseline: record?.shown,
 				options: { ...record?.options },
@@ -543,12 +583,19 @@ export class ObservationLedger {
 		});
 		return {
 			touched,
-			pids: cell.pids,
-			unattributed: cell.unattributed,
+			pids: new Set(cell.pids),
+			unattributed: [...cell.unattributed],
 			desktopScreenshot: cell.rootInput && this.#windows.get(DESKTOP_WINDOW_ID)?.pixels === true,
 			rosterBefore: cell.rosterBefore,
 			lastInputAt: cell.lastInputAt,
 		};
+	}
+
+	/** Commit only this cell's still-current baselines after its output is accepted. */
+	acceptCell(cellId: string): void {
+		for (const record of this.#windows.values()) {
+			if (record.provisionalCellId === cellId) record.provisionalCellId = undefined;
+		}
 	}
 
 	/**
@@ -557,9 +604,12 @@ export class ObservationLedger {
 	 * the next cell answers only for its own input.
 	 */
 	discard(cellId: string): void {
-		const cell = this.#cells.get(cellId);
-		if (!cell) return;
 		this.#cells.delete(cellId);
+		for (const record of this.#windows.values()) {
+			if (record.provisionalCellId !== cellId) continue;
+			record.shown = undefined;
+			record.provisionalCellId = undefined;
+		}
 	}
 
 	/**

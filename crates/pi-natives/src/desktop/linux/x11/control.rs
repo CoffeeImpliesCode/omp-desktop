@@ -29,7 +29,8 @@ use crate::desktop::{
 	types::{DesktopControlCapabilities, DesktopWindowState, DesktopWorkspace},
 };
 
-/// Workspace ids are opaque to callers and stable for the session.
+/// EWMH exposes only positional desktop indices. These ids are volatile:
+/// a removed or reordered desktop can reuse an otherwise valid slot.
 const WORKSPACE_PREFIX: &str = "x11-workspace:";
 /// Bound on reported desktops: a window manager advertising an absurd desktop
 /// count must not turn one read into an unbounded allocation.
@@ -142,12 +143,16 @@ pub(super) fn workspace_id(index: u32) -> String {
 	format!("{WORKSPACE_PREFIX}{index}")
 }
 
-/// Only an id this backend returned is a valid target, so the parse must be
-/// canonical: `x11-workspace:0`, no padding, no sign, and inside the range the
-/// root window currently advertises.
+/// Accept only a canonical positional id: `x11-workspace:0`, no padding or
+/// sign, inside the root window's current desktop range. This cannot detect
+/// reuse or reordering of an in-range slot; callers must enumerate afresh.
 fn parse_workspace_id(id: &str, desktops: u32) -> CoreResult<u32> {
-	let unknown =
-		|| DesktopError::invalid_target(format!("workspace {id:?} is not an id from listWorkspaces"));
+	let unknown = || {
+		DesktopError::invalid_target(format!(
+			"workspace {id:?} is not a canonical X11 positional workspace id; read listWorkspaces \
+			 again before choosing a target"
+		))
+	};
 	let index = id
 		.strip_prefix(WORKSPACE_PREFIX)
 		.and_then(|rest| rest.parse::<u32>().ok())
@@ -157,7 +162,8 @@ fn parse_workspace_id(id: &str, desktops: u32) -> CoreResult<u32> {
 	}
 	if index >= desktops {
 		return Err(DesktopError::invalid_target(format!(
-			"workspace {id} is outside this display's desktop range 0..{desktops}"
+			"workspace {id} is outside this display's desktop range 0..{desktops}; read \
+			 listWorkspaces again before choosing a target"
 		)));
 	}
 	Ok(index)
@@ -219,8 +225,10 @@ impl X11Control {
 		}
 	}
 
-	/// EWMH desktops of the current window manager, with the window that owns
-	/// each one. An X11 desktop spans the whole screen, so it has no display.
+	/// Fresh positional EWMH desktops of the current window manager, with the
+	/// window that owns each one. An X11 desktop spans the whole screen, so it
+	/// has no display. Read immediately before choosing an action target and
+	/// re-enumerate after topology changes: EWMH cannot identify a reused slot.
 	pub(super) fn workspaces(&self) -> CoreResult<Vec<DesktopWorkspace>> {
 		let wm = self.wm();
 		let control = &self.atoms.control;
@@ -610,7 +618,7 @@ impl X11Control {
 		Ok(clip_work_area(display, wm.work_area()))
 	}
 
-	/// Resolve an id from `listWorkspaces` against the current desktop range.
+	/// Resolve a positional id against the current range, not a stable identity.
 	fn desktop(wm: Wm<'_>, id: &str, operation: &str) -> CoreResult<u32> {
 		let desktops = wm.desktop_count().ok_or_else(|| {
 			DesktopError::control_unsupported(format!(
@@ -979,6 +987,17 @@ mod tests {
 			let error = parse_workspace_id(rejected, 4).expect_err("not an id from listWorkspaces");
 			assert_eq!(error.code, DesktopError::invalid_target("").code, "{rejected}");
 		}
+	}
+
+	#[test]
+	fn workspace_ids_are_resolved_against_the_current_positional_range() {
+		let id = workspace_id(3);
+		assert_eq!(parse_workspace_id(&id, 4).expect("current fourth slot"), 3);
+		let removed = parse_workspace_id(&id, 3).expect_err("fourth slot was removed");
+		assert_eq!(removed.code, DesktopError::invalid_target("").code);
+		// EWMH exposes positions, not identity. A reused or reordered in-range
+		// slot cannot be distinguished from the same workspace by this id.
+		assert_eq!(parse_workspace_id(&id, 5).expect("fourth slot still exists"), 3);
 	}
 
 	/// Screen coordinates must land on the X11 pixel grid and stay inside the

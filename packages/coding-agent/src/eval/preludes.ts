@@ -112,6 +112,13 @@ export interface EvalPreludeDefinition {
 		cell: EvalPreludeCell,
 		outcome: { failed: boolean; output: string },
 	): Promise<EvalPreludeSettleReply | undefined>;
+	/**
+	 * Eval has assembled the tool result and decided whether this cell's
+	 * settlement replies will be published. Called synchronously, including
+	 * after cancellation or output-assembly failure. Release cancellation
+	 * listeners here, not when `settleCell` returns.
+	 */
+	finishCell?(cell: EvalPreludeCell, outcome: { published: boolean }): void;
 }
 
 /**

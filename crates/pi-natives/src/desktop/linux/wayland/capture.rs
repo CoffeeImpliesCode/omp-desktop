@@ -49,7 +49,7 @@ impl ScreenCastSession<'_> {
 async fn portal_request<T>(
 	request: impl std::future::Future<Output = Result<T, String>>,
 ) -> CoreResult<T> {
-	super::libei::cancellable(tokio::time::timeout(PORTAL_TIMEOUT, request))
+	control::cancellable(tokio::time::timeout(PORTAL_TIMEOUT, request))
 		.await?
 		.map_err(|_| DesktopError::capture_failed("Wayland ScreenCast portal timed out"))?
 		.map_err(DesktopError::capture_failed)
@@ -140,10 +140,6 @@ impl PixelLayout {
 	}
 }
 
-struct UserData {
-	format: spa::param::video::VideoInfoRaw,
-}
-
 fn rgba_from_buffer(
 	format: &spa::param::video::VideoInfoRaw,
 	data: &mut pw::spa::buffer::Data,
@@ -229,7 +225,39 @@ fn rgba_from_rows(
 		.ok_or_else(|| "failed to construct PipeWire RGBA frame".to_string())
 }
 
-type SharedFrames = Rc<RefCell<Vec<Option<Result<RgbaImage, String>>>>>;
+#[derive(Clone)]
+struct GrabbedFrame {
+	width:  u32,
+	height: u32,
+	image:  Option<RgbaImage>,
+}
+
+/// Validate the negotiated size and aggregate budget before touching pixels.
+/// Metadata never calls `read_pixels`, including on unmapped buffers.
+fn acquire_frame(
+	format: &spa::param::video::VideoInfoRaw,
+	pixels: bool,
+	retained_pixels: &Cell<u64>,
+	read_pixels: impl FnOnce() -> Result<RgbaImage, String>,
+) -> Result<GrabbedFrame, String> {
+	let size = format.size();
+	let (width, height) = (size.width, size.height);
+	if width == 0 || height == 0 {
+		return Err("PipeWire negotiated an empty frame".to_string());
+	}
+	PixelLayout::new(format.format())?;
+	let count = u64::from(width) * u64::from(height);
+	let total = retained_pixels
+		.get()
+		.checked_add(count)
+		.filter(|total| *total <= MAX_FRAME_PIXELS)
+		.ok_or_else(|| "PipeWire frames exceed the desktop pixel limit".to_string())?;
+	let image = if pixels { Some(read_pixels()?) } else { None };
+	retained_pixels.set(total);
+	Ok(GrabbedFrame { width, height, image })
+}
+
+type SharedFrames = Rc<RefCell<Vec<Option<Result<GrabbedFrame, String>>>>>;
 
 /// Per-stream `PipeWire` state shared with the loop callbacks.
 struct StreamUserData {
@@ -239,6 +267,7 @@ struct StreamUserData {
 	node:            u32,
 	/// Format the compositor negotiated for this stream.
 	format:          spa::param::video::VideoInfoRaw,
+	pixels:          bool,
 	/// First frame of every stream, filled in by whichever stream is ready.
 	frames:          SharedFrames,
 	/// Streams that have not reported a frame or an error yet.
@@ -252,7 +281,7 @@ impl StreamUserData {
 	/// Record the first outcome of this stream and leave the loop when the last
 	/// one lands. Later frames and later state changes are ignored: a stream
 	/// that already reported must not be counted twice.
-	fn finish(&self, frame: Result<RgbaImage, String>) {
+	fn finish(&self, frame: Result<GrabbedFrame, String>) {
 		if self.frames.borrow()[self.index].is_some() {
 			return;
 		}
@@ -324,7 +353,8 @@ fn grab_pipewire_frames(
 	nodes: &[u32],
 	remote: Option<OwnedFd>,
 	formats: Formats,
-) -> Result<Vec<RgbaImage>, String> {
+	pixels: bool,
+) -> Result<Vec<GrabbedFrame>, String> {
 	if nodes.is_empty() {
 		return Err("PipeWire capture needs at least one node".to_string());
 	}
@@ -390,6 +420,7 @@ fn grab_pipewire_frames(
 			index,
 			node,
 			format: Default::default(),
+			pixels,
 			frames: Rc::clone(&frames),
 			pending: Rc::clone(&pending),
 			retained_pixels: Rc::clone(&retained_pixels),
@@ -417,23 +448,13 @@ fn grab_pipewire_frames(
 				let Some(mut buffer) = stream.dequeue_buffer() else {
 					return;
 				};
-				let Some(data) = buffer.datas_mut().first_mut() else {
-					return;
-				};
-				let size = user.format.size();
-				let pixels = u64::from(size.width) * u64::from(size.height);
-				let retained = user.retained_pixels.get();
-				if retained
-					.checked_add(pixels)
-					.is_none_or(|total| total > MAX_FRAME_PIXELS)
-				{
-					user.finish(Err("PipeWire frames exceed the desktop pixel limit".to_string()));
-					return;
-				}
-				let frame = rgba_from_buffer(&user.format, data);
-				if frame.is_ok() {
-					user.retained_pixels.set(retained + pixels);
-				}
+				let frame = acquire_frame(&user.format, user.pixels, &user.retained_pixels, || {
+					let data = buffer
+						.datas_mut()
+						.first_mut()
+						.ok_or_else(|| "PipeWire frame has no data".to_string())?;
+					rgba_from_buffer(&user.format, data)
+				});
 				user.finish(frame);
 			})
 			.register()
@@ -443,7 +464,12 @@ fn grab_pipewire_frames(
 			.connect(
 				spa::utils::Direction::Input,
 				Some(node),
-				pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+				pw::stream::StreamFlags::AUTOCONNECT
+					| if pixels {
+						pw::stream::StreamFlags::MAP_BUFFERS
+					} else {
+						pw::stream::StreamFlags::empty()
+					},
 				&mut params,
 			)
 			.map_err(|err| format!("PipeWire connect {node}: {err}"))?;
@@ -481,7 +507,14 @@ fn grab_pipewire_frames(
 	if cancelled.get() {
 		return Err("PipeWire capture cancelled".to_string());
 	}
-	std::mem::take(&mut *frames.borrow_mut())
+	collect_frames(std::mem::take(&mut *frames.borrow_mut()))
+}
+
+/// Preserve all-authorized-stream semantics, including missing/error outcomes.
+fn collect_frames(
+	frames: Vec<Option<Result<GrabbedFrame, String>>>,
+) -> Result<Vec<GrabbedFrame>, String> {
+	frames
 		.into_iter()
 		.map(|frame| {
 			frame.unwrap_or_else(|| Err("PipeWire stream ended before producing a frame".to_string()))
@@ -501,10 +534,11 @@ pub(super) fn grab_pipewire_frame(
 	remote: Option<OwnedFd>,
 	formats: Formats,
 ) -> Result<RgbaImage, String> {
-	let mut frames = grab_pipewire_frames(&[node], remote, formats)?;
+	let mut frames = grab_pipewire_frames(&[node], remote, formats, true)?;
 	frames
 		.pop()
-		.ok_or_else(|| "PipeWire capture produced no frame".to_string())
+		.and_then(|frame| frame.image)
+		.ok_or_else(|| "PipeWire capture produced no pixel frame".to_string())
 }
 
 /// Capture every monitor the user authorized, closing the session afterwards.
@@ -512,10 +546,24 @@ pub(super) fn grab_pipewire_frame(
 /// The consent, restore token and denial paths are the portal's: the session is
 /// created, granted, used, and closed exactly once per capture.
 pub(super) fn capture() -> CoreResult<Vec<(RgbaImage, super::PortalGeometry)>> {
+	acquire_portal_streams(true).and_then(|frames| {
+		frames
+			.into_iter()
+			.map(|(frame, geometry)| {
+				let image = frame.image.ok_or_else(|| {
+					DesktopError::capture_failed("PipeWire capture produced no pixel frame")
+				})?;
+				Ok((image, geometry))
+			})
+			.collect()
+	})
+}
+
+fn acquire_portal_streams(pixels: bool) -> CoreResult<Vec<(GrabbedFrame, super::PortalGeometry)>> {
 	control::check()?;
 	let runtime = super::portal::portal_runtime()?;
 	let session = runtime.block_on(open_screencast())?;
-	let outcome = capture_streams(runtime, session);
+	let outcome = capture_streams(runtime, session, pixels);
 	control::check()?;
 	outcome.map_err(|err| DesktopError::capture_failed(format!("wayland screencast failed: {err}")))
 }
@@ -555,8 +603,10 @@ fn placeable_monitors(streams: &[MonitorStream]) -> Result<(), String> {
 fn capture_streams(
 	runtime: &tokio::runtime::Runtime,
 	session: ScreenCastSession<'_>,
-) -> Result<Vec<(RgbaImage, super::PortalGeometry)>, String> {
-	let outcome = placeable_monitors(&session.streams).and_then(|()| grab_granted_streams(&session));
+	pixels: bool,
+) -> Result<Vec<(GrabbedFrame, super::PortalGeometry)>, String> {
+	let outcome =
+		placeable_monitors(&session.streams).and_then(|()| grab_granted_streams(&session, pixels));
 	session.close(runtime);
 	outcome
 }
@@ -565,7 +615,8 @@ fn capture_streams(
 /// position and size next to it.
 fn grab_granted_streams(
 	session: &ScreenCastSession<'_>,
-) -> Result<Vec<(RgbaImage, super::PortalGeometry)>, String> {
+	pixels: bool,
+) -> Result<Vec<(GrabbedFrame, super::PortalGeometry)>, String> {
 	// A duplicate keeps the session's own handle alive, so the session can
 	// still be closed after PipeWire took its descriptor.
 	let remote = session
@@ -577,25 +628,32 @@ fn grab_granted_streams(
 		.iter()
 		.map(|stream| stream.node)
 		.collect::<Vec<_>>();
-	grab_pipewire_frames(&nodes, Some(remote), Formats::Any).map(|frames| {
-		frames
-			.into_iter()
-			.zip(&session.streams)
-			.map(|(image, stream)| {
-				let geometry = super::PortalGeometry::new(
-					stream.position,
-					stream.size,
-					image.width(),
-					image.height(),
-				);
-				(image, geometry)
-			})
-			.collect()
-	})
+	let frames = grab_pipewire_frames(&nodes, Some(remote), Formats::Any, pixels)?;
+	pair_granted_streams(&session.streams, frames)
+}
+
+fn pair_granted_streams(
+	streams: &[MonitorStream],
+	frames: Vec<GrabbedFrame>,
+) -> Result<Vec<(GrabbedFrame, super::PortalGeometry)>, String> {
+	placeable_monitors(streams)?;
+	if frames.len() != streams.len() {
+		return Err("PipeWire did not return every authorized monitor".to_string());
+	}
+	Ok(frames
+		.into_iter()
+		.zip(streams)
+		.map(|(frame, stream)| {
+			let geometry =
+				super::PortalGeometry::new(stream.position, stream.size, frame.width, frame.height);
+			(frame, geometry)
+		})
+		.collect())
 }
 
 pub(super) fn geometry() -> CoreResult<Vec<super::PortalGeometry>> {
-	capture().map(|frames| frames.into_iter().map(|(_, geometry)| geometry).collect())
+	acquire_portal_streams(false)
+		.map(|frames| frames.into_iter().map(|(_, geometry)| geometry).collect())
 }
 
 #[cfg(test)]
@@ -609,6 +667,126 @@ mod tests {
 		info.set_format(format);
 		info.set_size(spa::utils::Rectangle { width, height });
 		info
+	}
+	#[test]
+	fn metadata_never_reads_pixels_and_uses_the_same_limits() {
+		let retained = Cell::new(0);
+		let frame = acquire_frame(&negotiated(VideoFormat::BGRA, 8, 6), false, &retained, || {
+			panic!("metadata must not access buffer data")
+		})
+		.unwrap();
+		assert_eq!((frame.width, frame.height), (8, 6));
+		assert!(frame.image.is_none());
+		assert_eq!(retained.get(), 48);
+		for (width, height) in [(0, 3), (3, 0), (65_536, 65_536)] {
+			assert!(
+				acquire_frame(
+					&negotiated(VideoFormat::BGRA, width, height),
+					false,
+					&retained,
+					|| panic!("invalid geometry must not read pixels"),
+				)
+				.is_err()
+			);
+		}
+		assert!(
+			acquire_frame(&negotiated(VideoFormat::NV12, 2, 2), false, &retained, || {
+				panic!("an unsupported format must not read pixels")
+			})
+			.is_err()
+		);
+		retained.set(MAX_FRAME_PIXELS - 1);
+		assert!(
+			acquire_frame(&negotiated(VideoFormat::BGRA, 1, 1), false, &retained, || {
+				panic!("metadata at the limit must not read pixels")
+			})
+			.is_ok()
+		);
+		assert_eq!(retained.get(), MAX_FRAME_PIXELS);
+		retained.set(MAX_FRAME_PIXELS);
+		assert!(
+			acquire_frame(&negotiated(VideoFormat::BGRA, 1, 1), false, &retained, || {
+				panic!("an over-budget stream must not read pixels")
+			})
+			.is_err()
+		);
+	}
+
+	#[test]
+	fn pixel_acquisition_keeps_alpha_and_does_not_charge_failed_frames() {
+		let retained = Cell::new(0);
+		let format = negotiated(VideoFormat::RGBA, 1, 1);
+		assert!(acquire_frame(&format, true, &retained, || Err("unmapped".into())).is_err());
+		assert_eq!(retained.get(), 0);
+		let frame =
+			acquire_frame(&format, true, &retained, || rgba_from_rows(&format, &[1, 2, 3, 4], 4))
+				.unwrap();
+		assert_eq!(frame.image.unwrap().get_pixel(0, 0).0, [1, 2, 3, 4]);
+		assert_eq!(retained.get(), 1);
+	}
+
+	#[test]
+	fn granted_metadata_keeps_order_logical_bounds_and_all_streams() {
+		let streams =
+			[MonitorStream { node: 8, position: Some((-4, -2)), size: Some((4, 3)) }, MonitorStream {
+				node:     9,
+				position: Some((0, 1)),
+				size:     Some((4, 3)),
+			}];
+		let metadata = || {
+			let retained = Cell::new(0);
+			[(4, 3), (8, 6)]
+				.into_iter()
+				.map(|(width, height)| {
+					acquire_frame(
+						&negotiated(VideoFormat::BGRA, width, height),
+						false,
+						&retained,
+						|| panic!("granted metadata must not read pixels"),
+					)
+				})
+				.collect::<Vec<_>>()
+		};
+		let frames = pair_granted_streams(
+			&streams,
+			collect_frames(metadata().into_iter().map(Some).collect()).unwrap(),
+		)
+		.unwrap();
+		let geometries = frames
+			.into_iter()
+			.map(|(_, geometry)| geometry)
+			.collect::<Vec<_>>();
+		let displays = super::super::geometry::fresh_layout(&geometries, &[]).unwrap();
+		assert_eq!(
+			(displays[0].x, displays[0].y, displays[0].pixel_x, displays[0].pixel_y),
+			(-4, -2, 0, 0)
+		);
+		assert_eq!(
+			(displays[1].x, displays[1].y, displays[1].pixel_x, displays[1].pixel_y),
+			(0, 1, 8, 6)
+		);
+		assert_eq!((displays[0].scale, displays[1].scale), (1.0, 2.0));
+		assert!(pair_granted_streams(&streams, vec![]).is_err());
+		assert!(collect_frames(vec![Some(metadata().remove(0)), None]).is_err());
+		assert!(
+			collect_frames(vec![Some(metadata().remove(0)), Some(Err("denied".into()))]).is_err()
+		);
+		let invalid =
+			[MonitorStream { node: 8, position: Some((0, 0)), size: Some((4, 3)) }, MonitorStream {
+				node:     9,
+				position: None,
+				size:     Some((4, 3)),
+			}];
+		assert!(
+			pair_granted_streams(
+				&invalid,
+				metadata()
+					.into_iter()
+					.collect::<Result<Vec<_>, _>>()
+					.unwrap()
+			)
+			.is_err()
+		);
 	}
 
 	/// `PipeWire` hands out rows aligned to its own stride, so a converter that

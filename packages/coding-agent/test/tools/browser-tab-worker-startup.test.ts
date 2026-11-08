@@ -185,10 +185,8 @@ describe("OMP-owned browser evaluation", () => {
 					);
 				},
 			});
-			let browser: BrowserHandle | undefined;
+			const browser = headless();
 			try {
-				browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: project.path() });
-				if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
 				await acquireTab(name, browser, {
 					url: `http://127.0.0.1:${server.port}/page`,
 					timeoutMs: 30_000,
@@ -248,8 +246,6 @@ describe("OMP-owned browser evaluation", () => {
 				expect(value.helperMutations).toEqual({ added: 0, removed: 0 });
 			} finally {
 				await releaseTab(name, { kill: true });
-				if (browser && "browser" in browser && browser.browser.connected)
-					await releaseBrowser(browser, { kill: true });
 				server.stop(true);
 				await project.remove();
 			}
@@ -354,8 +350,7 @@ describe("OMP-owned browser evaluation", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"keeps raw collection evaluation usable when the callsite stack is one frame deep",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
-			if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
+			const browser = headless();
 			const page = await browser.browser.newPage();
 			const stackTraceLimit = Error.stackTraceLimit;
 			try {
@@ -377,7 +372,6 @@ describe("OMP-owned browser evaluation", () => {
 			} finally {
 				Error.stackTraceLimit = stackTraceLimit;
 				await page.close().catch(() => undefined);
-				if (browser.browser.connected) await releaseBrowser(browser, { kill: true });
 			}
 		},
 		45_000,
@@ -386,8 +380,7 @@ describe("OMP-owned browser evaluation", () => {
 	it.skipIf(!CHROMIUM_AVAILABLE)(
 		"returns computed DOM collections through raw page and frame evaluation",
 		async () => {
-			const browser = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
-			if (!("browser" in browser)) throw new Error("Expected a Puppeteer browser");
+			const browser = headless();
 			const name = `collection-evaluate-${process.pid}`;
 			const session = {
 				cwd: process.cwd(),
@@ -434,7 +427,6 @@ describe("OMP-owned browser evaluation", () => {
 				});
 			} finally {
 				await releaseTab(name, { kill: true });
-				if (browser.browser.connected) await releaseBrowser(browser, { kill: true });
 			}
 		},
 		45_000,

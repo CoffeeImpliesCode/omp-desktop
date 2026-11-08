@@ -309,7 +309,7 @@ def _make_computer():
             return await self._method("focus", args, kwargs)
 
         async def raise_(self, *args, **kwargs):
-            return await self.focus(*args, **kwargs)
+            return await self._method("raise", args, kwargs)
 
         async def state(self, *args, **kwargs):
             return await self._method("state", args, kwargs)

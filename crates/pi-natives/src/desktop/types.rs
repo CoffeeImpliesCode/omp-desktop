@@ -213,8 +213,14 @@ pub struct DesktopWindowState {
 	pub fullscreen:   Option<bool>,
 }
 
-/// One workspace as the backend reports it. `id` is opaque and stable, and
-/// only an id returned here is ever a valid mutation target.
+/// One workspace reported by the backend.
+///
+/// Only a returned `id` is a valid mutation target.
+/// Niri ids are compositor-stable; X11 ids identify EWMH
+/// positions only and can designate a different workspace after removal or
+/// reordering. Read fresh workspaces/state before choosing an action target
+/// and re-enumerate after topology changes. X11 can reject an out-of-range
+/// position, but cannot detect reuse or reordering of an in-range position.
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct DesktopWorkspace {
@@ -309,6 +315,19 @@ pub struct DesktopFocusReturn {
 	pub previous_pid: Option<u32>,
 	/// The process front once the takeover ended; absent when unreadable.
 	pub front_pid:    Option<u32>,
+}
+
+/// What a drag call did: made a text selection, or posted input.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct DesktopDragResult {
+	/// The selection a macOS background left drag across the text of one
+	/// native text element made through accessibility, read back; absent when
+	/// the drag was posted as input.
+	pub selection:    Option<AxTextSelection>,
+	/// Where focus ended when the drag ran in takeover; see
+	/// [`DesktopFocusReturn`].
+	pub focus_return: Option<DesktopFocusReturn>,
 }
 
 #[napi(object)]

@@ -60,6 +60,7 @@
 		"press",
 		"state",
 		"focus",
+		"raise",
 		"close",
 		"moveTo",
 		"moveBy",

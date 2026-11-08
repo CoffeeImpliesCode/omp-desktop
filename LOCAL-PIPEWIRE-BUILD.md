@@ -1,15 +1,15 @@
 # Linux Wayland build: PipeWire capture
 
-Released builds compile the native addons with `crate_features = []`. On a
-Wayland session `capture()` is then reduced to
+Upstream's released builds compile the native addons with `crate_features = []`.
+On a Wayland session `capture()` is then reduced to
 `CaptureFailed: Wayland capture requires the wayland-pipewire feature`. The X11
-fallback does not help: niri runs Xwayland rootless, so the X root window is
-empty. Backend selection reads only `WAYLAND_DISPLAY` / `DISPLAY`
-(`crates/pi-natives/src/desktop/linux/mod.rs`), so neither
-`~/.omp/agent/settings.json` nor `config.yml` turns the feature on. The build
-below compiles both addons with `wayland-pipewire` and embeds them in the
-executable. The fork also keeps every authorized monitor stream, adds exact
-niri window capture, and integrates upstream v18.12.6.
+fallback does not help on niri: Xwayland is rootless, so the X root window is
+empty. The native backend probes the inherited Wayland socket or configured
+socket path; only a conclusively stale endpoint permits X11 fallback.
+Neither `~/.omp/agent/settings.json` nor `config.yml` enables the capture
+feature. The build below compiles both addons with `wayland-pipewire` and
+embeds them in the executable. The fork also keeps every authorized monitor
+stream, adds exact niri window capture, and integrates upstream v18.18.2.
 
 ## Why a hand-dropped addon is not enough
 
@@ -84,6 +84,12 @@ or the baseline and modern files can contain the same host-specific build.
 does not match `packages/natives/package.json`. Embedding only `modern` leaves
 hosts without AVX2 loading an AVX2 binary. The fork's
 `OMP_NATIVE_X64_VARIANT` override builds both variants on one host.
+
+**Desktop ABI.** The JavaScript adapter requires desktop ABI 1 before it
+constructs a native session. Method names alone cannot prove compatible drag
+results or control semantics. A stale addon leaves non-desktop tools usable,
+but computer use fails with a rebuild-and-restart instruction. Rebuild both
+variants before compiling the executable; restart existing omp processes.
 
 **Bun runtime.** The standalone binary embeds the Bun used to compile it.
 `packages/coding-agent/package.json` declares the minimum version. The project

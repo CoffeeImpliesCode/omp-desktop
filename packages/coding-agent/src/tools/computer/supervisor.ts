@@ -28,6 +28,7 @@ import {
 	ESCAPE_REFUSED_MESSAGE,
 	ESCAPE_STOPPED_MESSAGE,
 	type RunErrorPayload,
+	UNTAGGED_CELL_ID,
 } from "./protocol";
 
 const START_TIMEOUT_MS = 10_000;
@@ -92,11 +93,13 @@ export interface ComputerController {
 		signal?: AbortSignal,
 	): Promise<ComputerSettleReport | undefined>;
 	/**
-	 * Forget what an eval cell left pending: it was cancelled and will never
-	 * settle. A notification, not a request — nothing is answered, captured or
-	 * reported, and a cell that failed without being cancelled is untouched.
+	 * Forget provisional observations whose cell output was cancelled or could
+	 * not be assembled. A notification, not a request; it never captures or
+	 * reports. Ordinary runtime failures whose output is published remain intact.
 	 */
 	discardCell?(cellId: string): void;
+	/** Commit the cell's AX baseline only after Eval accepts its complete output. */
+	acceptCell?(cellId: string): void;
 	close(): Promise<void>;
 }
 
@@ -379,10 +382,16 @@ export class ComputerSupervisor implements ComputerController {
 		try {
 			this.#worker?.send({ type: "settle", id, timeoutMs: SETTLE_TIMEOUT_MS, session: snapshot, output });
 			const { returnValue, displays } = await this.#raceWithGrace(promise, SETTLE_TIMEOUT_MS);
+			if (signal?.aborted) throw new ToolAbortError();
 			const text = typeof returnValue === "string" ? returnValue : undefined;
 			const images = displays.filter((block): block is ImageContent => block.type === "image");
 			if (text === undefined && images.length === 0) return undefined;
 			return { text, images };
+		} catch (error) {
+			// Worker success is provisional until this caller accepts it. A late
+			// abort or failed delivery must not leave an unseen report baseline.
+			this.discardCell(snapshot.cellId ?? UNTAGGED_CELL_ID);
+			throw error;
 		} finally {
 			signal?.removeEventListener("abort", abort);
 			this.#pending.delete(id);
@@ -392,6 +401,11 @@ export class ComputerSupervisor implements ComputerController {
 	discardCell(cellId: string): void {
 		if (this.#closed) return;
 		this.#safeSend({ type: "discard", cellId });
+	}
+
+	acceptCell(cellId: string): void {
+		if (this.#closed) return;
+		this.#safeSend({ type: "accept", cellId });
 	}
 
 	#start(): Promise<void> {

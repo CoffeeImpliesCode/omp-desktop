@@ -82,6 +82,7 @@ export const WINDOW_METHODS: MethodPolicies = {
 	press: "exec",
 	state: "read",
 	focus: "exec",
+	raise: "exec",
 	close: "exec",
 	moveTo: "exec",
 	moveBy: "exec",

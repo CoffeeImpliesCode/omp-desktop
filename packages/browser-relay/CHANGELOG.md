@@ -6,6 +6,22 @@
 
 - Relay opens now create dedicated background tabs and close only tabs created by omp; `app.target` explicitly borrows an existing tab ([#14060](https://github.com/can1357/oh-my-pi/pull/14060) by [@nnnnoel](https://github.com/nnnnoel)).
 
+## [18.18.2] - 2026-11-08
+
+### Added
+
+- The browser extension now requests Chrome’s downloads permission so relay tabs can report where downloads were saved to omp.
+
+## [18.18.1] - 2026-11-08
+
+### Changed
+
+- The extension now requests `scripting` and access to all sites (Chrome lists "Read and change all your data on all websites"); it uses them only to empty another extension's frames in a tab omp is driving, when Chrome refuses it the debugger there ([#16908](https://github.com/can1357/oh-my-pi/pull/16908) by [@will-bogusz](https://github.com/will-bogusz))
+
+### Fixed
+
+- Fixed a password manager's inline autofill menu locking omp out of a tab it drives: the extension empties and hides such frames in that tab and retries the attach or command Chrome refused ([#16908](https://github.com/can1357/oh-my-pi/pull/16908) by [@will-bogusz](https://github.com/will-bogusz))
+
 ## [18.13.3] - 2026-10-28
 
 ### Changed
@@ -31,6 +47,7 @@
 ### Fixed
 
 - Fixed tabs a relay client asks to open in the background being created as the selected tab ([#15109](https://github.com/can1357/oh-my-pi/pull/15109) by [@will-bogusz](https://github.com/will-bogusz))
+
 ## [18.6.3] - 2026-10-06
 
 ### Fixed

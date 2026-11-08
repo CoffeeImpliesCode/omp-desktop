@@ -141,7 +141,6 @@ function makeWedgeTab(scope: SharedTargetScope, options: WedgeOptions = {}): Tab
 		pending: new Map(),
 		kindTag: "headless",
 		ownsPage: true,
-		activateForScreenshot: true,
 		ownerSessionId: "session-wedge",
 		persist: false,
 		lastActivityAt: Date.now(),

@@ -13,6 +13,11 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { computerApproval, createComputerPrelude } from "@oh-my-pi/pi-coding-agent/tools/computer";
 import { isReadOnlyComputerCall, renderComputerCall } from "@oh-my-pi/pi-coding-agent/tools/computer/call";
 import {
+	ObservationLedger,
+	REPORT_TREE_BUDGET_BYTES,
+	treeRefs,
+} from "@oh-my-pi/pi-coding-agent/tools/computer/observation";
+import {
 	type ComputerRunOk,
 	type ComputerSessionSnapshot,
 	type ComputerWorkerInbound,
@@ -36,6 +41,7 @@ import {
 import { ComputerWorkerCore, type NativeDesktopSession } from "@oh-my-pi/pi-coding-agent/tools/computer/worker";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import * as clipboard from "@oh-my-pi/pi-coding-agent/utils/clipboard";
+import * as imageResize from "@oh-my-pi/pi-coding-agent/utils/image-resize";
 import type {
 	ApplicationOpenOptions,
 	AxNode,
@@ -49,6 +55,7 @@ import type {
 	DesktopControlCapabilities,
 	DesktopCapture,
 	DesktopDisplay,
+	DesktopDragResult,
 	DesktopFocusReturn,
 	DesktopPoint,
 	DesktopScreenState,
@@ -58,7 +65,6 @@ import type {
 	HoldOptions as NativeHoldOptions,
 	PointerOptions,
 } from "@oh-my-pi/pi-natives";
-import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 import { cfgComputerEnabled } from "@oh-my-pi/pi-coding-agent/tools/settings";
 
@@ -435,8 +441,17 @@ class FakeNativeSession implements NativeDesktopSession {
 		this.#requireFrame(target);
 		this.takeovers.push(_opts?.takeover);
 	}
-	async drag(target: string, _points: DesktopPoint[], _opts?: PointerOptions | null): Promise<void> {
+	/** The selection a text drag makes, or `null` for a posted drag. */
+	dragSelection: AxTextSelection | null = null;
+	readonly dragInputs: Array<{ target: string; points: DesktopPoint[]; options?: PointerOptions | null }> = [];
+	async drag(
+		target: string,
+		points: DesktopPoint[],
+		options?: PointerOptions | null,
+	): Promise<DesktopDragResult | null | void> {
 		this.#requireFrame(target);
+		this.dragInputs.push({ target, points, options });
+		return this.dragSelection ? { selection: this.dragSelection } : null;
 	}
 	async scroll(
 		target: string,
@@ -999,41 +1014,6 @@ type SettlingController = ComputerController & {
 		signal?: AbortSignal,
 	): Promise<ComputerSettleReport | undefined>;
 };
-
-/** A controller that runs every call through a real worker core over `native`. */
-function workerController(native: NativeDesktopSession): SettlingController {
-	const transport = new MemoryTransport();
-	new ComputerWorkerCore(transport, () => native);
-	let runs = 0;
-	let settles = 0;
-	const controller: SettlingController = {
-		async run(code) {
-			const result = await runWorker(transport, `kernel-${++runs}`, code);
-			if (!result.ok) {
-				const error = result.error.isToolError
-					? new ToolError(result.error.message)
-					: new Error(result.error.message);
-				error.name = result.error.name;
-				throw error;
-			}
-			return result.payload;
-		},
-		async settle(_runSnapshot, output) {
-			const id = `settle-${++settles}`;
-			const result = await settleRun(transport, id, output);
-			if (!result.ok) throw new Error(`${id} failed: ${result.error.message}`);
-			const { returnValue, displays } = result.payload;
-			const text = typeof returnValue === "string" ? returnValue : undefined;
-			const images = displays.filter(block => block.type === "image");
-			return text === undefined && images.length === 0 ? undefined : { text, images };
-		},
-		async capabilities() {
-			return undefined;
-		},
-		async close() {},
-	};
-	return controller;
-}
 
 /** What a stubbed host controller answers with; every field is read per call. */
 interface StubController {
@@ -1686,7 +1666,7 @@ describe("computer prelude", () => {
 				action: "call",
 				chain: [
 					{ method: "window", args: ["42"] },
-					{ method: "focus", args: [] },
+					{ method: "raise", args: [] },
 				],
 			},
 			{
@@ -2172,119 +2152,185 @@ describe("computer prelude", () => {
 		);
 	});
 
-	it("appends the guide once per conversation to the cell of its first window lookup, hit or miss", async () => {
-		let conversation = "session-a";
-		let readActive = true;
-		const session: ToolSession = {
-			...toolSession(),
-			getSessionId: () => conversation,
-			isToolActive: (name: string) => name !== "read" || readActive,
-		};
-		const stub: StubController = { value: { id: "42", app: "Code", title: "main.ts", focused: true } };
-		// The turn a cell belongs to, aborted while that cell's report settles.
-		let abortedWhileSettling: AbortController | undefined;
-		stub.onSettle = () => abortedWhileSettling?.abort();
-		const prelude = createComputerPrelude(session, () => stubController(stub)) as SettlingPrelude;
-		/** Run one cell of direct calls (each `[method, …]` a chain), then settle it unless cancelled. */
-		const cell = async (chains: string[][], end: "settle" | "cancel" | "abort" = "settle") => {
-			const turn = new AbortController();
-			const current: PreludeCell = { signal: turn.signal };
-			for (const methods of chains) {
-				const chain = methods.map(method => ({
-					method,
-					args: method === "window" ? [{ app: "Reminders" }] : [],
-				}));
-				const context: CellAwareContext = { session, toolCallId: methods[0]!, cell: current };
-				await prelude.invoke({ action: "call", chain }, context).catch(() => undefined);
-			}
-			if (end === "cancel") {
+	it("discards a successful nonempty computer settlement returned after cancellation", async () => {
+		const turn = new AbortController();
+		const session = toolSession();
+		const prelude = createComputerPrelude(session, () => ({
+			...stubController({}),
+			async settle() {
 				turn.abort();
-				return undefined;
+				return {
+					text: "late computer text",
+					images: [{ type: "image", data: "late frame", mimeType: "image/png" }],
+				};
+			},
+		})) as SettlingPrelude;
+		const cell = { signal: turn.signal };
+		await prelude.invoke({ action: "run", code: "return 1" }, { session, toolCallId: "late", cell });
+		expect(await prelude.settleCell?.(cell, { failed: false, output: "already emitted" })).toBeUndefined();
+	});
+
+	it.each(["suppressed", "accepted", "format-error", "printed-format-error"] as const)(
+		"keeps %s computer baseline ownership across later Eval prelude publication",
+		async publication => {
+			const transport = new MemoryTransport();
+			const native = new EditableWindowSession();
+			native.typeText = async (_target, text) => {
+				native.status = text;
+			};
+			native.keyChord = async () => {
+				native.status = "next state";
+			};
+			new ComputerWorkerCore(transport, () => native);
+			let definitions: readonly EvalPreludeDefinition[] = [];
+			const id = crypto.randomUUID();
+			const session: ToolSession = {
+				...toolSession(),
+				getEvalSessionId: () => `publication-eval-${id}`,
+				getEvalPreludes: () => definitions,
+			};
+			const prelude = createComputerPrelude(session, () => ({
+				async run(code, timeoutMs, runSnapshot) {
+					const reply = await runWorker(
+						transport,
+						crypto.randomUUID(),
+						code,
+						runSnapshot.readOnly,
+						timeoutMs,
+						runSnapshot.cellId,
+					);
+					if (!reply.ok) throw new Error(reply.error.message);
+					return reply.payload;
+				},
+				async settle(runSnapshot, output) {
+					const reply = await settledPayload(transport, crypto.randomUUID(), output, runSnapshot.cellId);
+					return typeof reply.returnValue === "string" ? { text: reply.returnValue } : undefined;
+				},
+				acceptCell: cellId => transport.inbound({ type: "accept", cellId }),
+				discardCell: cellId => transport.inbound({ type: "discard", cellId }),
+				async capabilities() {
+					return native.capabilities;
+				},
+				async close() {
+					transport.inbound({ type: "close" });
+				},
+			}));
+			const turn = new AbortController();
+			let cancel = publication === "suppressed";
+			definitions = [
+				prelude,
+				{
+					name: "publication-stop",
+					documentation: "",
+					javascript: "",
+					python: "",
+					exports: [],
+					async invoke() {
+						return { content: [] };
+					},
+					async settleCell() {
+						if (publication.endsWith("format-error")) {
+							return {
+								images: [
+									{
+										type: "image",
+										data: "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAFklEQVR4nGP8z8DwnwEPYMInOXwUAAASWwIOH0pJXQAAAABJRU5ErkJggg==",
+										mimeType: "image/png",
+									},
+								],
+							};
+						}
+						if (cancel) turn.abort();
+						return undefined;
+					},
+				},
+			];
+			const tool = new EvalTool(session);
+			try {
+				await readCell(transport, "publication-eval-read");
+				const resize = publication.endsWith("format-error")
+					? spyOn(imageResize, "resizeImage").mockRejectedValueOnce(new Error("image processing failed"))
+					: undefined;
+				const firstCall = tool.execute(
+					"publication-first",
+					{
+						language: "js",
+						code: `await computer.run('await (await desktop.window("42")).type("first state"); ${publication === "printed-format-error" ? 'console.log(await (await desktop.window("42")).ax())' : ""}')`,
+					},
+					turn.signal,
+				);
+				if (publication.endsWith("format-error")) {
+					await expect(firstCall).rejects.toThrow("image processing failed");
+					resize?.mockRestore();
+				} else {
+					const first = await firstCall;
+					const firstText = first.content
+						.filter(block => block.type === "text")
+						.map(block => block.text)
+						.join("");
+					if (publication === "suppressed") expect(firstText).not.toContain('"first state"');
+					else expect(firstText).toContain('"first state"');
+				}
+				// A turn can abort after an accepted cell: that must not undo model-visible evidence.
+				turn.abort();
+				cancel = false;
+				definitions = [prelude];
+				const next = await tool.execute("publication-next", {
+					language: "js",
+					code: `await computer.run('await (await desktop.window("42")).press("shift")')`,
+				});
+				const text = next.content
+					.filter(block => block.type === "text")
+					.map(block => block.text)
+					.join("");
+				expect(text).toContain('"next state"');
+				if (publication === "accepted") expect(text).toContain('(was: statictext: "first state")');
+				else expect(text).not.toContain('(was: statictext: "first state")');
+			} finally {
+				await prelude.invoke({ action: "close" }, { session, toolCallId: "publication-close" });
 			}
-			abortedWhileSettling = end === "abort" ? turn : undefined;
-			return (await prelude.settleCell?.(current, { failed: stub.failure !== undefined, output: "" }))?.text;
+		},
+	);
+
+	it.each(["js", "py"] as const)("keeps %s window raise independent of compositor focus support", async language => {
+		const native = new FakeNativeSession({ operations: [] });
+		let raises = 0;
+		native.raiseWindow = async () => {
+			raises++;
 		};
-
-		// Other calls, and window methods on a handle, never bring it.
-		expect(await cell([["windows"], ["window", "ax"]])).toBeUndefined();
-		// A miss brings it, caught or not; later lookups do not.
-		stub.failure = new ToolError('no window matches {"app":"Reminders"}');
-		expect(await cell([["window"]])).toContain(prelude.documentation!);
-		expect(await cell([["window"]])).toBeUndefined();
-		stub.failure = undefined;
-		expect(await cell([["focusedWindow"]])).toBeUndefined();
-		// A cancelled cell is never settled, and a turn aborted while settling is not answered, so the next
-		// lookup still brings it; so does a null focusedWindow().
-		conversation = "session-b";
-		stub.value = null;
-		expect(await cell([["focusedWindow"]], "cancel")).toBeUndefined();
-		expect(await cell([["focusedWindow"]], "abort")).toBeUndefined();
-		expect(await cell([["focusedWindow"]])).toContain(prelude.documentation!);
-		conversation = "session-a";
-		expect(await cell([["window"]])).toBeUndefined();
-		// A session without `read` has the guide inline in the eval description instead.
-		conversation = "session-c";
-		readActive = false;
-		expect(await cell([["window"]])).toBeUndefined();
-	});
-
-	it("puts the guide ahead of the post-input report of the first lookup's cell", async () => {
-		const session: ToolSession = { ...toolSession(), getSessionId: () => "session" };
-		const report = 'window "42" after press e3 — current tree:';
-		const prelude = createComputerPrelude(session, () =>
-			stubController({
-				value: { id: "42", app: "Code", title: "main.ts" },
-				report,
-			}),
-		) as SettlingPrelude;
-		const current: PreludeCell = { signal: new AbortController().signal };
-		const lookup: CellAwareContext = { session, toolCallId: "window", cell: current };
-		await prelude.invoke({ action: "call", chain: [{ method: "window", args: [{ app: "Code" }] }] }, lookup);
-
-		const text = (await prelude.settleCell?.(current, { failed: false, output: "" }))?.text ?? "";
-		expect(text).toContain(prelude.documentation!);
-		expect(text).toContain(report);
-		expect(text.indexOf(prelude.documentation!)).toBeLessThan(text.indexOf(report));
-	});
-
-	it("appends the guide after the first lookup's cell through the eval tool in JavaScript and Python", async () => {
-		const native = new FakeNativeSession();
-		native.listWindows = async () => [
-			windowFixture,
-			{ ...windowFixture, id: "67", app: "Reminders", title: "Reminders", pid: 11, focused: false },
-		];
-		let conversation = "js";
-		let definitions: readonly EvalPreludeDefinition[] = [];
+		const id = `computer-activation-${language}-${crypto.randomUUID()}`;
 		const session: ToolSession = {
 			...toolSession(),
 			settings: Settings.isolated({ "computer.enabled": true, "async.enabled": false }),
-			getSessionId: () => conversation,
-			getEvalSessionId: () => `computer-guide-${conversation}`,
-			getEvalPreludes: () => definitions,
+			getEvalSessionId: () => id,
+			getEvalPreludes: () => [prelude],
 		};
-		const prelude = createComputerPrelude(session, () => workerController(native));
-		definitions = [prelude];
+		const prelude = workerPrelude(session, native);
 		const tool = new EvalTool(session);
-		const output = async (language: "js" | "py", code: string): Promise<string> =>
-			(await tool.execute(`guide-${language}-${crypto.randomUUID()}`, { language, code })).content
-				.map(block => (block.type === "text" ? block.text : ""))
-				.join("");
-		const guide = prelude.documentation!;
-
-		// A miss the cell swallows still brings it, after the cell's own output.
-		const swallowed = await output(
-			"js",
-			'try { await computer.window({ app: "Contacts" }); } catch {} print("after");',
-		);
-		expect(swallowed).toContain(guide);
-		expect(swallowed.indexOf("after")).toBeLessThan(swallowed.indexOf(guide));
-		expect(await output("js", 'print((await computer.window({ app: "Reminders" })).title);')).toBe("Reminders");
-
-		conversation = "py";
-		const failed = await output("py", 'await computer.window({"app": "Contacts"})');
-		expect(failed).toContain("Contacts");
-		expect(failed).toContain(guide);
-		expect(await output("py", 'print((await computer.window({"app": "Reminders"})).title)')).toBe("Reminders");
+		try {
+			const code =
+				language === "js"
+					? 'const win = await computer.window("42"); await win.raise(); print("raised");'
+					: 'win = await computer.window("42")\nawait win.raise_()\nprint("raised")';
+			const raised = await tool.execute(`${id}-raise`, { language, code });
+			expect(raised.isError).not.toBe(true);
+			expect(raised.content).toEqual([{ type: "text", text: "raised" }]);
+			expect(raises).toBe(1);
+			const focused = await tool.execute(`${id}-focus`, {
+				language,
+				code:
+					language === "js"
+						? 'await (await computer.window("42")).focus();'
+						: 'await (await computer.window("42")).focus()',
+			});
+			expect(focused.isError).toBe(true);
+			expect(focused.content.some(part => part.type === "text" && part.text.includes("ControlUnsupported:"))).toBe(
+				true,
+			);
+			expect(native.receivedActions).toEqual([]);
+		} finally {
+			await prelude.invoke({ action: "close" }, { session, toolCallId: `${id}-close` });
+		}
 	});
 });
 
@@ -2885,6 +2931,70 @@ describe("computer worker round trips", () => {
 		expect(native.selections).toEqual([]);
 	});
 
+	it("returns and reports a drag the native side made as a text selection", async () => {
+		const transport = new MemoryTransport();
+		const native = new FakeNativeSession();
+		native.dragSelection = { start: 7, length: 7, text: "BV-2291", focused: false };
+		new ComputerWorkerCore(transport, () => native);
+		const result = await runWorker(
+			transport,
+			"drag-selection",
+			'const win = await desktop.window("42"); await win.screenshot({ silent: true }); await win.drag([[1, 2], [30, 2]])',
+		);
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.payload.returnValue).toEqual(native.dragSelection);
+		expect(native.dragInputs).toEqual([
+			{
+				target: "42",
+				points: [
+					{ x: 1, y: 2 },
+					{ x: 30, y: 2 },
+				],
+				options: {},
+			},
+		]);
+		expect(result.payload.displays).toHaveLength(1);
+		const [notice] = result.payload.displays;
+		expect(notice?.type).toBe("text");
+		const text = notice?.type === "text" ? notice.text : "";
+		expect(text).toContain(JSON.stringify("BV-2291"));
+		expect(text).toContain("accessibility");
+		expect(text).toContain("no mouse input");
+		expect(text).not.toContain("\n");
+		expect(String(await settleWorker(transport, "settle-drag-selection"))).toContain("after drag");
+		native.dragSelection = null;
+		const posted = await runWorker(
+			transport,
+			"drag-posted",
+			'const win = await desktop.window("42"); await win.screenshot({ silent: true }); await win.drag([[1, 2], [30, 2]])',
+		);
+		expect(posted.ok && posted.payload.returnValue).toBeUndefined();
+		expect(posted.ok && posted.payload.displays).toEqual([]);
+		// The notice stays one short line, JSON escaping included; the return value keeps the selection whole.
+		for (const [label, text, full] of [
+			["long", "a".repeat(300), "a".repeat(300)],
+			["wide", "あ".repeat(150), "あ".repeat(150)],
+			["escaped", '"\\\n\t'.repeat(70), '\\"\\\\\\n\\t'.repeat(70)],
+		] as const) {
+			native.dragSelection = { start: 0, length: text.length, text, focused: false };
+			const long = await runWorker(
+				transport,
+				`drag-${label}`,
+				'const win = await desktop.window("42"); await win.screenshot({ silent: true }); await win.drag([[1, 2], [30, 2]])',
+			);
+			expect(long.ok && long.payload.returnValue).toEqual(native.dragSelection);
+			const longNotice = long.ok ? long.payload.displays[0] : undefined;
+			const longText = longNotice?.type === "text" ? longNotice.text : "";
+			expect(long.ok).toBe(true);
+			expect(longNotice?.type).toBe("text");
+			expect(longText).not.toContain("\n");
+			expect(longText.length).toBeLessThan(full.length);
+			expect(longText).toContain(full.slice(0, 4));
+			expect(longText).not.toContain(full);
+		}
+	});
+
 	describe("numeric window ids", () => {
 		it.each([
 			["a number", "desktop.window(42)"],
@@ -3415,6 +3525,56 @@ describe("computer worker round trips", () => {
 				["fake-workspace:2", false, "7"],
 			],
 		});
+	});
+
+	it("refuses foreground compositor controls centrally without refusing unfocused moves", async () => {
+		const transport = new MemoryTransport();
+		const native = new FakeNativeSession({
+			windows: [windowFixture, secondWindowFixture],
+			displays: [display, secondDisplay],
+		});
+		new ComputerWorkerCore(transport, () => native);
+		const before = await native.windowState("42");
+		for (const [index, code] of [
+			'await (await desktop.window("7")).focus()',
+			'await desktop.focusWorkspace({ workspaceId: "fake-workspace:2" })',
+			'await desktop.focusDisplay({ displayId: "display-2" })',
+			'await (await desktop.window("42")).moveToWorkspace({ workspaceId: "fake-workspace:2", focus: true })',
+		].entries()) {
+			transport.inbound({
+				type: "run",
+				id: `refuse-control-${index}`,
+				code,
+				timeoutMs: 10_000,
+				session: { ...snapshot(false), backgroundFallback: "refuse" },
+				escape: escapeScope(),
+			});
+			const result = await transport.waitFor(
+				message => message.type === "result" && message.id === `refuse-control-${index}`,
+			);
+			if (result.type !== "result" || result.ok) throw new Error("foreground control was not refused");
+			expect(result.error.message).toContain('computer.backgroundFallback setting is "refuse"');
+			expect(native.receivedActions).toEqual([]);
+			expect(await native.windowState("42")).toEqual(before);
+			expect((await native.listWindows()).find(window => window.focused)?.id).toBe("42");
+		}
+		transport.inbound({
+			type: "run",
+			id: "unfocused-move",
+			code: 'const win = await desktop.window("42"); await win.maximize(); await win.moveToWorkspace({ workspaceId: "fake-workspace:2", focus: false }); return await win.state()',
+			timeoutMs: 10_000,
+			session: { ...snapshot(false), backgroundFallback: "refuse" },
+			escape: escapeScope(),
+		});
+		const moved = await transport.waitFor(message => message.type === "result" && message.id === "unfocused-move");
+		if (moved.type !== "result" || !moved.ok) throw new Error("unfocused move was refused");
+		expect(native.receivedActions).toEqual([
+			{ operation: "maximizeWindow", windowId: "42" },
+			{ operation: "moveWindowToWorkspace", windowId: "42", workspaceId: "fake-workspace:2", focus: false },
+		]);
+		expect(moved.payload.returnValue).toEqual(
+			expect.objectContaining({ workspaceId: "fake-workspace:2", maximized: true }),
+		);
 	});
 
 	it("closes one window and leaves the desktop session running", async () => {
@@ -5149,6 +5309,26 @@ describe("computer cell settlement", () => {
 		expect(native.snapshots).toBe(before);
 	});
 
+	it("does not suppress readback or promote an unseen tree when the cell prints only refs", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+		await readCell(transport, "read");
+		const read = await runWorker(
+			transport,
+			"refs-only",
+			'await (await desktop.ref("e3")).press(); return await (await desktop.window("42")).ax()',
+		);
+		if (!read.ok) throw new Error(read.error.message);
+		const refs = String(read.payload.returnValue)
+			.match(/\[ref=e\d+\]/g)!
+			.join(" ");
+		const report = String(await settleWorker(transport, "settle-refs", refs));
+		expect(report).toContain('~ button "Done"');
+		expect(report).toContain('(was: button "Edit")');
+		expect(report).toContain('+ textfield "Phone"');
+	});
+
 	it("reports a window whose tree the cell read after its input but did not print", async () => {
 		const transport = new MemoryTransport();
 		const native = new EditableWindowSession();
@@ -5607,6 +5787,796 @@ describe("computer cell settlement", () => {
 		const aReport = String(await settleWorker(transport, "a-settle", "", "cell-a"));
 		expect(aReport).toContain("after press shift");
 		expect(aReport).not.toContain('type "hi"');
+	});
+
+	it("freezes A's same-window state before queued B mutates, even when B settles first", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		native.keyChord = async () => {
+			native.status = "A state";
+			started.resolve();
+			await release.promise;
+		};
+		native.typeText = async () => {
+			native.status = "B state";
+		};
+		new ComputerWorkerCore(transport, () => native);
+		await readCell(transport, "read");
+		await runWorker(transport, "pixel-mode", 'await (await desktop.window("42")).screenshot()');
+		const a = runWorker(
+			transport,
+			"a-overlap",
+			'await (await desktop.window("42")).press("shift")',
+			false,
+			10_000,
+			"overlap-a",
+		);
+		await started.promise;
+		const b = runWorker(
+			transport,
+			"b-overlap",
+			'await (await desktop.window("42")).type("B")',
+			false,
+			10_000,
+			"overlap-b",
+		);
+		release.resolve();
+		expect((await a).ok).toBe(true);
+		expect((await b).ok).toBe(true);
+		const bPayload = await settledPayload(transport, "b-overlap-settle", "", "overlap-b");
+		// A later inspection helper must not replace A's earlier frozen result with B.
+		await runWorker(transport, "a-inspect", 'return (await desktop.window("42")).title', true, 10_000, "overlap-a");
+		const aPayload = await settledPayload(transport, "a-overlap-settle", "", "overlap-a");
+		const bReport = String(bPayload.returnValue);
+		const aReport = String(aPayload.returnValue);
+		expect(bReport).toContain('"B state"');
+		expect(aReport).toContain('"A state"');
+		expect(aReport).not.toContain('"B state"');
+		expect(aReport).toContain("after press shift");
+		expect(aReport).not.toContain('after type "B"');
+		expect(aReport).toContain("Historical post-input snapshot");
+		expect(aReport).not.toContain("[ref=");
+		expect(imageBlocks(aPayload)).toEqual([]);
+		expect(aPayload.screenshots).toEqual([]);
+		expect(imageBlocks(bPayload)).toHaveLength(1);
+		// A's old report must not replace B's current baseline.
+		await runWorker(
+			transport,
+			"baseline-key",
+			'await (await desktop.window("42")).press("ctrl")',
+			false,
+			10_000,
+			"baseline-cell",
+		);
+		const baseline = String(await settleWorker(transport, "baseline-settle", "", "baseline-cell"));
+		expect(baseline).toContain('(was: statictext: "B state")');
+	});
+
+	for (const lateInspection of ["ax", "screenshot", "expired-ref"] as const) {
+		it(`retains A's historical evidence after a late ${lateInspection} inspection`, async () => {
+			const transport = new MemoryTransport();
+			const native = new EditableWindowSession();
+			native.keyChord = async () => {
+				native.status = "A [ref=e99] payload";
+			};
+			native.typeText = async () => {
+				native.status = "B state";
+			};
+			const snapshotTree = native.axSnapshot.bind(native);
+			native.axSnapshot = async () => ({
+				text: (await snapshotTree()).text.replace('window "Editor"', 'window "Editor [ref=e98] caption"'),
+			});
+			new ComputerWorkerCore(transport, () => native);
+			await readCell(transport, "read");
+			await runWorker(
+				transport,
+				"history-a",
+				'await (await desktop.window("42")).press("shift")',
+				false,
+				10_000,
+				"history-a",
+			);
+			await runWorker(
+				transport,
+				"history-b",
+				'await (await desktop.window("42")).type("B")',
+				false,
+				10_000,
+				"history-b",
+			);
+			// B has renewed the native ref generations before A inspects again.
+			await settledPayload(transport, "history-b-settle", "", "history-b");
+			const code =
+				lateInspection === "ax"
+					? 'return await (await desktop.window("42")).ax()'
+					: lateInspection === "screenshot"
+						? 'await (await desktop.window("42")).screenshot()'
+						: 'return await (await desktop.ref("e3")).value()';
+			const late = await runWorker(transport, "history-a-inspect", code, true, 10_000, "history-a");
+			expect(late.ok).toBe(lateInspection !== "expired-ref");
+			const printed = late.ok && lateInspection === "ax" ? String(late.payload.returnValue) : "";
+			const report = await settledPayload(transport, "history-a-settle", printed, "history-a");
+			const text = String(report.returnValue);
+			expect(text).toContain("Historical post-input snapshot");
+			expect(text).toContain('"A [ref=e99] payload"');
+			expect(text).toContain('"Editor [ref=e98] caption"');
+			expect(text).not.toContain('"B state"');
+			expect(treeRefs(text)).toEqual([]);
+			expect(imageBlocks(report)).toEqual([]);
+			if (lateInspection === "expired-ref") expect(text).toContain("Later call failed");
+		});
+	}
+
+	for (const mutation of [
+		"holdKeys",
+		"holdMouse",
+		"menu.select",
+		"menu.items",
+		"bringToCurrentSpace",
+		"raise",
+		"selectText",
+		"apps.open",
+	] as const) {
+		it(`supersedes A's old snapshot after A actually dispatches ${mutation}`, async () => {
+			const transport = new MemoryTransport();
+			const native = new EditableWindowSession();
+			native.keyChord = async () => {
+				native.status = "old A";
+			};
+			native.typeText = async () => {
+				native.status = "B state";
+			};
+			native.holdKeys = async () => {
+				native.status = "new A";
+			};
+			native.holdMouse = async () => {
+				native.status = "new A";
+			};
+			native.menuSelect = async () => {
+				native.status = "new A";
+			};
+			native.menuItems = async () => {
+				native.status = "new A";
+				return [];
+			};
+			native.bringToCurrentSpace = async () => {
+				native.status = "new A";
+			};
+			native.raiseWindow = async () => {
+				native.status = "new A";
+			};
+			native.axSelectText = async () => {
+				native.status = "new A";
+				return { start: 0, length: 1, text: "n", focused: false };
+			};
+			native.openApplication = async () => {
+				native.status = "new A";
+				return { ...(await native.listApplications())[0]!, window: windowFixture };
+			};
+			new ComputerWorkerCore(transport, () => native);
+			await readCell(transport, "read");
+			await runWorker(
+				transport,
+				"mutate-a",
+				'await (await desktop.window("42")).press("shift")',
+				false,
+				10_000,
+				"mutate-a",
+			);
+			await runWorker(
+				transport,
+				"mutate-b",
+				'await (await desktop.window("42")).type("B")',
+				false,
+				10_000,
+				"mutate-b",
+			);
+			const code =
+				mutation === "apps.open"
+					? 'await desktop.apps.open("Code")'
+					: mutation === "selectText"
+						? 'const win = await desktop.window("42"); const tree = await win.ax(); const ref = tree.match(/button "Edit" \\[ref=(e\\d+)\\]/)[1]; await win.ref(ref).selectText("n")'
+						: mutation === "holdKeys"
+							? 'await (await desktop.window("42")).holdKeys(["shift"], { duration: 0 })'
+							: mutation === "holdMouse"
+								? 'await (await desktop.window("42")).holdMouse(1, 1, { duration: 0 })'
+								: mutation === "menu.select"
+									? 'await (await desktop.window("42")).menu.select(["File", "Save"])'
+									: mutation === "menu.items"
+										? 'await (await desktop.window("42")).menu.items()'
+										: `await (await desktop.window("42")).${mutation}()`;
+			expect((await runWorker(transport, "mutate-a-again", code, false, 10_000, "mutate-a")).ok).toBe(true);
+			const report = await settledPayload(transport, "mutate-a-settle", "", "mutate-a");
+			expect(String(report.returnValue)).toContain('"new A"');
+			expect(String(report.returnValue)).not.toContain("Historical post-input snapshot");
+			expect(String(report.returnValue)).toContain("[ref=");
+			if (mutation === "holdMouse") expect(imageBlocks(report)).toHaveLength(1);
+		});
+	}
+
+	for (const [name, code] of [
+		["focus-policy", 'await (await desktop.window("42")).focus()'],
+		["takeover-policy", 'await (await desktop.window("42")).click(1, 1, { takeover: true })'],
+		["argument", 'await (await desktop.window("42")).moveTo({ x: NaN, y: 1 })'],
+		["capability", 'await (await desktop.window("42")).maximize()'],
+		["native-unsent", 'await (await desktop.window("42")).press("ctrl")'],
+		["native-explicit-unsent", 'await (await desktop.window("42")).press("alt")'],
+		["native-sync-preflight", 'await (await desktop.window("42")).press("invalid-native-key")'],
+	] as const) {
+		it(`retains frozen A after a no-send ${name} rejection following B`, async () => {
+			const transport = new MemoryTransport();
+			const native = new EditableWindowSession({ operations: [] });
+			native.keyChord = (_target, keys) => {
+				if (keys[0] === "invalid-native-key") throw new Error("InvalidKey: unknown native key");
+				if (keys[0] === "alt")
+					return Promise.reject(new Error("InputFailed: input route refused; nothing was sent"));
+				if (keys[0] !== "shift")
+					return Promise.reject(
+						new Error("BackgroundUnavailable: background route unavailable; nothing was sent"),
+					);
+				native.status = "A state";
+				return Promise.resolve();
+			};
+			native.typeText = async () => {
+				native.status = "B state";
+			};
+			new ComputerWorkerCore(transport, () => native);
+			await readCell(transport, "read");
+			await runWorker(
+				transport,
+				"no-send-a",
+				'await (await desktop.window("42")).press("shift")',
+				false,
+				10_000,
+				"no-send-a",
+			);
+			await runWorker(
+				transport,
+				"no-send-b",
+				'await (await desktop.window("42")).type("B")',
+				false,
+				10_000,
+				"no-send-b",
+			);
+			await settledPayload(transport, "no-send-b-settle", "", "no-send-b");
+			transport.inbound({
+				type: "run",
+				id: "no-send-a-rejected",
+				code,
+				timeoutMs: 10_000,
+				session: { ...snapshot(false), cellId: "no-send-a", backgroundFallback: "refuse" },
+				escape: escapeScope(),
+			});
+			const rejected = await transport.waitFor(
+				message => message.type === "result" && message.id === "no-send-a-rejected",
+			);
+			if (rejected.type !== "result" || rejected.ok) throw new Error("expected no-send rejection");
+			const report = String(await settleWorker(transport, "no-send-a-settle", "", "no-send-a"));
+			expect(report).toContain("Historical post-input snapshot");
+			expect(report).toContain('"A state"');
+			expect(report).not.toContain('"B state"');
+			expect(report).toContain("Later call failed");
+			expect(native.receivedActions).toEqual([]);
+			expect(native.clickCount).toBe(0);
+		});
+	}
+
+	it("supersedes frozen A after an asynchronously rejected native input partially changes the window", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		native.keyChord = (_target, keys) => {
+			native.status = keys[0] === "shift" ? "old A" : "partial A";
+			return keys[0] === "shift"
+				? Promise.resolve()
+				: Promise.reject(new Error("InputFailed: key down sent, key up failed"));
+		};
+		native.typeText = async () => {
+			native.status = "B state";
+		};
+		new ComputerWorkerCore(transport, () => native);
+		await readCell(transport, "partial-read");
+		await runWorker(
+			transport,
+			"partial-a",
+			'await (await desktop.window("42")).press("shift")',
+			false,
+			10_000,
+			"partial-a",
+		);
+		await runWorker(
+			transport,
+			"partial-b",
+			'await (await desktop.window("42")).type("B")',
+			false,
+			10_000,
+			"partial-b",
+		);
+		await settledPayload(transport, "partial-b-settle", "", "partial-b");
+		const rejected = await runWorker(
+			transport,
+			"partial-a-reject",
+			'await (await desktop.window("42")).press("ctrl")',
+			false,
+			10_000,
+			"partial-a",
+		);
+		expect(rejected.ok).toBe(false);
+		const report = String(await settleWorker(transport, "partial-a-settle", "", "partial-a"));
+		expect(report).toContain('"partial A"');
+		expect(report).not.toContain("Historical post-input snapshot");
+		expect(report).toContain("key down sent");
+	});
+
+	it("keeps the 64-input bound before native dispatch without leaking synchronous preflight reservations", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		const release = Promise.withResolvers<void>();
+		let dispatched = 0;
+		native.keyChord = () => {
+			throw new Error("InvalidKey: unknown native key");
+		};
+		native.holdKeys = () => {
+			dispatched++;
+			return release.promise;
+		};
+		new ComputerWorkerCore(transport, () => native);
+		const run = runWorker(
+			transport,
+			"input-bound",
+			`
+			const win = await desktop.window("42");
+			for (let i = 0; i < 65; i++) {
+				try { await win.press("invalid-native-key"); } catch {}
+			}
+			await Promise.all(Array.from({ length: 65 }, () =>
+				win.holdKeys(["shift"], { duration: 1 }).catch(error => tool.bound(error.message))));
+		`,
+			false,
+			10_000,
+			"input-bound",
+		);
+		try {
+			const refusal = await transport.waitFor(
+				message => message.type === "tool-call" && message.runId === "input-bound",
+			);
+			if (refusal.type !== "tool-call") throw new Error("expected bound refusal");
+			expect(refusal.args).toContain("Too many in-flight desktop inputs");
+			expect(dispatched).toBe(64);
+			release.resolve();
+			transport.inbound({ type: "tool-reply", id: refusal.id, reply: { ok: true, value: null } });
+			expect((await run).ok).toBe(true);
+		} finally {
+			release.resolve();
+		}
+	});
+
+	for (const baseline of ["newer-report", "accepted-read"] as const) {
+		it(`preserves ${baseline} baseline when an older cell's report is discarded`, async () => {
+			const transport = new MemoryTransport();
+			const native = new EditableWindowSession();
+			native.keyChord = async () => {
+				native.status = "next state";
+			};
+			native.typeText = async (_target, text) => {
+				native.status = text;
+			};
+			new ComputerWorkerCore(transport, () => native);
+			await readCell(transport, "publication-read");
+			const read = await runWorker(
+				transport,
+				"publication-a",
+				baseline === "accepted-read"
+					? 'return await (await desktop.window("42")).ax()'
+					: 'await (await desktop.window("42")).type("suppressed state")',
+				false,
+				10_000,
+				"publication-a",
+			);
+			if (!read.ok) throw new Error(read.error.message);
+			await settledPayload(
+				transport,
+				"publication-a-settle",
+				baseline === "accepted-read" ? String(read.payload.returnValue) : "",
+				"publication-a",
+			);
+			if (baseline === "accepted-read") transport.inbound({ type: "accept", cellId: "publication-a" });
+			if (baseline === "newer-report") {
+				await runWorker(
+					transport,
+					"publication-b",
+					'await (await desktop.window("42")).type("accepted B")',
+					false,
+					10_000,
+					"publication-b",
+				);
+				await settledPayload(transport, "publication-b-settle", "", "publication-b");
+			}
+			transport.inbound({ type: "discard", cellId: "publication-a" });
+			await runWorker(
+				transport,
+				"publication-c",
+				'await (await desktop.window("42")).press("shift")',
+				false,
+				10_000,
+				"publication-c",
+			);
+			const report = String(await settleWorker(transport, "publication-c-settle", "", "publication-c"));
+			expect(report).toContain(`(was: statictext: "${baseline === "newer-report" ? "accepted B" : "Ready"}")`);
+		});
+	}
+
+	for (const outcome of ["return", "throw"] as const) {
+		it(`finalizes dispatched unawaited held input when its helper ends by ${outcome}`, async () => {
+			const transport = new MemoryTransport();
+			const native = new EditableWindowSession();
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			native.keyChord = async () => {
+				native.status = "old A";
+			};
+			native.typeText = async () => {
+				native.status = "B state";
+			};
+			native.holdKeys = async () => {
+				native.status = "new A key-down";
+				started.resolve();
+				await release.promise;
+			};
+			new ComputerWorkerCore(transport, () => native);
+			await readCell(transport, "read");
+			await runWorker(
+				transport,
+				"pending-a",
+				'await (await desktop.window("42")).press("shift")',
+				false,
+				10_000,
+				"pending-a",
+			);
+			await runWorker(
+				transport,
+				"pending-b",
+				'await (await desktop.window("42")).type("B")',
+				false,
+				10_000,
+				"pending-b",
+			);
+			const resumed = runWorker(
+				transport,
+				"pending-a-held",
+				`const win = await desktop.window("42"); void win.holdKeys(["shift"], { duration: 3 }); ${outcome === "throw" ? 'throw new Error("body failed")' : "return 7"}`,
+				false,
+				10_000,
+				"pending-a",
+			);
+			await started.promise;
+			expect((await resumed).ok).toBe(outcome === "return");
+			const report = String(await settleWorker(transport, "pending-a-settle", "", "pending-a"));
+			expect(report).toContain('"new A key-down"');
+			expect(report).not.toContain("Historical post-input snapshot");
+			expect(report).toContain("completion unconfirmed");
+			expect(report.match(/holdKeys shift/g)).toHaveLength(1);
+			release.resolve();
+			await scheduler.wait(0);
+			expect(await settleWorker(transport, "pending-a-again", "", "pending-a")).toBeUndefined();
+			expect((await runWorker(transport, "pending-next", "return 42", true, 10_000, "pending-next")).ok).toBe(true);
+		});
+	}
+
+	it("reports an unawaited resolved-element action without crashing or repeating its late completion", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		const started = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		native.axPerform = async () => {
+			native.status = "element action pending";
+			started.resolve();
+			await release.promise;
+		};
+		new ComputerWorkerCore(transport, () => native);
+		await readCell(transport, "read");
+		const pending = runWorker(
+			transport,
+			"floating-element",
+			'const el = await desktop.ref("e3"); void el.press(); await tool.inputBarrier(); return 7',
+			false,
+			10_000,
+			"floating-element",
+		);
+		await started.promise;
+		const barrier = await transport.waitFor(
+			message => message.type === "tool-call" && message.runId === "floating-element",
+		);
+		if (barrier.type !== "tool-call") throw new Error("expected input barrier");
+		transport.inbound({ type: "tool-reply", id: barrier.id, reply: { ok: true, value: null } });
+		expect((await pending).ok).toBe(true);
+		const report = String(await settleWorker(transport, "floating-element-settle", "", "floating-element"));
+		expect(report).toContain('"element action pending"');
+		expect(report).toContain("press e3 (native completion unconfirmed at helper end)");
+		release.resolve();
+		await scheduler.wait(0);
+		expect(await settleWorker(transport, "floating-element-again", "", "floating-element")).toBeUndefined();
+	});
+
+	it("retains frozen A when an awaited cached-element mutation fails StaleRef before sending input", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		native.keyChord = async () => {
+			native.status = "A state";
+		};
+		native.typeText = async () => {
+			native.status = "B state";
+		};
+		new ComputerWorkerCore(transport, () => native);
+		await readCell(transport, "read");
+		await runWorker(
+			transport,
+			"stale-input-a",
+			'globalThis.cachedAElement = await desktop.ref("e3"); await (await desktop.window("42")).press("shift")',
+			false,
+			10_000,
+			"stale-input-a",
+		);
+		await runWorker(
+			transport,
+			"stale-input-b",
+			'await (await desktop.window("42")).type("B")',
+			false,
+			10_000,
+			"stale-input-b",
+		);
+		await settledPayload(transport, "stale-input-b-settle", "", "stale-input-b");
+		const rejected = await runWorker(
+			transport,
+			"stale-input-a-rejected",
+			"await cachedAElement.press()",
+			false,
+			10_000,
+			"stale-input-a",
+		);
+		if (rejected.ok) throw new Error("expired native element mutation must fail");
+		expect(rejected.error.message).toStartWith("StaleRef:");
+		const report = String(await settleWorker(transport, "stale-input-a-settle", "", "stale-input-a"));
+		expect(report).toContain("Historical post-input snapshot");
+		expect(report).toContain('"A state"');
+		expect(report).not.toContain('"B state"');
+		expect(report).toContain("Later call failed: press e3 failed: StaleRef:");
+	});
+
+	for (const end of ["timeout", "abort", "discard"] as const) {
+		it(`preserves unconfirmed helper input after ${end} unless the whole cell was discarded`, async () => {
+			const transport = new MemoryTransport();
+			const native = new EditableWindowSession();
+			const started = Promise.withResolvers<void>();
+			const release = Promise.withResolvers<void>();
+			native.keyChord = async () => {
+				native.status = "old A";
+			};
+			native.typeText = async () => {
+				native.status = "B state";
+			};
+			native.holdKeys = async () => {
+				native.status = "new A key-down";
+				started.resolve();
+				await release.promise;
+			};
+			new ComputerWorkerCore(transport, () => native);
+			await readCell(transport, "read");
+			await runWorker(
+				transport,
+				"helper-end-a",
+				'await (await desktop.window("42")).press("shift")',
+				false,
+				10_000,
+				"helper-end-a",
+			);
+			await runWorker(
+				transport,
+				"helper-end-b",
+				'await (await desktop.window("42")).type("B")',
+				false,
+				10_000,
+				"helper-end-b",
+			);
+			await settledPayload(transport, "helper-end-b-settle", "", "helper-end-b");
+			const held = runWorker(
+				transport,
+				"helper-end-held",
+				'await (await desktop.window("42")).holdKeys(["shift"], { duration: 3 })',
+				false,
+				end === "timeout" ? 500 : 10_000,
+				"helper-end-a",
+			);
+			await started.promise;
+			if (end === "abort") transport.inbound({ type: "abort", id: "helper-end-held" });
+			if (end === "discard") transport.inbound({ type: "discard", cellId: "helper-end-a" });
+			expect((await held).ok).toBe(false);
+			const report = await settleWorker(transport, "helper-end-a-settle", "", "helper-end-a");
+			if (end === "discard") expect(report).toBeUndefined();
+			else {
+				expect(String(report)).toContain('"new A key-down"');
+				expect(String(report)).toContain("completion unconfirmed");
+				expect(String(report)).not.toContain("Historical post-input snapshot");
+			}
+			release.resolve();
+			await scheduler.wait(0);
+			expect(await settleWorker(transport, "helper-end-a-late", "", "helper-end-a")).toBeUndefined();
+			expect((await runWorker(transport, "helper-end-next", "return 42", true, 10_000, "helper-end-next")).ok).toBe(
+				true,
+			);
+		});
+	}
+
+	it("bounds retained inspection failures and counts duplicate and excess occurrences", () => {
+		const ledger = new ObservationLedger();
+		for (let index = 0; index < 1_000; index++)
+			ledger.noteFailure("errors", { id: "42" }, "read", `StaleRef: ${index % 20} ${"界".repeat(2_000)}`);
+		const failures = ledger.failures("errors");
+		expect(failures.total).toBe(1_000);
+		expect(failures.messages.length).toBeGreaterThan(0);
+		expect(failures.messages.length).toBeLessThanOrEqual(8);
+		expect(failures.omitted).toBe(1_000 - failures.messages.length);
+		expect(failures.messages.reduce((bytes, message) => bytes + Buffer.byteLength(message), 0)).toBeLessThanOrEqual(
+			REPORT_TREE_BUDGET_BYTES / 4,
+		);
+		for (const message of failures.messages) expect(Buffer.byteLength(message)).toBeLessThanOrEqual(1_024);
+	});
+
+	it("bounds repeated caught stale-read errors in a historical report and gives an omitted count", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		native.keyChord = async () => {
+			native.status = "A state";
+		};
+		native.typeText = async () => {
+			native.status = "B state";
+		};
+		new ComputerWorkerCore(transport, () => native);
+		await readCell(transport, "read");
+		await runWorker(
+			transport,
+			"bounded-a",
+			'await (await desktop.window("42")).press("shift")',
+			false,
+			10_000,
+			"bounded-a",
+		);
+		await runWorker(
+			transport,
+			"bounded-b",
+			'await (await desktop.window("42")).type("B")',
+			false,
+			10_000,
+			"bounded-b",
+		);
+		await settledPayload(transport, "bounded-b-settle", "", "bounded-b");
+		let errors = 0;
+		native.axNode = async () => {
+			throw new Error(`StaleRef: ${errors++ % 20} ${"界".repeat(2_000)}`);
+		};
+		await runWorker(
+			transport,
+			"bounded-a-errors",
+			'for (let index = 0; index < 400; index++) { try { await (await desktop.ref("e3")).value(); } catch {} }',
+			true,
+			10_000,
+			"bounded-a",
+		);
+		const text = String(await settleWorker(transport, "bounded-a-settle", "", "bounded-a"));
+		const failures = text.split("\n").filter(line => line.startsWith("Later call failed:"));
+		expect(failures.length).toBeGreaterThan(0);
+		expect(failures[0]).toContain("StaleRef:");
+		expect(failures.length).toBeLessThanOrEqual(8);
+		expect(text).toContain(`${400 - failures.length} later call failures omitted`);
+		expect(text).toContain('"A state"');
+		expect(text).not.toContain('"B state"');
+		expect(Buffer.byteLength(text)).toBeLessThanOrEqual(REPORT_TREE_BUDGET_BYTES);
+		expect(Buffer.byteLength(text.slice(text.indexOf("Later call failed:")))).toBeLessThanOrEqual(
+			REPORT_TREE_BUDGET_BYTES / 4,
+		);
+	});
+
+	it("keeps the queue live when freezing fails and when a multi-helper cell never settles", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+		expect(
+			(
+				await runWorker(
+					transport,
+					"failed-a",
+					'await (await desktop.window("42")).press("shift"); throw new Error("after input")',
+					false,
+					10_000,
+					"failed-a",
+				)
+			).ok,
+		).toBe(false);
+		native.axFails = true;
+		expect(
+			(
+				await runWorker(
+					transport,
+					"orphan-b-1",
+					'await (await desktop.window("42")).type("one")',
+					false,
+					10_000,
+					"orphan-b",
+				)
+			).ok,
+		).toBe(true);
+		native.axFails = false;
+		expect(
+			(
+				await runWorker(
+					transport,
+					"orphan-b-2",
+					'await (await desktop.window("42")).type("two")',
+					false,
+					10_000,
+					"orphan-b",
+				)
+			).ok,
+		).toBe(true);
+		// B's Eval code never settles; C still runs and can settle independently.
+		expect(
+			(
+				await runWorker(
+					transport,
+					"live-c",
+					'await (await desktop.window("42")).type("three")',
+					false,
+					10_000,
+					"live-c",
+				)
+			).ok,
+		).toBe(true);
+		const a = String(await settleWorker(transport, "failed-a-settle", "", "failed-a"));
+		expect(a).toContain("could not be read back through AX");
+		expect(a).toContain("Historical post-input snapshot");
+		transport.inbound({ type: "discard", cellId: "orphan-b" });
+		const c = String(await settleWorker(transport, "live-c-settle", "", "live-c"));
+		expect(c).toContain('after type "three"');
+		expect(c).not.toContain('type "one"');
+		expect(c).not.toContain('type "two"');
+	});
+
+	it("cancels a queued cell's hung snapshot without discarding the previous cell or blocking later work", async () => {
+		const transport = new MemoryTransport();
+		const native = new EditableWindowSession();
+		new ComputerWorkerCore(transport, () => native);
+		await runWorker(
+			transport,
+			"snapshot-a",
+			'await (await desktop.window("42")).press("shift")',
+			false,
+			10_000,
+			"snapshot-a",
+		);
+		const started = Promise.withResolvers<void>();
+		const original = native.axSnapshot.bind(native);
+		native.axSnapshot = async () => {
+			started.resolve();
+			return await new Promise<{ text: string }>(() => {});
+		};
+		const b = runWorker(
+			transport,
+			"snapshot-b",
+			'await (await desktop.window("42")).type("never")',
+			false,
+			10_000,
+			"snapshot-b",
+		);
+		await started.promise;
+		transport.inbound({ type: "discard", cellId: "snapshot-b" });
+		expect((await b).ok).toBe(false);
+		native.axSnapshot = original;
+		expect((await runWorker(transport, "snapshot-c", "return 42", true, 10_000, "snapshot-c")).ok).toBe(true);
+		expect(String(await settleWorker(transport, "snapshot-a-settle", "", "snapshot-a"))).toContain(
+			"after press shift",
+		);
+		expect(await settleWorker(transport, "snapshot-b-settle", "", "snapshot-b")).toBeUndefined();
 	});
 
 	it("answers every settle waiting behind an active cell instead of refusing the later ones", async () => {
@@ -6289,7 +7259,14 @@ describe("computer background fallback", () => {
 			},
 			{
 				code: 'await (await desktop.ref("e1")).perform(" Raise ")',
+				// Off macOS native is sent the name as given: UIA and AT-SPI match their own names.
 				call: "perform: Raise ",
+				route: "no raise is needed",
+			},
+			{
+				// Native runs any spelling of an element's action, so this one raises too.
+				code: 'await (await desktop.ref("e1")).perform("axraise")',
+				call: "perform:axraise",
 				route: "no raise is needed",
 			},
 			{
@@ -6485,8 +7462,9 @@ describe("computer background fallback", () => {
 					return { ...super.capabilities, backend: "quartz" };
 				}
 			}
-			// Native `action_name` runs exactly these two as AXOpen.
-			for (const action of ["AXOpen", "Open"]) {
+			// Native runs whichever of the element's actions matches with ASCII case folded, after
+			// trimming Unicode White_Space (U+0085 included), so every spelling of AXOpen is refused.
+			for (const action of ["AXOpen", "Open", "open", " Open ", "axopen", "AxOpen", "\u0085open", "open\u0085"]) {
 				const code = `await (await desktop.ref("e1")).perform(${JSON.stringify(action)})`;
 				const mac = new MacSession();
 				const refused = await run(mac, code, "refuse");
@@ -6499,17 +7477,25 @@ describe("computer background fallback", () => {
 				expect(refused.error.message, action).toContain("Use press() on a button that does the same");
 				expect(mac.calls, action).toEqual([]);
 
+				// Native is sent the spelling the refusal checked.
 				expect((await run(mac, code, "takeover")).ok, action).toBe(true);
-				expect(mac.calls, action).toEqual([`perform:${action}`]);
+				expect(mac.calls, action).toEqual(["perform:axopen"]);
 			}
 
-			// Other spellings reach native as other actions ("AXopen", "AX Open ").
+			// Names native runs as other actions still go through ("AX Open" names `AX Open`; U+FEFF is
+			// not White_Space, so native keeps it in the name).
 			const other = new MacSession();
-			const others = ['perform("open")', 'perform(" Open ")'].map(
-				call => `await (await desktop.ref("e1")).${call};`,
+			const otherActions = ["AX Open", "opener", "\ufeffopen", "open\ufeff"];
+			const others = otherActions.map(
+				action => `await (await desktop.ref("e1")).perform(${JSON.stringify(action)});`,
 			);
 			expect((await run(other, others.join("\n"), "refuse")).ok).toBe(true);
-			expect(other.calls).toEqual(["perform:open", "perform: Open "]);
+			expect(other.calls).toEqual([
+				"perform:ax open",
+				"perform:axopener",
+				"perform:ax\ufeffopen",
+				"perform:axopen\ufeff",
+			]);
 
 			const elsewhere = new ForegroundSession();
 			expect((await run(elsewhere, 'await (await desktop.ref("e1")).perform("AXOpen")', "refuse")).ok).toBe(true);
@@ -6540,27 +7526,37 @@ describe("computer background fallback", () => {
 			const menus: Array<{ code: string; call: string; named: string }> = [
 				{
 					code: `${el}.perform("AXShowMenu")`,
-					call: "perform:AXShowMenu",
+					call: "perform:axshowmenu",
 					named: 'perform("AXShowMenu") would open a context menu',
 				},
 				{
 					code: `${el}.perform(" showMenu ")`,
-					call: "perform: showMenu ",
+					call: "perform:axshowmenu",
 					named: 'perform(" showMenu ") would open a context menu',
 				},
 				{
 					code: `${el}.perform("show_menu")`,
-					call: "perform:show_menu",
+					call: "perform:axshowmenu",
 					named: 'perform("show_menu") would open a context menu',
 				},
 				{
+					code: `${el}.perform("axshowmenu")`,
+					call: "perform:axshowmenu",
+					named: 'perform("axshowmenu") would open a context menu',
+				},
+				{
+					code: `${el}.perform("AxShowMenu")`,
+					call: "perform:axshowmenu",
+					named: 'perform("AxShowMenu") would open a context menu',
+				},
+				{
 					code: `${el}.perform("AXShowMenu", { menu: ["Copy"] })`,
-					call: "perform:AXShowMenu",
+					call: "perform:axshowmenu",
 					named: "would open a context menu",
 				},
 				{
 					code: `${el}.perform("press", { menu: ["New Folder"] })`,
-					call: "perform:press",
+					call: "perform:axpress",
 					named: "perform with menu would open a menu",
 				},
 				{
@@ -6674,7 +7670,7 @@ describe("computer background fallback", () => {
 					"click:42:-",
 					"drag:42:-",
 					"perform:press",
-					"perform:AXIncrement",
+					"perform:axincrement",
 					"axClick:-",
 				]);
 
@@ -6751,14 +7747,20 @@ describe("computer background fallback", () => {
 					{
 						role: "AXPopUpButton",
 						code: `${el}.perform("AXPress")`,
-						call: "perform:AXPress",
+						call: "perform:axpress",
 						named: 'perform("AXPress") on an AXPopUpButton',
 					},
 					{
 						role: "AXMenuButton",
 						code: `${el}.perform(" Press ")`,
-						call: "perform: Press ",
+						call: "perform:axpress",
 						named: 'perform(" Press ") on an AXMenuButton',
+					},
+					{
+						role: "AXPopUpButton",
+						code: `${el}.perform("axpress")`,
+						call: "perform:axpress",
+						named: 'perform("axpress") on an AXPopUpButton',
 					},
 					{
 						role: "AXPopUpButton",
@@ -6808,13 +7810,13 @@ describe("computer background fallback", () => {
 						`${el}.click();`,
 					].join("\n");
 					expect((await run(button, code, "refuse")).ok).toBe(true);
-					expect(button.calls).toEqual(["perform:press", "perform:AXPress", "setValue:x", "axClick:true"]);
+					expect(button.calls).toEqual(["perform:press", "perform:axpress", "setValue:x", "axClick:true"]);
 
 					// A menu button's menu is a pull-down, so setValue and other actions do not open it.
 					const menuButton = new ControlSession("AXMenuButton");
 					const other = [`${el}.setValue("x");`, `${el}.perform("AXShowDefaultUI");`].join("\n");
 					expect((await run(menuButton, other, "refuse")).ok).toBe(true);
-					expect(menuButton.calls).toEqual(["setValue:x", "perform:AXShowDefaultUI"]);
+					expect(menuButton.calls).toEqual(["setValue:x", "perform:axshowdefaultui"]);
 
 					class ElsewhereSession extends ForegroundSession {
 						override async axNode(ref: string): Promise<AxNode> {

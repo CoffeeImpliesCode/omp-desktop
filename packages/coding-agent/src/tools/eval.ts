@@ -22,6 +22,7 @@ import type { ExecutorBackend, ExecutorBackendResult } from "../eval/backend";
 import { EVAL_TIMEOUT_PAUSE_OP, EVAL_TIMEOUT_RESUME_OP } from "../eval/bridge-timeout";
 import { IdleTimeout } from "../eval/idle-timeout";
 import {
+	type EvalPreludeCell,
 	type EvalPreludeDefinition,
 	type EvalPreludeSettleReply,
 	evalPreludeSummary,
@@ -198,10 +199,7 @@ export interface EvalToolDescriptionOptions {
 	/** Point blocked callers at the `wait` tool; false when the session lacks it (subagents). Default: true. */
 	waitTool?: boolean;
 	/** Enabled preludes; each becomes an `xd://eval/<name>` doc topic, inlined when it asks to be. */
-	preludes?: readonly Pick<
-		EvalPreludeDefinition,
-		"name" | "documentation" | "inlineDocumentation" | "documentationDelivery"
-	>[];
+	preludes?: readonly Pick<EvalPreludeDefinition, "name" | "documentation" | "inlineDocumentation">[];
 	/**
 	 * Inline every doc topic instead of linking `xd://eval/<topic>`. Required
 	 * when the session cannot `read` (the only transport for topic docs).
@@ -262,9 +260,8 @@ export function getEvalDocTopics(options: EvalToolDescriptionOptions = {}): Reco
 
 /** Model-facing eval description: core kernel surface plus one pointer per linked doc topic. */
 export function getEvalToolDescription(options: EvalToolDescriptionOptions = {}): string {
-	const preludes: { name: string; summary: string; delivery?: string }[] = [];
+	const preludes: { name: string; summary: string }[] = [];
 	const inlinePreludes: { name: string; documentation: string }[] = [];
-	let deliveredDocs = false;
 	for (const prelude of options.preludes ?? []) {
 		if (prelude.inlineDocumentation && !options.inlineTopics) {
 			const documentation = prelude.documentation.trim();
@@ -273,12 +270,10 @@ export function getEvalToolDescription(options: EvalToolDescriptionOptions = {})
 		}
 		const summary = evalPreludeSummary(prelude);
 		if (!summary) continue;
-		preludes.push({ name: prelude.name, summary, delivery: prelude.documentationDelivery });
-		if (prelude.documentationDelivery !== undefined) deliveredDocs = true;
+		preludes.push({ name: prelude.name, summary });
 	}
 	return prompt.render(evalDescription, {
 		...evalTemplateContext(options),
-		deliveredDocs,
 		preludes,
 		toolNames: options.toolNames,
 		inlinePreludes,
@@ -854,6 +849,8 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 			outputDumped = true;
 			return outputSummary;
 		};
+		const publications: { cell: EvalPreludeCell; preludes: Set<EvalPreludeDefinition>; published: boolean }[] = [];
+		let outputPublished = false;
 		try {
 			if (signal?.aborted) {
 				throw new ToolAbortError();
@@ -862,7 +859,6 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 
 			const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES * 2);
 			const images: ImageContent[] = [];
-			const callStatus: StatusEventLog = {};
 			const replies: string[] = [];
 
 			const cellResults: EvalCellResult[] = cells.map(cell => ({
@@ -894,10 +890,6 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				};
 				if (images.length > 0) {
 					details.images = images;
-				}
-				if (callStatus.statusEvents) {
-					details.statusEvents = callStatus.statusEvents;
-					details.statusEventsElided = callStatus.statusEventsElided;
 				}
 				if (replies.length > 0) {
 					details.replies = [...replies];
@@ -994,6 +986,9 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				// Prelude calls this cell makes carry `preludeCell`; each prelude may
 				// append what the cell left behind once it has settled.
 				const preludeCell = { signal: combinedSignal };
+				const cellPreludes = new Set(session.getEvalPreludes?.() ?? []);
+				const publication = { cell: preludeCell, preludes: cellPreludes, published: false };
+				publications.push(publication);
 				let result: ExecutorBackendResult;
 				try {
 					result = await runWithEvalPreludeCell(preludeCell, () =>
@@ -1039,11 +1034,15 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 					activeLiveCell = undefined;
 				}
 				const preludeReplies: string[] = [];
-				// Settle images join the cell's own displays, so they are noted alike.
-				const displayOutputs = result.displayOutputs;
-				if (!result.cancelled) {
+				const preludeImages: ImageContent[] = [];
+				// Replies remain provisional until every settle has finished without cancellation.
+				const displayOutputs = [...result.displayOutputs];
+				const settlingPreludes = getEnabledEvalPreludes(session.getEvalPreludes?.() ?? []);
+				for (const prelude of settlingPreludes) cellPreludes.add(prelude);
+				if (!result.cancelled && !combinedSignal.aborted) {
 					const failed = result.exitCode !== undefined && result.exitCode !== 0;
-					for (const prelude of getEnabledEvalPreludes(session.getEvalPreludes?.() ?? [])) {
+					for (const prelude of settlingPreludes) {
+						if (combinedSignal.aborted) break;
 						let reply: EvalPreludeSettleReply | undefined;
 						try {
 							reply = await prelude.settleCell?.(preludeCell, { failed, output: result.output });
@@ -1054,12 +1053,16 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 								error: error instanceof Error ? error.message : String(error),
 							});
 						}
+						if (combinedSignal.aborted) break;
 						if (reply?.text) preludeReplies.push(reply.text);
-						for (const image of reply?.images ?? []) displayOutputs.push(image);
+						preludeImages.push(...(reply?.images ?? []));
 					}
 				}
 				// Settling is part of the cell as the model sees it, including a cancellation that lands during it.
 				const cancelled = result.cancelled || combinedSignal.aborted;
+				if (cancelled) preludeReplies.length = 0;
+				else displayOutputs.push(...preludeImages);
+				publication.published = !cancelled;
 				const durationMs = Date.now() - startTime;
 
 				const cellStatus: StatusEventLog = {};
@@ -1107,7 +1110,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 									: undefined,
 							),
 						};
-						recordStatusEvent(callStatus, event);
+						// Kept on the cell only: a call-level copy doubled every persisted event.
 						recordStatusEvent(cellStatus, event);
 					}
 				}
@@ -1147,18 +1150,18 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 						language: languages[0],
 						languages,
 						cells: cellResults,
-						statusEvents: callStatus.statusEvents,
-						statusEventsElided: callStatus.statusEventsElided,
 						replies: replies.length > 0 ? replies : undefined,
 						isError: true,
 					};
 					if (notice) details.notice = notice;
 
-					return toolResult(details)
+					const response = toolResult(details)
 						.content([{ type: "text", text: notice ? `${notice}\n\n${outputText}` : outputText }, ...images])
 						.truncationFromSummary(summaryForMeta, { direction: "tail" })
 						.error()
 						.done();
+					outputPublished = true;
+					return response;
 				}
 
 				if (cell.environmentChange && cell.environment) {
@@ -1179,17 +1182,31 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				language: languages[0],
 				languages,
 				cells: cellResults,
-				statusEvents: callStatus.statusEvents,
-				statusEventsElided: callStatus.statusEventsElided,
 				replies: replies.length > 0 ? replies : undefined,
 			};
 			if (notice) details.notice = notice;
 
-			return toolResult(details)
+			const response = toolResult(details)
 				.content([{ type: "text", text: notice ? `${notice}\n\n${outputText}` : outputText }, ...images])
 				.truncationFromSummary(summaryForMeta, { direction: "tail" })
 				.done();
+			outputPublished = true;
+			return response;
 		} finally {
+			// Reports remain provisional through output formatting and final assembly.
+			// A hard backend/formatter failure must also release every cell listener.
+			for (const publication of publications) {
+				for (const prelude of publication.preludes) {
+					try {
+						prelude.finishCell?.(publication.cell, { published: outputPublished && publication.published });
+					} catch (error) {
+						logger.warn("Eval prelude finish failed", {
+							prelude: prelude.name,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
+			}
 			clearTimeout(updateTimer);
 			if (!outputDumped) {
 				try {

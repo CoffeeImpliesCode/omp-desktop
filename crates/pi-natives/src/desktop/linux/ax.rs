@@ -1,9 +1,12 @@
-use atspi::{CoordType, ObjectRefOwned, Role, State, proxy::accessible::ObjectRefExt};
+use atspi::{
+	CoordType, ObjectRefOwned, Role, State, proxy::accessible::ObjectRefExt, zbus::names::UniqueName,
+};
 use tokio::runtime::{Builder, Runtime};
 
 use crate::desktop::{
-	ax::{AxBounds, AxHandle, AxProps, normalize_role_atspi},
+	ax::{AxBounds, AxHandle, AxProps, normalize_role_atspi, text_readback, truncate_chars},
 	backend::AxBackend,
+	control,
 	error::{CoreResult, DesktopError},
 	types::DesktopWindow,
 };
@@ -77,14 +80,37 @@ pub fn resolve_focus(
 	}
 }
 
+/// Sensitivity controls interaction. `Enabled` describes application state;
+/// GTK controls can be fully interactive without reporting it.
+fn enabled_state(state: atspi::StateSet) -> bool {
+	state.contains(State::Sensitive)
+}
+
+/// Bounds AT-SPI service work without replaying a request after cancellation.
+fn wait_for_ax<T>(runtime: &Runtime, future: impl Future<Output = T>) -> CoreResult<T> {
+	let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+	if let Some(run_deadline) = control::current_token().and_then(|token| token.deadline()) {
+		deadline = deadline.min(run_deadline);
+	}
+	runtime.block_on(async {
+		control::cancellable(tokio::time::timeout_at(deadline.into(), future))
+			.await?
+			.map_err(|_| {
+				DesktopError::timeout(
+					"AT-SPI request exceeded its deadline; effects may be partial; inspect before \
+					 retrying",
+				)
+			})
+	})
+}
+
 impl AtSpiAx {
 	pub(crate) fn new() -> CoreResult<Self> {
 		let rt = Builder::new_current_thread()
 			.enable_all()
 			.build()
 			.map_err(|err| DesktopError::ax_failed(format!("AT-SPI runtime: {err}")))?;
-		let connection = rt
-			.block_on(atspi::AccessibilityConnection::new())
+		let connection = wait_for_ax(&rt, atspi::AccessibilityConnection::new())?
 			.map_err(|err| DesktopError::ax_failed(format!("AT-SPI connection: {err}")))?;
 		Ok(Self { rt, connection })
 	}
@@ -98,7 +124,7 @@ impl AtSpiAx {
 	}
 
 	pub(crate) fn windows(&self) -> CoreResult<Vec<AtSpiWindow>> {
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let mut windows = Vec::new();
 			for app in Self::apps(&self.connection)
 				.await
@@ -172,13 +198,13 @@ impl AtSpiAx {
 				}
 			}
 			Ok(windows)
-		})
+		})?
 	}
 
 	/// Whether the window's frame contains the keyboard-focused element. A
 	/// lookup that fails counts as not holding focus.
 	pub(crate) fn holds_focus(&self, window: &DesktopWindow) -> bool {
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let compositor = window
 				.id
 				.starts_with("niri:")
@@ -199,6 +225,7 @@ impl AtSpiAx {
 			}
 			false
 		})
+		.unwrap_or(false)
 	}
 
 	async fn apps(
@@ -447,6 +474,108 @@ impl AtSpiAx {
 fn atspi_window_id(frame: &ObjectRefOwned) -> String {
 	let name = frame.name().map_or_default(ToString::to_string);
 	format!("atspi:{name}:{}", frame.path())
+}
+
+/// Replaces an element's text and reads it back: Gecko (Firefox, Thunderbird)
+/// accepts the write and keeps the old text. A field that hides its text reads
+/// back one mask character per character, whatever its role (a GTK4 entry
+/// with visibility off is a plain `Text`), so there the length is the check.
+/// Where the old text already showed that mask, a write the field ignored
+/// reads back the same, so the field must first read back empty after a
+/// clear. A hidden field's text never enters an error.
+async fn write_text(
+	connection: &atspi::zbus::Connection,
+	accessible: &atspi::proxy::accessible::AccessibleProxy<'_>,
+	name: &UniqueName<'static>,
+	object: &ObjectRefOwned,
+	value: &str,
+) -> CoreResult<()> {
+	let editable = atspi::proxy::editable_text::EditableTextProxy::builder(connection)
+		.destination(name.clone())
+		.and_then(|b| b.path(object.path().clone()))
+		.map_err(|err| DesktopError::ax_failed(err.to_string()))?
+		.build()
+		.await
+		.map_err(|err| DesktopError::ax_failed(format!("AT-SPI editable text: {err}")))?;
+	let read = async || text_contents(connection, name, object).await.ok();
+	let replace = async |text: &str| {
+		if !editable
+			.set_text_contents(text)
+			.await
+			.map_err(|err| DesktopError::ax_failed(format!("AT-SPI text value: {err}")))?
+		{
+			return Err(DesktopError::ax_failed("AT-SPI text value was rejected"));
+		}
+		CoreResult::Ok(read().await)
+	};
+	let old = read().await;
+	let actual = replace(value).await?;
+	if actual.as_deref() == Some(value) {
+		return Ok(());
+	}
+	if actual.as_deref().is_some_and(|actual| masks(actual, value)) {
+		if !old.as_deref().is_none_or(|old| masks(old, value)) {
+			return Ok(());
+		}
+		if replace("").await?.as_deref() != Some("") {
+			return text_readback(value, value, None, true);
+		}
+		let emptied = |mut error: DesktopError| {
+			error
+				.message
+				.push_str(". setValue emptied the field before this write, so it may now be empty");
+			error
+		};
+		let rewritten = replace(value).await.map_err(emptied)?;
+		if rewritten
+			.as_deref()
+			.is_some_and(|actual| masks(actual, value))
+		{
+			return Ok(());
+		}
+		return text_readback(value, value, None, true).map_err(emptied);
+	}
+	// A role that cannot be read counts as a password field's, so no password
+	// enters an error.
+	let secure = actual.as_deref().is_some_and(masked)
+		|| accessible
+			.get_role()
+			.await
+			.ok()
+			.is_none_or(|role| role == Role::PasswordText);
+	text_readback(value, value, actual.as_deref(), secure)
+}
+
+/// Whether `actual` is one repeated mask character: one of GTK's, or the `*`
+/// toolkits fall back on.
+fn masked(actual: &str) -> bool {
+	let mut chars = actual.chars();
+	chars.next().is_some_and(|first| {
+		['●', '•', '✱', '✺', '*'].contains(&first) && chars.all(|char| char == first)
+	})
+}
+
+/// Whether `actual` masks `value`: one mask character per character, or per
+/// UTF-16 unit as Qt masks.
+fn masks(actual: &str, value: &str) -> bool {
+	let shown = actual.chars().count();
+	masked(actual) && (shown == value.chars().count() || shown == value.encode_utf16().count())
+}
+
+/// The whole text of an element with the `Text` interface.
+async fn text_contents(
+	connection: &atspi::zbus::Connection,
+	name: &UniqueName<'static>,
+	object: &ObjectRefOwned,
+) -> atspi::zbus::Result<String> {
+	let text = atspi::proxy::text::TextProxy::builder(connection)
+		.destination(name.clone())?
+		.path(object.path().clone())?
+		.cache_properties(atspi::zbus::proxy::CacheProperties::No)
+		.build()
+		.await?;
+	let count = text.character_count().await?;
+	text.get_text(0, count).await
 }
 
 /// Generations from `client` up to its ancestor `owner`, if `owner` is one.
@@ -720,7 +849,7 @@ impl AxBackend for AtSpiAx {
 			.starts_with("niri:")
 			.then(super::wayland::compositor_pid)
 			.flatten();
-		let result = self.rt.block_on(async {
+		let result = wait_for_ax(&self.rt, async {
 			let (app, owner) = Self::app_for_window(&self.connection, win, compositor).await?;
 			let frames = Self::frames(&self.connection, &app).await?;
 			let mut named = Vec::new();
@@ -740,7 +869,7 @@ impl AxBackend for AtSpiAx {
 				named.push((frame, name));
 			}
 			Ok(FrameCandidates { owner, frames: named })
-		});
+		})?;
 		result
 			.and_then(|candidates| {
 				let sole_window = |owner: u32| {
@@ -765,7 +894,7 @@ impl AxBackend for AtSpiAx {
 			.any(|window| window.id.starts_with("niri:"))
 			.then(super::wayland::compositor_pid)
 			.flatten();
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let connection = self.connection.connection();
 			let object = Self::top_level(connection, object).await?;
 			let id = atspi_window_id(&object);
@@ -806,23 +935,17 @@ impl AxBackend for AtSpiAx {
 					.ok_or_else(|| DesktopError::window_not_found("AT-SPI owner is gone"))?;
 				if window.position_known == Some(false) {
 					return Err(DesktopError::invalid_coordinate_frame(
-						"window has no known global origin; use an accessibility action or \
-						 desktop screenshot coordinates",
+						"window has no known global origin; use an accessibility action or desktop \
+						 screenshot coordinates",
 					));
 				}
-				let component =
-					Self::component(&self.connection, &object)
-						.await
-						.map_err(|err| {
-							DesktopError::ax_failed(format!("AT-SPI window component: {err}"))
-						})?;
-				let (x, y, ..) =
-					component
-						.get_extents(CoordType::Screen)
-						.await
-						.map_err(|err| {
-							DesktopError::ax_failed(format!("AT-SPI window origin: {err}"))
-						})?;
+				let component = Self::component(&self.connection, &object)
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window component: {err}")))?;
+				let (x, y, ..) = component
+					.get_extents(CoordType::Screen)
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window origin: {err}")))?;
 				if (x, y) != (window.x, window.y) {
 					return Err(DesktopError::invalid_coordinate_frame(
 						"AT-SPI coordinates do not match the compositor's window origin; use an \
@@ -831,12 +954,12 @@ impl AxBackend for AtSpiAx {
 				}
 			}
 			Ok(id)
-		})
+		})?
 	}
 
 	fn props(&mut self, h: &AxHandle) -> CoreResult<AxProps> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let proxy = object
 				.as_accessible_proxy(self.connection.connection())
 				.await
@@ -896,9 +1019,7 @@ impl AxBackend for AtSpiAx {
 				title,
 				value,
 				description,
-				enabled: state
-					.as_ref()
-					.is_some_and(|states| states.contains(State::Enabled)),
+				enabled: state.as_ref().is_some_and(|states| enabled_state(*states)),
 				focused: state
 					.as_ref()
 					.is_some_and(|states| states.contains(State::Focused)),
@@ -907,13 +1028,15 @@ impl AxBackend for AtSpiAx {
 				child_count,
 				identity: None,
 				partial: false,
+				selected: false,
+				role_name: None,
 			})
-		})
+		})?
 	}
 
 	fn children(&mut self, h: &AxHandle) -> CoreResult<Vec<AxHandle>> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let proxy = object
 				.as_accessible_proxy(self.connection.connection())
 				.await
@@ -929,12 +1052,12 @@ impl AxBackend for AtSpiAx {
 						.collect()
 				})
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI children: {err}")))
-		})
+		})?
 	}
 
 	fn parent(&mut self, h: &AxHandle) -> CoreResult<Option<AxHandle>> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let proxy = object
 				.as_accessible_proxy(self.connection.connection())
 				.await
@@ -944,12 +1067,12 @@ impl AxBackend for AtSpiAx {
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI parent: {err}")))?;
 			Ok((!parent.is_null()).then_some(AxHandle::AtSpi(parent)))
-		})
+		})?
 	}
 
 	fn perform(&mut self, h: &AxHandle, action: &str) -> CoreResult<()> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let proxy = Self::action(self.connection.connection(), &object)
 				.await
 				.map_err(DesktopError::ax_failed)?;
@@ -963,12 +1086,12 @@ impl AxBackend for AtSpiAx {
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI action: {err}")))?
 				.ok_or_else(|| DesktopError::ax_failed(format!("AT-SPI action '{action}' failed")))
-		})
+		})?
 	}
 
 	fn set_value(&mut self, h: &AxHandle, value: &str) -> CoreResult<()> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let name = object
 				.name()
 				.ok_or_else(|| DesktopError::ax_failed("AT-SPI object has no bus name"))?
@@ -982,21 +1105,8 @@ impl AxBackend for AtSpiAx {
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI interfaces: {err}")))?;
 			if interfaces.contains(atspi::Interface::EditableText) {
-				let editable = atspi::proxy::editable_text::EditableTextProxy::builder(
-					self.connection.connection(),
-				)
-				.destination(name.clone())
-				.and_then(|b| b.path(object.path().clone()))
-				.map_err(|err| DesktopError::ax_failed(err.to_string()))?
-				.build()
-				.await;
-				let editable = editable
-					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI editable text: {err}")))?;
-				return editable
-					.set_text_contents(value)
-					.await
-					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI text value: {err}")))?
-					.ok_or_else(|| DesktopError::ax_failed("AT-SPI text value was rejected"));
+				return write_text(self.connection.connection(), &accessible, &name, &object, value)
+					.await;
 			}
 			if !interfaces.contains(atspi::Interface::Value) {
 				return Err(DesktopError::ax_failed("AT-SPI element has no writable value interface"));
@@ -1018,12 +1128,12 @@ impl AxBackend for AtSpiAx {
 				.set_current_value(numeric)
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI value: {err}")))
-		})
+		})?
 	}
 
 	fn focus(&mut self, h: &AxHandle) -> CoreResult<()> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let component = Self::component(&self.connection, &object)
 				.await
 				.map_err(DesktopError::ax_failed)?;
@@ -1032,13 +1142,13 @@ impl AxBackend for AtSpiAx {
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI focus: {err}")))?
 				.ok_or_else(|| DesktopError::ax_failed("AT-SPI focus request was rejected"))
-		})
+		})?
 	}
 
 	fn element_at(&mut self, x: f64, y: f64) -> CoreResult<Option<AxHandle>> {
 		let x = x.round() as i32;
 		let y = y.round() as i32;
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let mut root = None;
 			for app in Self::apps(&self.connection)
 				.await
@@ -1122,11 +1232,11 @@ impl AxBackend for AtSpiAx {
 				current = child;
 			}
 			Err(DesktopError::ax_failed("AT-SPI hit-test hierarchy exceeds the depth limit"))
-		})
+		})?
 	}
 
 	fn focused_element(&mut self) -> CoreResult<Option<AxHandle>> {
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			for app in Self::apps(&self.connection)
 				.await
 				.map_err(DesktopError::ax_failed)?
@@ -1139,12 +1249,12 @@ impl AxBackend for AtSpiAx {
 				}
 			}
 			Ok(None)
-		})
+		})?
 	}
 
 	fn attributes(&mut self, h: &AxHandle) -> CoreResult<Vec<(String, String)>> {
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let proxy = object
 				.as_accessible_proxy(self.connection.connection())
 				.await
@@ -1154,14 +1264,11 @@ impl AxBackend for AtSpiAx {
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI attributes: {err}")))?
 				.into_iter()
-				.map(|(key, mut value)| {
-					value.truncate(200);
-					(key, value)
-				})
+				.map(|(key, value)| (key, truncate_chars(value, 200)))
 				.collect();
 			attrs.sort_by(|a, b| a.0.cmp(&b.0));
 			Ok(attrs)
-		})
+		})?
 	}
 }
 
@@ -1185,7 +1292,7 @@ impl AtSpiAx {
 			DesktopError::ax_failed(format!("AT-SPI focus state: {error}"))
 		}
 		let object = Self::object(h).clone();
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let connection = self.connection.connection();
 			let proxy = object
 				.as_accessible_proxy(connection)
@@ -1215,13 +1322,110 @@ impl AtSpiAx {
 			.await;
 			let (toolkit, version) = toolkit.unwrap_or_default();
 			Ok(ElementFocus { focused, toolkit, version })
-		})
+		})?
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn an_unanswered_ax_method_obeys_cancellation_and_deadlines_without_poisoning_the_connection() {
+		use std::{
+			sync::{
+				Arc,
+				atomic::{AtomicUsize, Ordering},
+			},
+			time::{Duration, Instant},
+		};
+
+		use atspi::zbus::{connection::Builder as ConnectionBuilder, interface};
+
+		use crate::desktop::error::ErrorCode;
+
+		struct Node {
+			source: control::CancellationSource,
+			cancel: bool,
+			calls:  Arc<AtomicUsize>,
+		}
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl Node {
+			async fn get_role(&self) -> u32 {
+				if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+					if self.cancel {
+						self.source.cancel();
+					}
+					// The watchdog reply makes the pre-fix test finish instead of
+					// hanging.
+					tokio::time::sleep(Duration::from_millis(150)).await;
+				}
+				Role::Button as u32
+			}
+		}
+		for cancel in [true, false] {
+			let rt = Builder::new_current_thread().enable_all().build().unwrap();
+			let source = control::CancellationSource::default();
+			let calls = Arc::new(AtomicUsize::new(0));
+			let (server, client) = rt.block_on(async {
+				let (client, server) = tokio::net::UnixStream::pair().unwrap();
+				let server = ConnectionBuilder::unix_stream(server)
+					.server(atspi::zbus::Guid::generate())
+					.unwrap()
+					.p2p()
+					.serve_at("/button", Node {
+						source: source.clone(),
+						cancel,
+						calls: Arc::clone(&calls),
+					})
+					.unwrap()
+					.build();
+				let client = ConnectionBuilder::unix_stream(client).p2p().build();
+				tokio::try_join!(server, client).unwrap()
+			});
+			let read = || async {
+				let object = ObjectRefOwned::from_static_str_unchecked(":1.7", "/button");
+				object
+					.as_accessible_proxy(&client)
+					.await
+					.unwrap()
+					.get_role()
+					.await
+			};
+			let token = source.token();
+			if !cancel {
+				source.set_deadline(Some(Instant::now() + Duration::from_millis(50)));
+			}
+			let result = control::with_token_for_test(&token, || wait_for_ax(&rt, read()));
+			source.set_deadline(None);
+			let recovered = control::with_token_for_test(&source.token(), || wait_for_ax(&rt, read()));
+			drop(server);
+			assert_eq!(
+				result.err().map(|error| error.code),
+				Some(if cancel {
+					ErrorCode::Cancelled
+				} else {
+					ErrorCode::Timeout
+				})
+			);
+			assert_eq!(recovered.unwrap().unwrap(), Role::Button);
+			assert_eq!(calls.load(Ordering::Acquire), 2, "cancellation must not replay a read");
+		}
+	}
+
+	#[test]
+	fn gtk_sensitive_text_controls_are_not_reported_disabled() {
+		// GetState from a live GTK entry: Editable, Focusable, Focused and
+		// Sensitive are set, but Enabled is not.
+		let state = atspi::StateSet::from_bits(1_124_079_744 | (1024_u64 << 32)).unwrap();
+		assert!(enabled_state(state), "an editable GTK control must not be shown as disabled");
+	}
+
+	#[test]
+	fn application_enabled_state_does_not_enable_insensitive_controls() {
+		let state = atspi::StateSet::new(State::Enabled | State::Focused);
+		assert!(!enabled_state(state), "an insensitive control cannot accept user interaction");
+	}
 
 	#[test]
 	fn generic_press_never_selects_an_unrelated_editing_action() {
@@ -1244,6 +1448,210 @@ mod tests {
 			width:          100,
 			height:         100,
 			focused:        false,
+		}
+	}
+
+	#[test]
+	fn a_text_write_the_app_ignores_fails() {
+		use std::sync::{Arc, Mutex};
+
+		use atspi::zbus::{connection::Builder as ConnectionBuilder, interface};
+
+		/// Which writes a field applies: all (GTK, Qt, `LibreOffice`), none while
+		/// answering true (Gecko), or the first two and then it refuses.
+		#[derive(Clone, Copy)]
+		enum Writes {
+			All,
+			Ignored,
+			TwoThenRefused,
+		}
+
+		/// `org.a11y.atspi.EditableText`, counting the writes it gets.
+		struct Editable {
+			text:   Arc<Mutex<String>>,
+			writes: Writes,
+			count:  Arc<Mutex<usize>>,
+		}
+
+		#[interface(name = "org.a11y.atspi.EditableText")]
+		impl Editable {
+			fn set_text_contents(&self, new_contents: String) -> bool {
+				let mut count = self.count.lock().unwrap();
+				*count += 1;
+				let applies = match self.writes {
+					Writes::All => true,
+					Writes::Ignored => false,
+					Writes::TwoThenRefused if *count > 2 => return false,
+					Writes::TwoThenRefused => true,
+				};
+				if applies {
+					*self.text.lock().unwrap() = new_contents;
+				}
+				true
+			}
+		}
+
+		/// How a field shows its text: as is, or one `●` per character (GTK,
+		/// Gecko) or per UTF-16 unit (Qt).
+		#[derive(Clone, Copy)]
+		enum Shown {
+			Plain,
+			PerChar,
+			PerUtf16,
+		}
+
+		fn shown(text: &str, shown: Shown) -> String {
+			match shown {
+				Shown::Plain => text.to_owned(),
+				Shown::PerChar => "●".repeat(text.chars().count()),
+				Shown::PerUtf16 => "●".repeat(text.encode_utf16().count()),
+			}
+		}
+
+		/// `org.a11y.atspi.Text`, reading what the field shows.
+		struct Text {
+			text:  Arc<Mutex<String>>,
+			shown: Shown,
+		}
+
+		#[interface(name = "org.a11y.atspi.Text")]
+		impl Text {
+			#[zbus(property)]
+			fn character_count(&self) -> i32 {
+				shown(&self.text.lock().unwrap(), self.shown)
+					.chars()
+					.count() as i32
+			}
+
+			fn get_text(&self, start_offset: i32, end_offset: i32) -> String {
+				shown(&self.text.lock().unwrap(), self.shown)
+					.chars()
+					.skip(start_offset as usize)
+					.take((end_offset - start_offset) as usize)
+					.collect()
+			}
+		}
+
+		struct Accessible(Role);
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl Accessible {
+			fn get_role(&self) -> u32 {
+				self.0 as u32
+			}
+		}
+
+		/// An error naming what the field reads, one that names no text, or one
+		/// saying the field was emptied.
+		enum Verdict {
+			Ok,
+			Reads(&'static str),
+			Hidden,
+			Emptied,
+		}
+
+		const PEER: &str = ":1.7";
+		// Path, which writes the field applies, role (`None`: unreadable), how it
+		// shows its text (`None`: no `Text`), its old text, the verdict, and how
+		// many writes it gets.
+		type Case = (&'static str, Writes, Option<Role>, Option<Shown>, &'static str, Verdict, usize);
+		let password = Some(Role::PasswordText);
+		let masked = Some(Shown::PerChar);
+		// As many characters as "new ä€😀", so it shows the same mask.
+		let same_length = "abcdefg";
+		let cases: [Case; 12] = [
+			("/gtk", Writes::All, Some(Role::Entry), Some(Shown::Plain), "old", Verdict::Ok, 1),
+			(
+				"/gecko",
+				Writes::Ignored,
+				Some(Role::Entry),
+				Some(Shown::Plain),
+				"old",
+				Verdict::Reads(r#"the field now reads "old""#),
+				1,
+			),
+			// The mask changed length, so one write is proof.
+			("/gtk_password", Writes::All, password, masked, "old", Verdict::Ok, 1),
+			("/gecko_password", Writes::Ignored, password, masked, "old", Verdict::Hidden, 1),
+			// The old text shows the same mask: the field must clear first.
+			("/gtk_password_same_length", Writes::All, password, masked, same_length, Verdict::Ok, 3),
+			(
+				"/gecko_password_same_length",
+				Writes::Ignored,
+				password,
+				masked,
+				same_length,
+				Verdict::Hidden,
+				2,
+			),
+			(
+				"/refused_after_clear",
+				Writes::TwoThenRefused,
+				password,
+				masked,
+				same_length,
+				Verdict::Emptied,
+				3,
+			),
+			("/qt_password", Writes::All, password, Some(Shown::PerUtf16), "old", Verdict::Ok, 1),
+			// A GTK4 entry with visibility off and no password purpose.
+			("/gtk4_hidden", Writes::All, Some(Role::Text), masked, "old", Verdict::Ok, 1),
+			(
+				"/gtk4_hidden_ignored",
+				Writes::Ignored,
+				Some(Role::Text),
+				masked,
+				"old",
+				Verdict::Hidden,
+				1,
+			),
+			("/no_role", Writes::Ignored, None, Some(Shown::Plain), "old", Verdict::Hidden, 1),
+			("/no_text", Writes::All, password, None, "old", Verdict::Hidden, 1),
+		];
+		let counts: Vec<_> = cases.iter().map(|_| Arc::new(Mutex::new(0))).collect();
+		let rt = Builder::new_current_thread().enable_all().build().unwrap();
+		let results = rt.block_on(async {
+			let (client, server) = tokio::net::UnixStream::pair().unwrap();
+			let mut builder = ConnectionBuilder::unix_stream(server)
+				.server(atspi::zbus::Guid::generate())
+				.unwrap()
+				.p2p();
+			for (&(path, writes, role, shown, old, ..), count) in cases.iter().zip(&counts) {
+				let text = Arc::new(Mutex::new(old.to_owned()));
+				let count = count.clone();
+				builder = builder
+					.serve_at(path, Editable { text: text.clone(), writes, count })
+					.unwrap();
+				if let Some(shown) = shown {
+					builder = builder.serve_at(path, Text { text, shown }).unwrap();
+				}
+				if let Some(role) = role {
+					builder = builder.serve_at(path, Accessible(role)).unwrap();
+				}
+			}
+			let client = ConnectionBuilder::unix_stream(client).p2p().build();
+			let (server, client) = tokio::try_join!(builder.build(), client).unwrap();
+			let mut results = Vec::new();
+			for &(path, ..) in &cases {
+				let object = ObjectRefOwned::from_static_str_unchecked(PEER, path);
+				let name = object.name().unwrap().clone();
+				let accessible = object.as_accessible_proxy(&client).await.unwrap();
+				results.push(write_text(&client, &accessible, &name, &object, "new ä€😀").await);
+			}
+			drop(server);
+			results
+		});
+		for (((path, .., verdict, writes), result), count) in cases.iter().zip(results).zip(&counts) {
+			assert_eq!(*count.lock().unwrap(), *writes, "{path}: writes");
+			match (verdict, result) {
+				(Verdict::Ok, Ok(())) => {},
+				(Verdict::Reads(text), Err(err)) if err.message.contains(text) => {},
+				(Verdict::Hidden, Err(err))
+					if err.message.contains("secure") && !err.message.contains("new") => {},
+				(Verdict::Emptied, Err(err))
+					if err.message.contains("emptied") && !err.message.contains("new") => {},
+				(_, result) => panic!("{path}: {result:?}"),
+			}
 		}
 	}
 
@@ -1364,6 +1772,7 @@ mod tests {
 				width: 100,
 				height: 100,
 				focused,
+				position_known: Some(false),
 			},
 			position_known: false,
 		};
@@ -1525,7 +1934,8 @@ mod tests {
 			let (client, server) = tokio::net::UnixStream::pair().unwrap();
 			let root = Node {
 				state:    vec![0, 0],
-				// Chromium frames report children that are all the AT-SPI null object.
+				// Chromium frames report children that are all the AT-SPI null
+				// object.
 				children: vec![
 					(PEER.to_owned(), path("/org/a11y/atspi/null")),
 					(PEER.to_owned(), path("/focus")),

@@ -131,6 +131,7 @@ impl FrameGeometry {
 		}
 	}
 
+	#[cfg(any(test, all(target_os = "linux", feature = "wayland-pipewire")))]
 	/// A window frame the compositor rendered from the window's own buffer,
 	/// independent of any monitor stream.
 	pub(crate) fn for_compositor_window(

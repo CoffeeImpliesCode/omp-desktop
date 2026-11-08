@@ -132,7 +132,6 @@ function makeRelayTab(
 		pending: new Map(),
 		kindTag: "relay",
 		ownsPage,
-		activateForScreenshot: false,
 		uploadDir: newUploadStagingDir(),
 		ownerSessionId: "session-relay-ownership",
 		persist: false,

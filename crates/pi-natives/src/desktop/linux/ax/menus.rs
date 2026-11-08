@@ -189,7 +189,7 @@ impl AtSpiAx {
 				items.push(DesktopMenuItem {
 					title,
 					path: item_path,
-					enabled: state.contains(State::Enabled) && state.contains(State::Sensitive),
+					enabled: enabled_state(state),
 					checked: state.contains(State::Checked),
 					has_submenu,
 					shortcut,
@@ -238,7 +238,7 @@ impl AtSpiAx {
 	) -> CoreResult<Vec<DesktopMenuItem>> {
 		let root = self.window_root(window)?;
 		let root = Self::object(&root);
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let (containers, canonical) = if path.is_empty() {
 				(self.menu_bars(root).await?, Vec::new())
 			} else {
@@ -252,13 +252,13 @@ impl AtSpiAx {
 				.menu_level(&containers, &canonical)
 				.await
 				.map(|(items, _)| items)
-		})
+		})?
 	}
 
 	pub(crate) fn menu_select(&mut self, window: &DesktopWindow, path: &[String]) -> CoreResult<()> {
 		let root = self.window_root(window)?;
 		let root = Self::object(&root).clone();
-		let (item, object) = self.rt.block_on(self.resolve_menu(&root, path))?;
+		let (item, object) = wait_for_ax(&self.rt, self.resolve_menu(&root, path))??;
 		require_command(&item)?;
 		// Recheck the resolver and ancestor chain after discovery, before
 		// dispatch.
@@ -269,7 +269,7 @@ impl AtSpiAx {
 		if self.window_id(&handle, std::slice::from_ref(window))? != window.id {
 			return Err(failure("command no longer belongs to the target frame"));
 		}
-		self.rt.block_on(async {
+		wait_for_ax(&self.rt, async {
 			let (current, current_object) = self.resolve_menu(&root, path).await?;
 			require_command(&current)?;
 			if current_object != object {
@@ -285,6 +285,6 @@ impl AtSpiAx {
 				return Err(failure("application refused the menu command"));
 			}
 			Ok(())
-		})
+		})?
 	}
 }

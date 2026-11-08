@@ -374,23 +374,26 @@ export function waitForRun(
 	return trackBrowserRunPromise(promise);
 }
 
-/** Binds a long-lived scope facade (page/tab/desktop objects) to one evaluated run's abort signal. */
+/**
+ * Observes facade promises, optionally binding access to one run's abort signal.
+ * Long-lived handles omit the signal and enforce their current run context themselves.
+ */
 export function bindRunFacade<T extends object>(
 	target: T,
-	signal: AbortSignal,
+	signal: AbortSignal | undefined,
 	rejectionOwner?: object,
 	onFloatingRejection?: FloatingRejectionHandler,
 ): T {
 	const cache = new Map<PropertyKey, unknown>();
 	return new Proxy(target, {
 		get(current, prop) {
-			throwIfAborted(signal);
+			if (signal) throwIfAborted(signal);
 			const cached = cache.get(prop);
 			if (cached) return cached;
 			const value = Reflect.get(current, prop, current);
 			if (typeof value === "function") {
 				const wrapped = (...args: unknown[]): unknown => {
-					throwIfAborted(signal);
+					if (signal) throwIfAborted(signal);
 					const result = Reflect.apply(value, current, args);
 					if (result && typeof result === "object") {
 						const then = Reflect.get(result, "then");
@@ -399,7 +402,7 @@ export function bindRunFacade<T extends object>(
 							const settle = (): Promise<unknown> => {
 								settled ??= trackBrowserRunPromise(
 									Promise.resolve(result).then(resolved => {
-										throwIfAborted(signal);
+										if (signal) throwIfAborted(signal);
 										return resolved;
 									}),
 									rejectionOwner,
@@ -424,7 +427,7 @@ export function bindRunFacade<T extends object>(
 							return tracked;
 						}
 					}
-					throwIfAborted(signal);
+					if (signal) throwIfAborted(signal);
 					return result;
 				};
 				cache.set(prop, wrapped);

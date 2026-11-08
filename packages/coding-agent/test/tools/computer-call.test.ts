@@ -93,6 +93,7 @@ describe("isReadOnlyComputerCall", () => {
 		expect(isReadOnlyComputerCall([{ method: "clipboard.read", args: [] }])).toBe(true);
 		expect(isReadOnlyComputerCall(windowCall("ax"))).toBe(true);
 		expect(isReadOnlyComputerCall(windowCall("focus"))).toBe(false);
+		expect(isReadOnlyComputerCall(windowCall("raise"))).toBe(false);
 		expect(
 			isReadOnlyComputerCall([
 				{ method: "ref", args: ["e5"] },
@@ -144,8 +145,7 @@ describe("isReadOnlyComputerCall", () => {
 });
 
 describe("allowlist rejection", () => {
-	it("refuses the removed raise helper on every handle kind", () => {
-		expectRejection(() => renderComputerCall(windowCall("raise")), "raise", Object.keys(WINDOW_METHODS));
+	it("refuses activation on root and AX element handles", () => {
 		expectRejection(
 			() =>
 				renderComputerCall([
@@ -181,7 +181,6 @@ describe("allowlist rejection", () => {
 			Object.keys(ELEMENT_METHODS),
 		);
 		expect(() => isReadOnlyComputerCall([{ method: "launch", args: [] }])).toThrow();
-		expect(() => isReadOnlyComputerCall(windowCall("raise"))).toThrow();
 	});
 
 	it("refuses empty, over-long, and non-handle-rooted chains", () => {

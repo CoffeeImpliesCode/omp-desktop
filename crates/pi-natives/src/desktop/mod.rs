@@ -30,7 +30,7 @@ use std::{
 };
 
 pub use applications::{Application, ApplicationOpenOptions, ApplicationQuery, OpenedApplication};
-use ax::{AxRegistry, register_node};
+use ax::{AppFocus, AxRegistry, register_node};
 use backend::{
 	Backend, ClickOptions, DeliveryMode, DisplayAwakeHold, ElementDelivery, ElementInput,
 	KeyboardFocus, MouseButton, PointerEvent, is_raise_action,
@@ -175,8 +175,26 @@ enum Response {
 type Reply = flume::Sender<CoreResult<Response>>;
 
 struct QueuedRequest {
-	request: Request,
-	token:   OperationToken,
+	request:  Request,
+	token:    OperationToken,
+	_pending: PendingRequest,
+}
+
+/// Counts queued or executing work until the worker releases the request,
+/// independently of how long its caller waits for a reply.
+struct PendingRequest(Arc<AtomicUsize>);
+
+impl PendingRequest {
+	fn new(counter: &Arc<AtomicUsize>) -> Self {
+		counter.fetch_add(1, Ordering::AcqRel);
+		Self(Arc::clone(counter))
+	}
+}
+
+impl Drop for PendingRequest {
+	fn drop(&mut self) {
+		self.0.fetch_sub(1, Ordering::AcqRel);
+	}
 }
 
 enum Request {
@@ -926,7 +944,7 @@ impl Worker {
 		self.frames.insert(target.key().to_string(), geometry);
 		// Refreshing here keeps the snapshot current for getter reads that
 		// land while a later operation holds the worker.
-		let capabilities = self.backend()?.capabilities();
+		let capabilities = self.live_capabilities()?;
 		*self.capabilities.lock() = Some(capabilities.clone());
 		Ok(DesktopCapture {
 			data: Uint8Array::from(png),
@@ -1050,7 +1068,7 @@ impl Worker {
 				Some(deadline) => rx.recv_deadline(deadline),
 				None => rx.recv().map_err(|_| flume::RecvTimeoutError::Disconnected),
 			};
-			let QueuedRequest { request, token } = match next {
+			let QueuedRequest { request, token, _pending } = match next {
 				Ok(queued) => queued,
 				Err(flume::RecvTimeoutError::Timeout) => {
 					self.display_awake.expire();
@@ -1504,6 +1522,14 @@ impl Worker {
 				};
 				let mode = options.mode();
 				let backend = self.backend()?;
+				// The selection comes first: it reads the front app before any
+				// probe of the target, so a target the user brings forward while
+				// the menu preflight's probes block is not taken as their front
+				// app. A press on text opens no menu; any other drag still meets
+				// the preflight before it is posted.
+				if let Some(selection) = backend.drag_selection(target, &event, mode, token)? {
+					return Ok(Response::TextSelection(selection));
+				}
 				refuse_menu_press(backend.as_mut(), options.refuse_menu, mode, target, &event)?;
 				backend.pointer(target, event, &frame, mode, token)?;
 				Ok(Response::Input(control::take_focus_return()))
@@ -1575,7 +1601,7 @@ impl Worker {
 							.map_err(|error| error.clone())?
 							.ax()
 							.ok_or_else(DesktopError::ax_unsupported)?;
-						Some(register_node(ax, registry, "desktop", h)?)
+						Some(register_node(ax, registry, "desktop", h, &mut AppFocus::default())?)
 					},
 					None => None,
 				};
@@ -1583,7 +1609,7 @@ impl Worker {
 			},
 			Request::AxNode { reference, .. } => {
 				let h = self.registry.resolve(reference)?;
-				let props = self.ax()?.props(&h)?;
+				let props = ax::node_props(self.ax()?, &h, &mut AppFocus::default())?;
 				Ok(Response::Node(Some(ax::node_to_napi(reference.clone(), props))))
 			},
 			Request::AxAttributes { reference, .. } => {
@@ -1605,6 +1631,7 @@ impl Worker {
 				let target = self.registry.target(reference)?;
 				let handles = self.ax()?.children(&h)?;
 				let mut nodes = Vec::with_capacity(handles.len());
+				let mut focus = AppFocus::default();
 				for h in handles {
 					let (backend, registry) = (&mut self.backend, &mut self.registry);
 					let ax = backend
@@ -1612,7 +1639,7 @@ impl Worker {
 						.map_err(|error| error.clone())?
 						.ax()
 						.ok_or_else(DesktopError::ax_unsupported)?;
-					nodes.push(register_node(ax, registry, &target, h)?);
+					nodes.push(register_node(ax, registry, &target, h, &mut focus)?);
 				}
 				Ok(Response::Nodes(nodes))
 			},
@@ -1628,7 +1655,7 @@ impl Worker {
 							.map_err(|error| error.clone())?
 							.ax()
 							.ok_or_else(DesktopError::ax_unsupported)?;
-						Some(register_node(ax, registry, &target, h)?)
+						Some(register_node(ax, registry, &target, h, &mut AppFocus::default())?)
 					},
 					None => None,
 				};
@@ -1636,12 +1663,17 @@ impl Worker {
 			},
 			Request::AxPerform { reference, action, menu, .. } => {
 				let h = self.registry.resolve(reference)?;
-				match menu {
-					Some(path) => self.ax()?.perform_menu(&h, action, path)?,
-					None if action.eq_ignore_ascii_case("press") => ax::ax_press(self.ax()?, &h)?,
-					None => self.ax()?.perform(&h, action)?,
+				let performed = match menu {
+					Some(path) => self.ax()?.perform_menu(&h, action, path),
+					None if action.eq_ignore_ascii_case("press") => ax::ax_press(self.ax()?, &h),
+					None => self.ax()?.perform(&h, action),
+				};
+				match performed {
+					Err(error) if error.code == ErrorCode::AxUnconfirmed => {
+						Err(self.name_unconfirmed_target(reference, &h, error))
+					},
+					performed => performed.map(|()| Response::Unit),
 				}
-				Ok(Response::Unit)
 			},
 			Request::AxSetValue { reference, value, .. } => {
 				let h = self.registry.resolve(reference)?;
@@ -1690,6 +1722,38 @@ impl Worker {
 }
 
 impl Worker {
+	/// `error`, an action on `reference` whose outcome is unconfirmed, naming
+	/// the window and app the element is in now, so the caller knows which one
+	/// to inspect. Only reads: nothing is sent again.
+	fn name_unconfirmed_target(
+		&mut self,
+		reference: &str,
+		handle: &ax::AxHandle,
+		error: DesktopError,
+	) -> DesktopError {
+		let windows = self
+			.backend()
+			.and_then(|backend| backend.windows())
+			.unwrap_or_default();
+		let window = self
+			.ax()
+			.and_then(|ax| ax.window_id(handle, &windows))
+			.ok()
+			.and_then(|id| windows.into_iter().find(|window| window.id == id));
+		let target = match window {
+			Some(window) => {
+				let mut target = format!("{reference} is in window {} of ", window.id);
+				ax::push_quoted_label(&mut target, &window.app);
+				target.push_str(" (");
+				ax::push_quoted_label(&mut target, &window.title);
+				target.push(')');
+				target
+			},
+			None => format!("{reference}'s window could not be identified"),
+		};
+		DesktopError::new(error.code, format!("{} ({target})", error.message))
+	}
+
 	/// The error for keys addressed to `reference` that were never sent
 	/// because the element did not take keyboard focus: where focus is now,
 	/// with the focused element's `ax()` line and a ref for it.
@@ -1781,8 +1845,9 @@ struct SessionCore {
 	lifecycle:         Mutex<Lifecycle>,
 	capabilities:      Arc<Mutex<Option<DesktopCapabilities>>>,
 	display_awake:     Arc<DisplayAwake>,
-	/// `call`s sent to the worker that have not returned yet.
-	in_flight:         AtomicUsize,
+	/// Requests still queued or executing, including those whose callers gave
+	/// up.
+	in_flight:         Arc<AtomicUsize>,
 	cancellation:      CancellationSource,
 	/// How long `call` waits for the worker's reply before giving up.
 	operation_timeout: Duration,
@@ -1807,7 +1872,7 @@ impl SessionCore {
 			}),
 			capabilities: Arc::default(),
 			display_awake: Arc::default(),
-			in_flight: AtomicUsize::new(0),
+			in_flight: Arc::default(),
 			cancellation: CancellationSource::counting_escapes(escape_stops),
 			operation_timeout,
 		})
@@ -1851,23 +1916,23 @@ impl SessionCore {
 		// capture frame that it did not receive.
 		let (txr, rxr) = flume::bounded(0);
 		let tx = self.ensure_started()?;
-		self.in_flight.fetch_add(1, Ordering::AcqRel);
 		let reply_by = Instant::now() + self.operation_timeout;
 		// Input waiting for the user (to pause on macOS, to answer a Wayland
 		// permission prompt) gives up before this caller does.
 		#[cfg(any(target_os = "macos", target_os = "linux"))]
 		let token = token.replying_by(reply_by);
-		let response = tx
-			.send(QueuedRequest { request: make(txr), token })
-			.map_err(|_| DesktopError::internal("native desktop worker stopped unexpectedly"))
-			.and_then(|()| {
-				rxr.recv_deadline(reply_by).map_err(|e| {
-					self.display_awake.cancel_and_release(&self.cancellation);
-					DesktopError::timeout(format!("native desktop operation did not complete: {e}"))
-				})
-			});
-		self.in_flight.fetch_sub(1, Ordering::AcqRel);
-		response?
+		tx.send(QueuedRequest {
+			request: make(txr),
+			token,
+			_pending: PendingRequest::new(&self.in_flight),
+		})
+		.map_err(|_| DesktopError::internal("native desktop worker stopped unexpectedly"))
+		.and_then(|()| {
+			rxr.recv_deadline(reply_by).map_err(|e| {
+				self.display_awake.cancel_and_release(&self.cancellation);
+				DesktopError::timeout(format!("native desktop operation did not complete: {e}"))
+			})
+		})?
 	}
 
 	fn close(&self) -> CoreResult<()> {
@@ -1881,8 +1946,9 @@ impl SessionCore {
 		};
 		let (rtx, rrx) = flume::bounded(1);
 		tx.send(QueuedRequest {
-			request: Request::Close { reply: rtx },
-			token:   self.cancellation.token(),
+			request:  Request::Close { reply: rtx },
+			token:    self.cancellation.token(),
+			_pending: PendingRequest::new(&self.in_flight),
 		})
 		.map_err(|_| DesktopError::closed())?;
 		let _ = rrx.recv_timeout(CLOSE_TIMEOUT).map_err(|e| {
@@ -1908,8 +1974,9 @@ impl Drop for SessionCore {
 		if let Some(tx) = lifecycle.tx.take() {
 			let (reply, _) = flume::bounded(1);
 			let _ = tx.send(QueuedRequest {
-				request: Request::Close { reply },
-				token:   self.cancellation.token(),
+				request:  Request::Close { reply },
+				token:    self.cancellation.token(),
+				_pending: PendingRequest::new(&self.in_flight),
 			});
 		}
 		let _ = lifecycle.join.take();
@@ -1960,6 +2027,15 @@ impl Drop for DesktopSession {
 }
 #[napi]
 impl DesktopSession {
+	/// Desktop contract version, read before constructing a session.
+	/// Version 1 requires structured drag results (`selection`, `focusReturn`)
+	/// and native window controls. Bump this and the JS adapter's expected
+	/// version together for incompatible desktop argument/result contracts.
+	#[napi]
+	pub const fn abi_version() -> u32 {
+		1
+	}
+
 	#[napi(constructor)]
 	pub fn new(options: Option<DesktopSessionOptions>) -> Result<Self> {
 		let options = options.unwrap_or_default();
@@ -1970,13 +2046,16 @@ impl DesktopSession {
 	/// Asks the worker when it is idle, so permissions are read live. While
 	/// another operation holds the worker, answers from the snapshot of the
 	/// latest capabilities read or capture instead of blocking the JS thread
-	/// behind it.
+	/// behind it. With no prior snapshot, reports temporary unavailability.
 	#[napi(getter)]
 	pub fn capabilities(&self) -> DesktopCapabilities {
-		if self.core.in_flight.load(Ordering::Acquire) > 0
-			&& let Some(snapshot) = self.core.capabilities.lock().clone()
-		{
-			return snapshot;
+		if self.core.in_flight.load(Ordering::Acquire) > 0 {
+			return self
+				.core
+				.capabilities
+				.lock()
+				.clone()
+				.unwrap_or_else(DesktopCapabilities::unavailable);
 		}
 		match self
 			.core
@@ -2335,13 +2414,17 @@ impl DesktopSession {
 		}))
 	}
 
+	/// Drags along `path`. A macOS background left drag across the text of one
+	/// native text element is made as that element's selection through
+	/// accessibility, with no mouse event, and resolves to the selection read
+	/// back; a drag posted as input resolves to where a takeover left focus.
 	#[napi]
 	pub fn drag(
 		&self,
 		target: String,
 		path: Vec<DesktopPoint>,
 		opts: Option<PointerOptions>,
-	) -> Result<task::Promise<Option<DesktopFocusReturn>>> {
+	) -> Result<task::Promise<DesktopDragResult>> {
 		let o = ParsedPointerOptions::parse(opts).map_err(napi::Error::from)?;
 		if o.menu.is_some() {
 			return Err(
@@ -2352,11 +2435,20 @@ impl DesktopSession {
 			);
 		}
 		let path = path.into_iter().map(|p| (p.x, p.y)).collect();
-		Ok(self.input("desktop.drag", move |reply| Request::Drag {
-			target: Target::parse(&target),
-			path,
-			options: o,
-			reply,
+		let target = Target::parse(&target);
+		let c = Arc::clone(&self.core);
+		let token = c.cancellation.token();
+		Ok(task::blocking("desktop.drag", (), move |_| {
+			match c.call(token, |reply| Request::Drag { target, path, options: o, reply })? {
+				Response::TextSelection(v) => {
+					Ok(DesktopDragResult { selection: Some(v), focus_return: None })
+				},
+				Response::Input(report) => {
+					Ok(DesktopDragResult { selection: None, focus_return: report })
+				},
+				_ => Err(DesktopError::internal("unexpected desktop worker response")),
+			}
+			.map_err(Into::into)
 		}))
 	}
 
@@ -2784,6 +2876,8 @@ mod capture_tests {
 		reads:             u32,
 		/// Runs as each press is delivered and as each probe asks.
 		on_call:           Option<Box<dyn Fn(Call) + Send>>,
+		/// A press is delivered and the app answers with an unrelated error.
+		unconfirmed:       bool,
 	}
 
 	#[derive(Clone, Copy, PartialEq, Eq)]
@@ -2854,6 +2948,8 @@ mod capture_tests {
 		input_lookups:          Arc<Mutex<u32>>,
 		/// Every click lands on a control whose menu would take the keyboard.
 		menu_control:           bool,
+		/// What a drag is made as instead of input; `None` posts it.
+		drag_selection:         Option<AxTextSelection>,
 	}
 
 	impl FakeWaylandBackend {
@@ -2913,6 +3009,7 @@ mod capture_tests {
 				name_lookups: Arc::new(Mutex::new(0)),
 				#[cfg(target_os = "macos")]
 				input_lookups: Arc::new(Mutex::new(0)),
+				drag_selection: None,
 			}
 		}
 
@@ -2974,6 +3071,8 @@ mod capture_tests {
 				}),
 				actions: Vec::new(),
 				child_count: 0,
+				selected: false,
+				role_name: None,
 			})
 		}
 
@@ -3012,6 +3111,13 @@ mod capture_tests {
 			tree.pressed.push(id);
 			if tree.stale_presses {
 				return Err(DesktopError::stale_ref("the element no longer exists"));
+			}
+			if tree.unconfirmed {
+				return Err(DesktopError::new(
+					ErrorCode::AxUnconfirmed,
+					"AX action 'AXPress' was requested, but its outcome could not be confirmed. It may \
+					 already have taken effect: observe the window before retrying",
+				));
 			}
 			let Some(copy) = tree.press_rebuilds_as else {
 				return Ok(());
@@ -3213,6 +3319,16 @@ mod capture_tests {
 			Ok(())
 		}
 
+		fn drag_selection(
+			&mut self,
+			_: &Target,
+			_: &PointerEvent,
+			_: DeliveryMode,
+			_: &OperationToken,
+		) -> CoreResult<Option<AxTextSelection>> {
+			Ok(self.drag_selection.clone())
+		}
+
 		fn pointer_menu(
 			&mut self,
 			target: &Target,
@@ -3403,7 +3519,8 @@ mod capture_tests {
 			.map_err(|error| error.clone())?
 			.ax()
 			.ok_or_else(DesktopError::ax_unsupported)?;
-		let reference = register_node(ax, registry, origin, AxHandle::Test(1))?.ref_;
+		let reference =
+			register_node(ax, registry, origin, AxHandle::Test(1), &mut AppFocus::default())?.ref_;
 		let (reply, _rx) = flume::bounded(1);
 		worker.process(
 			&Request::AxClick { reference, options: ParsedPointerOptions::parse(None)?, reply },
@@ -3414,8 +3531,9 @@ mod capture_tests {
 	fn send_and_wait(tx: &flume::Sender<QueuedRequest>, make: impl FnOnce(Reply) -> Request) {
 		let (reply, rx) = flume::bounded(1);
 		tx.send(QueuedRequest {
-			request: make(reply),
-			token:   CancellationSource::default().token(),
+			request:  make(reply),
+			token:    CancellationSource::default().token(),
+			_pending: PendingRequest::new(&Arc::default()),
 		})
 		.unwrap();
 		let _ = rx
@@ -3603,11 +3721,13 @@ mod capture_tests {
 			HUNG_CALL_TIMEOUT,
 		);
 		let display_awake = Arc::clone(&core.display_awake);
+		let capabilities = Arc::clone(&core.capabilities);
 		let (tx, rx) = flume::unbounded();
 		let (done_tx, done) = flume::bounded(1);
 		let join = thread::spawn(move || {
 			let mut worker = unlocked_worker(backend);
 			worker.display_awake = display_awake;
+			worker.capabilities = capabilities;
 			worker.serve(&rx, Duration::from_secs(3600));
 			let _ = done_tx.send(());
 		});
@@ -3627,8 +3747,9 @@ mod capture_tests {
 		let tx = core.lifecycle.lock().tx.clone().unwrap();
 		let (reply, pending) = flume::bounded(1);
 		tx.send(QueuedRequest {
-			request: Request::ListWindows { reply },
-			token:   core.cancellation.token(),
+			request:  Request::ListWindows { reply },
+			token:    core.cancellation.token(),
+			_pending: PendingRequest::new(&core.in_flight),
 		})
 		.unwrap();
 		(tx, pending)
@@ -3648,6 +3769,65 @@ mod capture_tests {
 		drop(unblock);
 		core.close().unwrap();
 		assert_eq!(*awake.lock(), [true, false], "the late return neither holds nor releases again");
+	}
+
+	#[test]
+	fn capabilities_stay_nonblocking_after_a_hung_call_times_out() {
+		let (backend, _entered, unblock) = hanging_backend();
+		let core = session_serving(backend);
+		let Response::Capabilities(initial) = core
+			.call(core.cancellation.token(), |reply| Request::Capabilities { reply })
+			.unwrap()
+		else {
+			panic!("expected initial capabilities");
+		};
+		let error = core
+			.call(core.cancellation.token(), |reply| Request::ListWindows { reply })
+			.err()
+			.unwrap();
+		assert_eq!(error.code, ErrorCode::Timeout);
+		let (reported, ready) = flume::bounded(1);
+		let getter = thread::spawn({
+			let core = Arc::clone(&core);
+			move || {
+				let session = DesktopSession { core };
+				reported.send(session.capabilities()).unwrap();
+			}
+		});
+		let cached = ready.recv_timeout(Duration::from_millis(200));
+		// Always release the backend and join before asserting, including red.
+		drop(unblock);
+		getter.join().unwrap();
+		core.close().unwrap();
+		let cached = cached.expect("a timed-out caller must not make a busy worker look idle");
+		assert_eq!(cached.backend, initial.backend);
+		assert_eq!(cached.capture, initial.capture);
+	}
+
+	#[test]
+	fn busy_capabilities_without_a_snapshot_do_not_enter_the_worker_queue() {
+		let (backend, _entered, unblock) = hanging_backend();
+		let core = session_serving(backend);
+		let error = core
+			.call(core.cancellation.token(), |reply| Request::ListWindows { reply })
+			.err()
+			.unwrap();
+		assert_eq!(error.code, ErrorCode::Timeout);
+		let (reported, ready) = flume::bounded(1);
+		let getter = thread::spawn({
+			let core = Arc::clone(&core);
+			move || {
+				let session = DesktopSession { core };
+				reported.send(session.capabilities()).unwrap();
+			}
+		});
+		let cached = ready.recv_timeout(Duration::from_millis(200));
+		drop(unblock);
+		getter.join().unwrap();
+		core.close().unwrap();
+		let cached = cached.expect("an absent snapshot must not block capability inspection");
+		assert_eq!(cached.backend, "unavailable");
+		assert!(!cached.capture);
 	}
 
 	#[test]
@@ -3961,6 +4141,46 @@ mod capture_tests {
 	}
 
 	#[test]
+	fn an_unconfirmed_action_names_the_window_and_app_to_inspect_and_is_sent_once() {
+		let (mut worker, tree) = read_buttons(&[(2, "Go"), (3, "Stop")]);
+		tree.lock().unconfirmed = true;
+		let error = press(&mut worker, "e2").unwrap_err();
+		assert_eq!(error.code, ErrorCode::AxUnconfirmed);
+		assert!(error.message.contains("before retrying"), "{}", error.message);
+		assert!(
+			error
+				.message
+				.contains(&format!("e2 is in window {WAYLAND_ID} of \"obsidian\" (\"Obsidian\")")),
+			"{}",
+			error.message
+		);
+		assert_eq!(tree.lock().pressed, [2]);
+	}
+
+	#[test]
+	fn unconfirmed_action_metadata_is_escaped_and_bounded() {
+		let mut backend = FakeWaylandBackend::new();
+		let prefix = "A\t\n\r\u{1b}\"\\🦀";
+		backend.window.app = format!("{prefix}{}APP_END", "é".repeat(400));
+		backend.window.title = format!("{prefix}{}TITLE_END", "界".repeat(400));
+		let mut worker = worker_with(backend);
+		let error = worker.name_unconfirmed_target(
+			"e2",
+			&ax::AxHandle::Test(1),
+			DesktopError::new(ErrorCode::AxUnconfirmed, "inspect before retrying"),
+		);
+		assert_eq!(error.code, ErrorCode::AxUnconfirmed);
+		let escaped = "A\\t\\n\\r\\u001b\\\"\\\\🦀";
+		assert!(error.message.contains(&format!("of \"{escaped}")), "{}", error.message);
+		assert!(error.message.contains(&format!("(\"{escaped}")), "{}", error.message);
+		assert!(!error.message.chars().any(char::is_control), "{}", error.message);
+		assert!(!error.message.contains("APP_END"), "{}", error.message);
+		assert!(!error.message.contains("TITLE_END"), "{}", error.message);
+		assert_eq!(error.message.matches("\"…").count(), 2, "{}", error.message);
+		assert!(error.message.chars().count() < 550, "{}", error.message);
+	}
+
+	#[test]
 	fn every_call_on_a_rebuilt_element_names_its_copy() {
 		fn e2() -> String {
 			"e2".to_string()
@@ -4171,9 +4391,10 @@ mod capture_tests {
 				.ok()
 				.and_then(|backend| backend.ax())
 				.unwrap();
-			let reference = register_node(ax, registry, WAYLAND_ID, AxHandle::Test(1))
-				.unwrap()
-				.ref_;
+			let reference =
+				register_node(ax, registry, WAYLAND_ID, AxHandle::Test(1), &mut AppFocus::default())
+					.unwrap()
+					.ref_;
 			let (reply, _rx) = flume::bounded(1);
 			let request = make(reference, reply);
 			let before = *queries.lock();
@@ -4194,9 +4415,10 @@ mod capture_tests {
 			.ok()
 			.and_then(|backend| backend.ax())
 			.unwrap();
-		let reference = register_node(ax, registry, WAYLAND_ID, AxHandle::Test(1))
-			.unwrap()
-			.ref_;
+		let reference =
+			register_node(ax, registry, WAYLAND_ID, AxHandle::Test(1), &mut AppFocus::default())
+				.unwrap()
+				.ref_;
 		let (reply, _rx) = flume::bounded(1);
 		let request = Request::AxClick {
 			reference: reference.clone(),
@@ -4223,9 +4445,10 @@ mod capture_tests {
 				.ok()
 				.and_then(|backend| backend.ax())
 				.unwrap();
-			let reference = register_node(ax, registry, WAYLAND_ID, AxHandle::Test(1))
-				.unwrap()
-				.ref_;
+			let reference =
+				register_node(ax, registry, WAYLAND_ID, AxHandle::Test(1), &mut AppFocus::default())
+					.unwrap()
+					.ref_;
 			let (reply, _rx) = flume::bounded(1);
 			let request = Request::AxInput {
 				reference: reference.clone(),
@@ -4376,6 +4599,10 @@ mod capture_tests {
 		let capabilities = session.capabilities();
 		assert_eq!(capabilities.backend, "wayland");
 		assert!(capabilities.capture);
+		assert!(
+			capabilities.window_control.is_some(),
+			"capture must cache the centrally populated live control surface"
+		);
 		assert!(
 			session.core.lifecycle.lock().tx.is_none(),
 			"a busy getter must return the snapshot without starting or querying a worker"
@@ -4733,6 +4960,81 @@ mod capture_tests {
 	}
 
 	#[test]
+	fn a_drag_made_as_a_text_selection_posts_no_pointer_input() {
+		let drag = |worker: &mut TestWorker| {
+			let token = CancellationSource::default().token();
+			let target = Target::Window(WAYLAND_ID.to_string());
+			worker
+				.process(&capture_request(target.clone()), &token)
+				.unwrap();
+			let (reply, _rx) = flume::bounded(1);
+			let request = Request::Drag {
+				target,
+				path: vec![(4.0, 10.0), (30.0, 10.0)],
+				options: ParsedPointerOptions::parse(None).unwrap(),
+				reply,
+			};
+			worker.process(&request, &token).unwrap()
+		};
+		let mut backend = FakeWaylandBackend::new();
+		backend.drag_selection = Some(AxTextSelection {
+			start:   4,
+			length:  5,
+			text:    "quick".to_string(),
+			focused: false,
+		});
+		let clicks = Arc::clone(&backend.clicks);
+		let mut worker = worker_with(backend);
+		let Response::TextSelection(selection) = drag(&mut worker) else {
+			panic!("expected the selection the drag was made as")
+		};
+		assert_eq!((selection.start, selection.length, selection.text.as_str()), (4, 5, "quick"));
+		assert!(clicks.lock().is_empty(), "no pointer input was posted");
+		// Any other drag is posted.
+		drop(worker);
+		let backend = FakeWaylandBackend::new();
+		let clicks = Arc::clone(&backend.clicks);
+		let mut worker = worker_with(backend);
+		assert!(matches!(drag(&mut worker), Response::Input(None)));
+		assert_eq!(*clicks.lock(), [WAYLAND_ID]);
+	}
+
+	#[test]
+	fn a_drag_selection_reads_the_target_before_the_menu_preflight_probes_it() {
+		// The menu preflight probes the target, which can block; the selection
+		// reads the front app before any probe, so it runs first. A press on
+		// text opens no menu, so the refusing preflight never sees this drag.
+		let mut backend = FakeWaylandBackend::new();
+		backend.menu_control = true;
+		backend.drag_selection = Some(AxTextSelection {
+			start:   4,
+			length:  5,
+			text:    "quick".to_string(),
+			focused: false,
+		});
+		let clicks = Arc::clone(&backend.clicks);
+		let mut worker = worker_with(backend);
+		let token = CancellationSource::default().token();
+		let target = Target::Window(WAYLAND_ID.to_string());
+		worker
+			.process(&capture_request(target.clone()), &token)
+			.unwrap();
+		let (reply, _rx) = flume::bounded(1);
+		let request = Request::Drag {
+			target,
+			path: vec![(4.0, 10.0), (30.0, 10.0)],
+			options: ParsedPointerOptions::parse(Some(PointerOptions {
+				refuse_menu: Some(true),
+				..PointerOptions::default()
+			}))
+			.unwrap(),
+			reply,
+		};
+		assert!(matches!(worker.process(&request, &token).unwrap(), Response::TextSelection(_)));
+		assert!(clicks.lock().is_empty(), "no pointer input was posted");
+	}
+
+	#[test]
 	fn cancelled_full_capture_restores_previously_delivered_coordinates() {
 		let backend = FakeWaylandBackend::new();
 		let cancel_on_capabilities = Arc::clone(&backend.cancel_on_capabilities);
@@ -5038,7 +5340,7 @@ mod capture_tests {
 				reply,
 			}
 		};
-		for action in ["press", "AXPress", "axraise"] {
+		for action in ["press", "AXPress"] {
 			let source = CancellationSource::default();
 			let result = call(&mut worker, perform(action), &source);
 			assert!(
@@ -5053,7 +5355,8 @@ mod capture_tests {
 			assert!(token.check().is_ok(), "the user's Escape leaves {action} running");
 		}
 		assert_eq!(tree.lock().pressed, [2], "the fake tree runs only `press`");
-		for action in ["raise", " Raise ", "AXRaise"] {
+		// macOS runs any spelling of AXRaise, `axraise` included.
+		for action in ["raise", " Raise ", "AXRaise", "axraise", "AxRaise"] {
 			let source = CancellationSource::default();
 			let error = call(&mut worker, perform(action), &source)
 				.err()
@@ -5199,7 +5502,11 @@ mod capture_tests {
 		let (queue_tx, queue_rx) = flume::unbounded();
 		let (reply, result) = flume::bounded(1);
 		queue_tx
-			.send(QueuedRequest { request: Request::ListWindows { reply }, token: source.token() })
+			.send(QueuedRequest {
+				request:  Request::ListWindows { reply },
+				token:    source.token(),
+				_pending: PendingRequest::new(&Arc::default()),
+			})
 			.unwrap_or_else(|_| panic!("queue unexpectedly disconnected"));
 		source.cancel();
 		let queued = queue_rx.recv().unwrap();
@@ -5526,6 +5833,36 @@ mod control_tests {
 			}
 			Ok(())
 		}
+	}
+
+	#[test]
+	fn observe_keeps_live_controls_in_the_nonblocking_capture_snapshot() {
+		let core = SessionCore::new(DisplaySelector::Active, Arc::default());
+		let mut worker = worker_with(ControlBackend::new(&["focus", "moveWindow"]));
+		worker.capabilities = Arc::clone(&core.capabilities);
+		let (reply, _rx) = flume::bounded(1);
+		// This backend has no AX tree. Observe still captures first, so its
+		// capability snapshot must be complete before the later AX failure.
+		let request = Request::Observe {
+			target: Target::Window(WINDOW_ID.into()),
+			caps: CaptureCaps::default(),
+			options: AxSnapshotOptions::default(),
+			reply,
+		};
+		assert!(
+			worker
+				.process(&request, &core.cancellation.token())
+				.is_err()
+		);
+		core.in_flight.store(1, Ordering::Release);
+		let session = DesktopSession { core };
+		let controls = session
+			.capabilities()
+			.window_control
+			.expect("live control surface");
+		assert_eq!(controls.backend, "control-test");
+		assert_eq!(controls.operations, ["focus", "moveWindow"]);
+		assert!(session.core.lifecycle.lock().tx.is_none());
 	}
 
 	fn control_request(action: ControlAction) -> Request {

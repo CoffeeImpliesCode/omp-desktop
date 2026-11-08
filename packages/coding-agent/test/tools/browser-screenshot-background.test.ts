@@ -10,7 +10,11 @@ import {
 	type PuppeteerBrowserHandle,
 	releaseBrowser,
 } from "@oh-my-pi/pi-coding-agent/tools/browser/registry";
-import { decodePng } from "@oh-my-pi/pi-coding-agent/tools/browser/screenshot";
+import {
+	decodePng,
+	type DiffScreenshotResult,
+	type ScreenshotChangeResult,
+} from "@oh-my-pi/pi-coding-agent/tools/browser/screenshot";
 import { acquireTab, releaseTab, runInTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
 import type { Page } from "puppeteer-core";
@@ -104,6 +108,112 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser screenshots of background tabs", (
 		expect(await repaintAndCapture(name, "#00ff00")).toEqual([0, 255, 0]);
 		expect(await visibility(userPage)).toBe("visible");
 		expect(await visibility(agentPage)).toBe("hidden");
+	}, 45_000);
+
+	it.each(["selector", "fullPage"] as const)(
+		"captures a background %s without selecting the borrowed tab",
+		async scope => {
+			const handle = await connectedBrowser();
+			const agentPage = await handle.browser.newPage();
+			await agentPage.setViewport({ width: 320, height: 240, deviceScaleFactor: 1 });
+			const html = `<title>scoped-tab</title><body style="margin:0;height:2400px;background:#00ff00">
+				<div id="capture" style="position:absolute;top:1800px;width:80px;height:60px;background:#0000ff"></div>
+			</body>`;
+			await agentPage.goto(`data:text/html,${encodeURIComponent(html)}`);
+			const userPage = await handle.browser.newPage();
+			await userPage.goto(page("user-tab", "#ffffff"));
+			await userPage.bringToFront();
+			const name = `background-${scope}-${process.pid}`;
+			cleanups.push(async () => {
+				await releaseTab(name);
+			});
+			await acquireTab(name, handle, { target: "scoped-tab", timeoutMs: 30_000 });
+
+			const options = scope === "selector" ? { selector: "#capture" } : { fullPage: true };
+			const result = await runInTab(name, {
+				code: `
+					await tab.evaluate("document.querySelector('#capture').style.background = '#ff0000'");
+					return await tab.screenshot(${JSON.stringify({ ...options, format: "png", silent: true })});
+				`,
+				timeoutMs: 15_000,
+				session,
+			});
+			const dest = result.returnValue as string;
+			cleanups.push(() => fs.rm(dest, { force: true }));
+			const image = decodePng(await fs.readFile(dest));
+			if (scope === "selector") {
+				expect([image.width, image.height]).toEqual([80, 60]);
+				expect([...image.pixels.subarray(0, 3)]).toEqual([255, 0, 0]);
+			} else {
+				expect(image.height).toBe(2400);
+				expect([...image.pixels.subarray(0, 3)]).toEqual([0, 255, 0]);
+				const targetPixel = (1800 * image.width + 1) * 4;
+				expect([...image.pixels.subarray(targetPixel, targetPixel + 3)]).toEqual([255, 0, 0]);
+			}
+			expect(await visibility(userPage)).toBe("visible");
+			expect(await visibility(agentPage)).toBe("hidden");
+		},
+		45_000,
+	);
+
+	it("diffs and tracks changed pixels after the user switches away from an adopted tab", async () => {
+		const handle = await connectedBrowser();
+		const adopted = await handle.browser.newPage();
+		await adopted.goto(page("diff-tab", "#0000ff"));
+		await adopted.bringToFront();
+		const name = `background-diff-${process.pid}`;
+		cleanups.push(async () => {
+			await releaseTab(name);
+		});
+		await acquireTab(name, handle, { timeoutMs: 30_000 });
+		const baseline = await runInTab(name, {
+			code: `return await tab.screenshot({ format: "png", ifChanged: true, silent: true });`,
+			timeoutMs: 15_000,
+			session,
+		});
+		const baselineCapture = baseline.returnValue as ScreenshotChangeResult;
+		if (!baselineCapture.path) throw new Error("Expected the first tracked capture to save an image");
+		const baselinePath = baselineCapture.path;
+		cleanups.push(() => fs.rm(baselinePath, { force: true }));
+		const userPage = await handle.browser.newPage();
+		await userPage.goto(page("user-tab", "#ffffff"));
+		await userPage.bringToFront();
+
+		const diff = await runInTab(name, {
+			code: `
+				await tab.evaluate("document.body.style.background = '#ff0000'");
+				return await tab.diffScreenshot(${JSON.stringify(baselinePath)});
+			`,
+			timeoutMs: 15_000,
+			session,
+		});
+		const difference = diff.returnValue as DiffScreenshotResult;
+		cleanups.push(() => fs.rm(difference.diffPath, { force: true }));
+		expect(difference.changed).toBe(true);
+		expect(difference.pixelChangeRatio).toBe(1);
+		expect(decodePng(await fs.readFile(difference.diffPath)).width).toBeGreaterThan(0);
+		expect(await visibility(userPage)).toBe("visible");
+		expect(await visibility(adopted)).toBe("hidden");
+
+		const tracked = await runInTab(name, {
+			code: `
+				const changed = await tab.screenshot({ format: "png", ifChanged: true, silent: true });
+				const unchanged = await tab.screenshot({ format: "png", ifChanged: true, silent: true });
+				return { changed, unchanged };
+			`,
+			timeoutMs: 15_000,
+			session,
+		});
+		const captures = tracked.returnValue as { changed: ScreenshotChangeResult; unchanged: ScreenshotChangeResult };
+		if (!captures.changed.path) throw new Error("Expected a changed capture to save an image");
+		const changedPath = captures.changed.path;
+		cleanups.push(() => fs.rm(changedPath, { force: true }));
+		expect(captures.changed).toMatchObject({ changed: true, revision: 2, pixelChangeRatio: 1 });
+		expect(captures.unchanged).toEqual({ changed: false, revision: 2, pixelChangeRatio: 0 });
+		const image = decodePng(await fs.readFile(changedPath));
+		expect([...image.pixels.subarray(0, 3)]).toEqual([255, 0, 0]);
+		expect(await visibility(userPage)).toBe("visible");
+		expect(await visibility(adopted)).toBe("hidden");
 	}, 45_000);
 
 	it("captures the adopted tab after the user switched away from it", async () => {

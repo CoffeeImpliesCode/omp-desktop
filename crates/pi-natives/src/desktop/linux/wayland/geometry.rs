@@ -3,11 +3,10 @@ use image::{RgbaImage, imageops};
 
 use crate::desktop::{
 	error::{CoreResult, DesktopError},
-	frame::MAX_COMPOSITE_PIXELS,
 	types::DesktopDisplay,
 };
 #[cfg(any(feature = "wayland-pipewire", test))]
-use crate::desktop::{linux::ax::AtSpiWindow, types::DisplaySelector};
+use crate::desktop::{frame::MAX_COMPOSITE_PIXELS, linux::ax::AtSpiWindow, types::DisplaySelector};
 
 #[cfg(test)]
 mod tests {
@@ -35,6 +34,34 @@ mod tests {
 	}
 
 	#[test]
+	fn cached_metadata_matches_composite_origins_and_fresh_geometry() {
+		let frames = vec![monitor(-4, -2, 4, 3, 1, 11), monitor(0, 1, 4, 3, 2, 22)];
+		let cached = metadata(&frames, &[]).unwrap();
+		let geometries = frames
+			.iter()
+			.map(|(_, geometry)| *geometry)
+			.collect::<Vec<_>>();
+		let fresh = fresh_layout(&geometries, &[]).unwrap();
+		let (_, composed) = compose(frames, &DisplaySelector::All, &[]).unwrap();
+		let mut frame = FrameGeometry::for_displays(&composed);
+		frame.record_layout(&cached).unwrap();
+		frame.validate_layout(&fresh).unwrap();
+		assert_eq!(frame.map_point(10.0, 8.0, None).unwrap(), (1.0, 2.0));
+		assert!(frame.map_point(5.0, 1.0, None).is_err());
+		for (index, ((cached, fresh), composed)) in
+			cached.iter().zip(&fresh).zip(&composed).enumerate()
+		{
+			let coordinates = |display: &DesktopDisplay| {
+				(display.pixel_x, display.pixel_y, display.pixel_width, display.pixel_height)
+			};
+			assert_eq!(coordinates(cached), coordinates(fresh));
+			assert_eq!(coordinates(cached), coordinates(composed));
+			assert_eq!(cached.pixel_x, if index == 0 { 0 } else { 8 });
+			assert_eq!(cached.pixel_y, if index == 0 { 0 } else { 6 });
+		}
+	}
+
+	#[test]
 	fn both_monitors_survive_composition_and_coordinate_mapping() {
 		let frames = vec![monitor(4, 0, 4, 3, 1, 22), monitor(0, 0, 4, 3, 1, 11)];
 		let (image, displays) = compose(frames, &DisplaySelector::All, &[]).unwrap();
@@ -58,6 +85,30 @@ mod tests {
 	}
 
 	#[test]
+	fn selected_monitor_survives_an_oversized_unused_gap() {
+		let gap = 100_000_000;
+		let frames = || vec![monitor(0, 0, 4, 3, 1, 11), monitor(gap, 0, 4, 3, 1, 22)];
+		let cached = metadata(&frames(), &[]).unwrap();
+		assert_eq!(cached[1].pixel_x, gap as u32);
+		let (image, displays) =
+			compose(frames(), &DisplaySelector::Id("wayland-portal-1".into()), &[]).unwrap();
+		assert_eq!(image.dimensions(), (4, 3));
+		assert_eq!(image.get_pixel(3, 2).0, [22, 0, 0, 255]);
+		let mut frame = FrameGeometry::for_displays(&displays);
+		frame.record_layout(&cached).unwrap();
+		let geometries = frames()
+			.iter()
+			.map(|(_, geometry)| *geometry)
+			.collect::<Vec<_>>();
+		frame
+			.validate_layout(&fresh_layout(&geometries, &[]).unwrap())
+			.unwrap();
+		assert_eq!(frame.map_point(2.0, 1.0, None).unwrap(), (f64::from(gap) + 2.0, 1.0));
+		let error = compose(frames(), &DisplaySelector::All, &[]).unwrap_err();
+		assert_eq!(error.code.as_str(), "CaptureFailed");
+	}
+
+	#[test]
 	fn negative_origins_and_mixed_scale_do_not_overlap_native_buffers() {
 		let frames = vec![monitor(-4, -2, 4, 3, 1, 11), monitor(0, -2, 4, 3, 2, 22)];
 		let (image, displays) = compose(frames, &DisplaySelector::All, &[]).unwrap();
@@ -77,9 +128,12 @@ mod tests {
 		assert_eq!(err.code.as_str(), "InvalidTarget");
 		let mut displays = vec![
 			PortalGeometry::new(Some((i32::MIN, 0)), Some((4, 3)), 4, 3).display(0, &[]),
-			PortalGeometry::new(Some((i32::MAX - 4, 0)), Some((4, 3)), 4, 3).display(1, &[]),
+			PortalGeometry::new(Some((i32::MAX - 4, 0)), Some((4, 3)), 8, 6).display(1, &[]),
 		];
 		assert!(layout(&mut displays).is_err());
+		let frames = vec![monitor(i32::MIN, 0, 4, 3, 1, 11), monitor(i32::MAX - 4, 0, 4, 3, 2, 22)];
+		assert!(metadata(&frames, &[]).is_err(), "the cache must reject unsafe layout too");
+		assert!(metadata(&[], &[]).is_err());
 	}
 
 	fn captured_niri_frame() -> (FrameGeometry, DesktopDisplay, PortalGeometry) {
@@ -94,8 +148,7 @@ mod tests {
 		native.pixel_width = 8;
 		native.pixel_height = 6;
 		native.scale = 2.0;
-		let mut displays = metadata(&[capture], std::slice::from_ref(&native));
-		layout(&mut displays).unwrap();
+		let displays = metadata(&[capture], std::slice::from_ref(&native)).unwrap();
 		let mut frame = FrameGeometry::for_displays(&displays);
 		frame.record_layout(&displays).unwrap();
 		(frame, native, portal)
@@ -307,13 +360,10 @@ pub(super) fn layout(displays: &mut [DesktopDisplay]) -> CoreResult<(u32, u32)> 
 		width = width.max(u64::from(d.pixel_x) + u64::from(d.pixel_width));
 		height = height.max(u64::from(d.pixel_y) + u64::from(d.pixel_height));
 	}
-	if width > u64::from(u32::MAX)
-		|| height > u64::from(u32::MAX)
-		|| width
-			.checked_mul(height)
-			.is_none_or(|pixels| pixels > MAX_COMPOSITE_PIXELS)
-	{
-		return Err(DesktopError::capture_failed("monitor composite exceeds native safety limit"));
+	if width > u64::from(u32::MAX) || height > u64::from(u32::MAX) {
+		return Err(DesktopError::capture_failed(
+			"monitor layout exceeds composite coordinate space",
+		));
 	}
 	Ok((width as u32, height as u32))
 }
@@ -336,12 +386,14 @@ pub(super) fn fresh_layout(
 pub(super) fn metadata(
 	frames: &[(RgbaImage, PortalGeometry)],
 	known: &[DesktopDisplay],
-) -> Vec<DesktopDisplay> {
-	frames
+) -> CoreResult<Vec<DesktopDisplay>> {
+	let mut displays = frames
 		.iter()
 		.enumerate()
 		.map(|(index, (_, geometry))| geometry.display(index, known))
-		.collect()
+		.collect::<Vec<_>>();
+	layout(&mut displays)?;
+	Ok(displays)
 }
 
 #[cfg(any(feature = "wayland-pipewire", test))]
@@ -350,7 +402,7 @@ pub(super) fn compose(
 	selector: &DisplaySelector,
 	known: &[DesktopDisplay],
 ) -> CoreResult<(RgbaImage, Vec<DesktopDisplay>)> {
-	let mut displays = metadata(&frames, known);
+	let mut displays = metadata(&frames, known)?;
 	if let DisplaySelector::Id(id) = selector {
 		let index = displays
 			.iter()
@@ -366,6 +418,11 @@ pub(super) fn compose(
 		displays = vec![display];
 	}
 	let (width, height) = layout(&mut displays)?;
+	// Geometry does not allocate empty gaps. Apply the pixel budget only to
+	// the selected canvas, so an unused monitor cannot reject a small capture.
+	if u64::from(width) * u64::from(height) > MAX_COMPOSITE_PIXELS {
+		return Err(DesktopError::capture_failed("monitor composite exceeds native safety limit"));
+	}
 	if frames.len() == 1 {
 		return Ok((frames.remove(0).0, displays));
 	}

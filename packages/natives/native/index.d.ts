@@ -30,12 +30,19 @@ export declare class AudioPlayback {
 
 /** Persistent, serialized native desktop capture/input/accessibility session. */
 export declare class DesktopSession {
+  /**
+   * Desktop contract version, read before constructing a session.
+   * Version 1 requires structured drag results (`selection`, `focusReturn`)
+   * and native window controls. Bump this and the JS adapter's expected
+   * version together for incompatible desktop argument/result contracts.
+   */
+  static abiVersion(): number
   constructor(options?: DesktopSessionOptions | undefined | null)
   /**
    * Asks the worker when it is idle, so permissions are read live. While
    * another operation holds the worker, answers from the snapshot of the
    * latest capabilities read or capture instead of blocking the JS thread
-   * behind it.
+   * behind it. With no prior snapshot, reports temporary unavailability.
    */
   get capabilities(): DesktopCapabilities
   /**
@@ -99,7 +106,13 @@ export declare class DesktopSession {
   captureRegion(target: string, region: CaptureRegion, caps?: CaptureCaps | undefined | null): Promise<DesktopCapture>
   click(target: string, x: number, y: number, opts?: PointerOptions | undefined | null): Promise<DesktopFocusReturn | undefined | null>
   moveMouse(target: string, x: number, y: number, opts?: PointerOptions | undefined | null): Promise<DesktopFocusReturn | undefined | null>
-  drag(target: string, path: Array<DesktopPoint>, opts?: PointerOptions | undefined | null): Promise<DesktopFocusReturn | undefined | null>
+  /**
+   * Drags along `path`. A macOS background left drag across the text of one
+   * native text element is made as that element's selection through
+   * accessibility, with no mouse event, and resolves to the selection read
+   * back; a drag posted as input resolves to where a takeover left focus.
+   */
+  drag(target: string, path: Array<DesktopPoint>, opts?: PointerOptions | undefined | null): Promise<DesktopDragResult>
   scroll(target: string, x: number, y: number, dx: number, dy: number, opts?: PointerOptions | undefined | null): Promise<DesktopFocusReturn | undefined | null>
   typeText(target: string, text: string, opts?: PointerOptions | undefined | null): Promise<DesktopFocusReturn | undefined | null>
   keyChord(target: string, keys: Array<string>, opts?: PointerOptions | undefined | null): Promise<DesktopFocusReturn | undefined | null>
@@ -621,6 +634,14 @@ export declare class Shell {
    * The options set session-scoped environment variables and a snapshot path.
    */
   constructor(options?: ShellOptions | undefined | null)
+  /**
+   * A new shell with this one's options whose session starts from this
+   * session's state (variables, functions, aliases, options, working
+   * directory) as of its last command boundary: while a command runs, the
+   * state that command started from. What the fork sets stays in the
+   * fork. Never waits for the running command.
+   */
+  fork(): Shell
   /**
    * Run a shell command using the provided options.
    *
@@ -1657,6 +1678,21 @@ export interface DesktopDisplay {
   isPrimary: boolean
 }
 
+/** What a drag call did: made a text selection, or posted input. */
+export interface DesktopDragResult {
+  /**
+   * The selection a macOS background left drag across the text of one
+   * native text element made through accessibility, read back; absent when
+   * the drag was posted as input.
+   */
+  selection?: AxTextSelection
+  /**
+   * Where focus ended when the drag ran in takeover; see
+   * [`DesktopFocusReturn`].
+   */
+  focusReturn?: DesktopFocusReturn
+}
+
 /**
  * Physical-Escape stops counted under `key` by every desktop session created
  * with it, including closed ones, until the key is forgotten.
@@ -1764,8 +1800,14 @@ export interface DesktopWindowState {
 }
 
 /**
- * One workspace as the backend reports it. `id` is opaque and stable, and
- * only an id returned here is ever a valid mutation target.
+ * One workspace reported by the backend.
+ *
+ * Only a returned `id` is a valid mutation target.
+ * Niri ids are compositor-stable; X11 ids identify EWMH
+ * positions only and can designate a different workspace after removal or
+ * reordering. Read fresh workspaces/state before choosing an action target
+ * and re-enumerate after topology changes. X11 can reject an out-of-range
+ * position, but cannot detect reuse or reordering of an in-range position.
  */
 export interface DesktopWorkspace {
   id: string

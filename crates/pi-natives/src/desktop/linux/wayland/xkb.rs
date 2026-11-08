@@ -566,6 +566,7 @@ mod tests {
 		io::{Seek, SeekFrom, Write},
 		os::fd::{FromRawFd, OwnedFd},
 	};
+
 	use super::{KeyStroke, KeyboardLayout};
 
 	const FR: &str = include_str!("testdata/fr.xkb");

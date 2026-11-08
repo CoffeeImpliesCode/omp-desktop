@@ -13,7 +13,7 @@ The companion relay server lives in the omp CLI (`omp browser-relay`, see `packa
 
 That's it: the relay server auto-starts under omp's profile-independent global daemon broker the first time Eval's browser API needs it. Every relay consumer holds a broker lease, so one project exiting cannot interrupt another; the server stops after the last consumer across all projects exits. The extension badge turns **on** when connected. Run `omp browser-relay` manually only for `--token`, `--no-group`, or a non-default port — a relay already serving the port is adopted, never fought over.
 
-Without `app.target`, omp creates an owned background tab and leaves your foreground tab in place. `app.target` borrows a specific existing tab by URL/title substring. Closing an owned tab removes it; closing a borrowed handle only releases it. Owned background screenshots do not activate the tab; hidden borrowed targets require explicit activation.
+Without `app.target`, omp creates an owned background tab and leaves your foreground tab in place. `app.target` borrows a specific existing tab by URL/title substring. Closing an owned tab removes it. Closing a borrowed handle only releases it. Screenshots capture either kind in place, even when hidden, without selecting the tab or raising Chrome.
 
 An older relay extension can select newly created tabs instead. Run `omp browser-relay install` again and reload the extension.
 
@@ -31,4 +31,5 @@ After an omp upgrade, the relay keeps the extension current on its own: when it 
 - `chrome://`, DevTools, Web Store, and other-extension pages are not attachable and are hidden from the agent.
 - Chrome shows its "is debugging this browser" infobar while any tab is attached; dismissing it detaches that tab until it navigates again.
 - A tab with DevTools open can't be attached (one debugger per tab — the constraint the relay multiplexes around for its own clients).
+- Chrome refuses the debugger in a tab while another extension's frame, such as a password manager's inline menu, is in it. In a tab omp drives, the extension empties and hides that frame so omp can continue; your other tabs keep theirs.
 - Anything that can reach the relay port can drive your logged-in browser. The relay binds loopback only; use `omp browser-relay --token <secret>` (mirrored in the extension options) if untrusted local processes are a concern.

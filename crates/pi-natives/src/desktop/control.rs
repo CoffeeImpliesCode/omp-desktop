@@ -739,6 +739,25 @@ pub(crate) fn current_token() -> Option<OperationToken> {
 	}
 }
 
+/// Waits for the original request or a generation-revocation wake. Cancellation
+/// drops that request, never polls on a timer or starts it again.
+#[cfg(target_os = "linux")]
+pub(crate) async fn cancellable<T>(future: impl Future<Output = T>) -> CoreResult<T> {
+	check()?;
+	let Some(token) = current_token() else {
+		return Ok(future.await);
+	};
+	let future = std::pin::pin!(future);
+	let cancelled = std::pin::pin!(token.cancelled());
+	match futures::future::select(cancelled, future).await {
+		futures::future::Either::Left((error, _)) => Err(error),
+		futures::future::Either::Right((result, _)) => {
+			token.check()?;
+			Ok(result)
+		},
+	}
+}
+
 pub(crate) fn check() -> CoreResult<()> {
 	if CLEANUP.get() {
 		return Ok(());
@@ -1752,7 +1771,7 @@ mod ownership_tests {
 		let lease = KernelLease::at(&path).expect("lease");
 		// A process spawned while the lease is held carries a copy of its
 		// descriptor until it execs; this one keeps it.
-		let mut copy = std::process::Command::new("/bin/cat")
+		let mut copy = std::process::Command::new("cat")
 			.stdin(std::process::Stdio::piped())
 			.stdout(lease.file.try_clone().expect("descriptor copy"))
 			.spawn()

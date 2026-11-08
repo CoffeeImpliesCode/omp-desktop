@@ -216,6 +216,7 @@ impl Backend for X11Backend {
 	fn window_state(&mut self, id: &str) -> CoreResult<DesktopWindowState> {
 		self.control.window_state(&self.capture, id)
 	}
+
 	fn ax(&mut self) -> Option<&mut dyn AxBackend> {
 		self.ax.as_mut().map(|ax| ax as &mut dyn AxBackend)
 	}

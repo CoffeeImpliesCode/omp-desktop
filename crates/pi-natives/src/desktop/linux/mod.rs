@@ -3,7 +3,13 @@ mod menus;
 pub mod wayland;
 pub mod x11;
 
-use std::{io, os::fd::RawFd, path::Path, time::Duration};
+use std::{
+	io,
+	os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+	path::Path,
+	time::Duration,
+};
+
 use super::{
 	backend::Backend,
 	control,
@@ -41,9 +47,9 @@ fn pace_clicks(count: u32, mut send: impl FnMut(bool) -> CoreResult<()>) -> Core
 pub fn new_backend(display: DisplaySelector) -> CoreResult<Box<dyn Backend>> {
 	match wayland_endpoint() {
 		// Reachable and Blocked both keep the session on Wayland. A compositor
-		// this process may not judge is not a dead compositor, and the fallback it
-		// would trigger is worse than the failure it avoids: niri's Xwayland root
-		// window is empty, so nothing can be focused there.
+		// this process may not judge is not a dead compositor, and the fallback
+		// it would trigger is worse than the failure it avoids: niri's Xwayland
+		// root window is empty, so nothing can be focused there.
 		WaylandEndpoint::Reachable | WaylandEndpoint::Blocked => {
 			Ok(Box::new(wayland::WaylandBackend::new(display)))
 		},
@@ -154,8 +160,8 @@ fn socket_type(fd: RawFd) -> Result<libc::c_int, libc::c_int> {
 	let mut kind: libc::c_int = 0;
 	let mut length =
 		libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>()).expect("c_int fits socklen_t");
-	// SAFETY: `kind` and `length` describe the buffer `getsockopt` fills, and `fd`
-	// is the caller's descriptor.
+	// SAFETY: `kind` and `length` describe the buffer `getsockopt` fills, and
+	// `fd` is the caller's descriptor.
 	if unsafe {
 		libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE, (&raw mut kind).cast(), &mut length)
 	} != 0
@@ -171,8 +177,8 @@ fn peer_family(fd: RawFd) -> Result<libc::sa_family_t, libc::c_int> {
 	let mut address = std::mem::MaybeUninit::<libc::sockaddr_storage>::uninit();
 	let mut length = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_storage>())
 		.expect("sockaddr_storage fits socklen_t");
-	// SAFETY: `address` and `length` describe the buffer `getpeername` fills, and
-	// `fd` is the caller's descriptor.
+	// SAFETY: `address` and `length` describe the buffer `getpeername` fills,
+	// and `fd` is the caller's descriptor.
 	if unsafe { libc::getpeername(fd, address.as_mut_ptr().cast(), &mut length) } != 0 {
 		return Err(last_errno());
 	}
@@ -201,34 +207,35 @@ fn last_errno() -> libc::c_int {
 /// without sending a byte: selection must not consume a compositor connection
 /// slot or start a compositor handshake.
 fn probe_compositor(path: &Path) -> WaylandEndpoint {
-	let Some(address) = SocketAddress::new(path) else {
-		return WaylandEndpoint::Stale;
-	};
-	// SAFETY: a fresh AF_UNIX socket that this call owns until the close below.
+	match connect_compositor(path) {
+		Ok(_) => WaylandEndpoint::Reachable,
+		Err(error) => match error.raw_os_error() {
+			Some(code) if is_absent(code) => WaylandEndpoint::Stale,
+			// Backlog, permission and resource failures do not prove staleness.
+			_ => WaylandEndpoint::Blocked,
+		},
+	}
+}
+
+/// Open a compositor connection without waiting for a backlog slot or sending
+/// a handshake. Callers may read peer credentials; dropping it closes the fd.
+fn connect_compositor(path: &Path) -> io::Result<OwnedFd> {
+	let address =
+		SocketAddress::new(path).ok_or_else(|| io::Error::from_raw_os_error(libc::ENAMETOOLONG))?;
+	// SAFETY: the returned descriptor is fresh and owned by this call.
 	let fd = unsafe {
 		libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0)
 	};
 	if fd < 0 {
-		// No descriptor to probe with, which says nothing about the compositor.
-		return WaylandEndpoint::Blocked;
+		return Err(io::Error::last_os_error());
 	}
-	// SAFETY: `fd` is an AF_UNIX socket and `address` describes a NUL-terminated
-	// path inside the struct.
-	let endpoint = if unsafe { libc::connect(fd, address.as_ptr(), address.length) } == 0 {
-		WaylandEndpoint::Reachable
-	} else {
-		// SAFETY: `connect` set `errno` for the failure above.
-		match io::Error::last_os_error().raw_os_error() {
-			// Nothing is listening, nothing is there, or the path is not a socket.
-			Some(code) if is_absent(code) => WaylandEndpoint::Stale,
-			// A full backlog means a live but busy compositor, and a permission or
-			// resource failure says nothing about it at all. Neither is staleness.
-			_ => WaylandEndpoint::Blocked,
-		}
-	};
-	// SAFETY: `fd` came from `socket` above and is used nowhere after this.
-	unsafe { libc::close(fd) };
-	endpoint
+	// SAFETY: ownership transfers exactly once and closes on every error path.
+	let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+	// SAFETY: address contains a valid, NUL-terminated sockaddr_un.
+	if unsafe { libc::connect(socket.as_raw_fd(), address.as_ptr(), address.length) } != 0 {
+		return Err(io::Error::last_os_error());
+	}
+	Ok(socket)
 }
 
 /// Whether `errno` proves no compositor socket is there, as opposed to refusing
@@ -265,8 +272,8 @@ impl SocketAddress {
 			return None;
 		}
 		address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-		// SAFETY: `sun_path` has room for `bytes` plus the zeroed terminator, which
-		// is how `connect` sees where the path ends.
+		// SAFETY: `sun_path` has room for `bytes` plus the zeroed terminator,
+		// which is how `connect` sees where the path ends.
 		unsafe {
 			std::ptr::copy_nonoverlapping(
 				bytes.as_ptr(),
@@ -720,16 +727,17 @@ mod backend_selection_tests {
 	/// exactly what the case needs whatever descriptors this process holds open.
 	fn hand_socket_fd_to_child(command: &mut Command, source: Option<RawFd>) {
 		// SAFETY: the closure runs between fork and exec and calls only `dup2`,
-		// `fcntl`, and `close`, all async-signal-safe. `source` belongs to a value
-		// the caller keeps alive until `spawn` returns.
+		// `fcntl`, and `close`, all async-signal-safe. `source` belongs to a
+		// value the caller keeps alive until `spawn` returns.
 		unsafe {
 			command.pre_exec(move || {
 				let Some(source) = source else {
 					// SAFETY: `CHILD_SOCKET_FD` is a number this process owns or has
 					// already closed; either way the child must not inherit it.
 					if libc::close(CHILD_SOCKET_FD) < 0 {
-						// An unused number is the likely case here. Anything else means
-						// the child could still hold a descriptor it must not.
+						// An unused number is the likely case here. Anything else
+						// means the child could still hold a
+						// descriptor it must not.
 						let error = std::io::Error::last_os_error();
 						if error.raw_os_error() != Some(libc::EBADF) {
 							return Err(error);
@@ -1052,9 +1060,9 @@ mod backend_selection_tests {
 		let locked = dir.path().join("locked");
 		fs::create_dir_all(&locked).expect("create locked directory");
 		let _listener = UnixListener::bind(locked.join("wayland-0")).expect("bind compositor socket");
-		// Unsearchable parent: the socket exists and answers, but this process may
-		// not reach it. Root ignores directory permissions, so the case needs a
-		// process they bind on; ask a throwaway directory first.
+		// Unsearchable parent: the socket exists and answers, but this process
+		// may not reach it. Root ignores directory permissions, so the case
+		// needs a process they bind on; ask a throwaway directory first.
 		let probe_dir = dir.path().join("permission-probe");
 		fs::create_dir_all(&probe_dir).expect("create permission probe directory");
 		fs::set_permissions(&probe_dir, fs::Permissions::from_mode(0o000)).expect("lock probe");
