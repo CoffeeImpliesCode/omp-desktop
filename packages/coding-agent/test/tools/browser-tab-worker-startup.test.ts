@@ -902,11 +902,15 @@ describe("browser tabs whose renderer crashed", () => {
 			const browser = headless();
 			const name = `crashed-unlisted-${process.pid}`;
 			const url = `data:text/html,<title>${name}</title>`;
-			const opener = await browser.browser.newPage();
+			const popupContext = await browser.browser.createBrowserContext();
 			try {
 				await acquireTab(name, browser, { url, timeoutMs: 30_000 });
 				const tab = getTab(name);
 				if (tab?.backend !== "worker") throw new Error("Expected a worker tab");
+				await crashRenderer(browser, url);
+				// Create the uncommitted page after the crash, in its own context: it must remain a live target,
+				// not share the renderer whose crash this fixture uses to request the recycle.
+				const opener = await popupContext.newPage();
 				// A crashed page revived by the reattach reports an empty URL for a moment, and Puppeteer lists no
 				// page until its URL is set. A popup whose first load has not committed stays in that state on demand,
 				// so the reattach here is pointed at one.
@@ -922,8 +926,12 @@ describe("browser tabs whose renderer crashed", () => {
 					`http://127.0.0.1:${server.port}/popup`,
 				);
 				const popupId = await popupCreated.promise;
+				const { targetInfo } = await watcher.send("Target.getTargetInfo", { targetId: popupId });
+				expect(targetInfo).toMatchObject({ type: "page", url: "" });
+				// The replacement below stands in for the crashed target's empty-URL revival; the old fixture target
+				// is no longer owned once its id is replaced, so remove it before handing ownership to the popup.
+				await watcher.send("Target.closeTarget", { targetId: tab.targetId });
 				await watcher.detach();
-				await crashRenderer(browser, url);
 				tab.targetId = popupId;
 				// Commit the popup's load only after the new worker has looked the target up. The worker lists
 				// Puppeteer's targets in the same turn it reports `setup`, so that report releases the load.
@@ -936,22 +944,32 @@ describe("browser tabs whose renderer crashed", () => {
 						});
 					}
 				};
+				const crashedWorker = tab.worker;
 				let failure: unknown;
 				try {
-					failure = await runInTab(name, { code: "return 1;", timeoutMs: 10_000, session }).catch(
-						(error: unknown) => error,
-					);
+					failure = await runInTab(name, {
+						code: "await page.evaluate(() => { globalThis.replayed = true; });",
+						timeoutMs: 10_000,
+						session,
+					}).catch((error: unknown) => error);
 				} finally {
 					globalThis.Worker = RealWorker;
 				}
-				expect(String(failure)).toContain("its page reloaded");
+				expect(failure).toBeInstanceOf(Error);
 				// The worker that looked the page up adopted it; an inline fallback would retry after the load committed.
-				expect(getTab(name)).toMatchObject({ worker: { mode: "worker" } });
-				const next = await runInTab(name, { code: "return await page.title();", timeoutMs: 10_000, session });
-				expect(next.returnValue).toBe("late-commit");
+				expect(getTab(name)).toBe(tab);
+				expect(tab).toMatchObject({ state: "alive", targetId: popupId, worker: { mode: "worker" } });
+				expect(tab.worker).not.toBe(crashedWorker);
+				const next = await runInTab(name, {
+					code: "return { title: await page.title(), replayed: await page.evaluate(() => globalThis.replayed ?? false) };",
+					timeoutMs: 10_000,
+					session,
+				});
+				expect(next.returnValue).toEqual({ title: "late-commit", replayed: false });
 			} finally {
+				loadGate.resolve();
 				await releaseTab(name, { kill: true });
-				await opener.close().catch(() => undefined);
+				await popupContext.close();
 				server.stop(true);
 			}
 		},

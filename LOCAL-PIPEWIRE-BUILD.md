@@ -9,7 +9,7 @@ socket path; only a conclusively stale endpoint permits X11 fallback.
 Neither `~/.omp/agent/settings.json` nor `config.yml` enables the capture
 feature. The build below compiles both addons with `wayland-pipewire` and
 embeds them in the executable. The fork also keeps every authorized monitor
-stream, adds exact niri window capture, and integrates upstream v18.18.2.
+stream, adds exact niri window capture, and integrates upstream v18.18.6.
 
 ## Why a hand-dropped addon is not enough
 

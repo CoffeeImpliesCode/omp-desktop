@@ -11,6 +11,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/tools/browser/launch";
 import { DISCARDED_TABS_PROTOCOL_VERSION } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/protocol";
 import { type RelayServer, startRelayServer } from "@oh-my-pi/pi-coding-agent/tools/browser/relay/server";
+import type { WorkerOutbound } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-protocol";
 import * as tabSupervisor from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import { getTab, releaseTab, runInTab } from "@oh-my-pi/pi-coding-agent/tools/browser/tab-supervisor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools/index";
@@ -469,26 +470,63 @@ describe("relay tabs Chrome detaches omp from", () => {
 			await handled;
 			const tab = getTab(name);
 			if (tab?.backend !== "worker") throw new Error("expected a worker tab");
-			const now = spyOn(performance, "now").mockReturnValue(0);
-			const terminate = tab.worker.terminate.bind(tab.worker);
-			const held = spyOn(tab.worker, "terminate").mockImplementation(async () => {
-				await terminate();
-				now.mockReturnValue(30_000);
+			if (!page) throw new Error("expected the borrowed page");
+			const navigation = await page.createCDPSession();
+			await navigation.send("Network.enable");
+			const neverUrl = `${pageUrl}&never`;
+			const requests: string[] = [];
+			navigation.on("Network.requestWillBeSent", event => {
+				if (event.type === "Document") requests.push(event.request.url);
 			});
+			const originalWorker = tab.worker;
+			const now = spyOn(performance, "now").mockReturnValue(0);
+			const RealWorker = globalThis.Worker;
+			let recovered = false;
+			// Exhaust the caller's budget only after re-adoption succeeds. Advancing it at terminate() also
+			// exhausts the replacement's startup budget, which tests startup failure instead of no replay.
+			globalThis.Worker = class RecoveryReportingWorker extends RealWorker {
+				constructor(...args: ConstructorParameters<typeof Worker>) {
+					super(...args);
+					this.addEventListener("message", event => {
+						if ((event.data as WorkerOutbound).type !== "ready") return;
+						recovered = true;
+						now.mockReturnValue(30_000);
+					});
+				}
+			};
 			try {
-				const result = await invoke({ action: "open", url: `${pageUrl}&never`, timeout: 20 }).catch(
+				const result = await invoke({ action: "open", url: neverUrl, timeout: 20 }).catch(
 					(error: unknown) => error,
 				);
-				expect(String(result)).toContain("call was not run again");
-				expect(String(result)).toContain("stays open on what loaded");
-				expect(getTab(name)?.state).toBe("alive");
-				expect(page?.url()).toBe(pageUrl);
+				expect(result).toBeInstanceOf(Error);
+				expect(recovered).toBe(true);
+				expect(getTab(name)).toBe(tab);
+				expect(tab.worker).not.toBe(originalWorker);
+				expect(tab.state).toBe("alive");
+				expect(requests).not.toContain(neverUrl);
+				expect(page.isClosed()).toBe(false);
+				expect(page.url()).toBe(pageUrl);
 			} finally {
+				globalThis.Worker = RealWorker;
 				now.mockRestore();
-				held.mockRestore();
+				await navigation.detach();
 			}
+			expect((await invoke(readMark)).value).toBe("kept");
 		},
 		60_000,
+	);
+
+	it.skipIf(!CHROMIUM_AVAILABLE)(
+		"re-adopts a kept relay tab after release and reads the state left on it",
+		async () => {
+			await openRelayTab();
+			for (let attempt = 0; attempt < 4; attempt++) {
+				await releaseTab(name, { keepPage: true });
+				await invoke({ action: "open", app: { relay: true, target: "case=" }, timeout: 20 });
+				expect((await invoke(readMark)).value).toBe("kept");
+			}
+		},
+		120_000,
 	);
 
 	it.skipIf(!CHROMIUM_AVAILABLE)(

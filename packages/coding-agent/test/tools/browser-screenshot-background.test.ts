@@ -49,6 +49,7 @@ async function repaintAndCapture(name: string, color: string): Promise<[number, 
 	return [pixels[0], pixels[1], pixels[2]];
 }
 
+/** Borrowed pages are focus-emulated; read the unborrowed user's visibility to prove it stayed selected. */
 const visibility = (target: Page): Promise<string> => target.evaluate("document.visibilityState") as Promise<string>;
 
 const cleanups: (() => Promise<void>)[] = [];
@@ -107,7 +108,6 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser screenshots of background tabs", (
 
 		expect(await repaintAndCapture(name, "#00ff00")).toEqual([0, 255, 0]);
 		expect(await visibility(userPage)).toBe("visible");
-		expect(await visibility(agentPage)).toBe("hidden");
 	}, 45_000);
 
 	it.each(["selector", "fullPage"] as const)(
@@ -151,7 +151,6 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser screenshots of background tabs", (
 				expect([...image.pixels.subarray(targetPixel, targetPixel + 3)]).toEqual([255, 0, 0]);
 			}
 			expect(await visibility(userPage)).toBe("visible");
-			expect(await visibility(agentPage)).toBe("hidden");
 		},
 		45_000,
 	);
@@ -193,7 +192,6 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser screenshots of background tabs", (
 		expect(difference.pixelChangeRatio).toBe(1);
 		expect(decodePng(await fs.readFile(difference.diffPath)).width).toBeGreaterThan(0);
 		expect(await visibility(userPage)).toBe("visible");
-		expect(await visibility(adopted)).toBe("hidden");
 
 		const tracked = await runInTab(name, {
 			code: `
@@ -213,7 +211,6 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser screenshots of background tabs", (
 		const image = decodePng(await fs.readFile(changedPath));
 		expect([...image.pixels.subarray(0, 3)]).toEqual([255, 0, 0]);
 		expect(await visibility(userPage)).toBe("visible");
-		expect(await visibility(adopted)).toBe("hidden");
 	}, 45_000);
 
 	it("captures the adopted tab after the user switched away from it", async () => {

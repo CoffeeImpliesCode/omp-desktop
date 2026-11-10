@@ -194,7 +194,7 @@ export interface EvalToolDescriptionOptions {
 	autoBackgroundEnabled?: boolean;
 	/** Advertise `@tool` / `tool(fn)` and the `tools` spawn option (`eval.tools.enabled`). */
 	evalTools?: boolean;
-	/** Push `workpool()` as the default for independent items (model delegation bias `eager`). Default: true. */
+	/** Push `workpool()` as the default for independent items (model delegation bias `eager`). Default: false. */
 	eagerDelegation?: boolean;
 	/** Point blocked callers at the `wait` tool; false when the session lacks it (subagents). Default: true. */
 	waitTool?: boolean;
@@ -223,7 +223,7 @@ function evalTemplateContext(options: EvalToolDescriptionOptions) {
 		py: options.py ?? true,
 		js: options.js ?? true,
 		evalTools: options.evalTools ?? true,
-		eagerDelegation: options.eagerDelegation ?? true,
+		eagerDelegation: options.eagerDelegation ?? false,
 		waitTool: options.waitTool ?? true,
 		autoBackgroundEnabled: options.autoBackgroundEnabled ?? false,
 		spawns: spawnPolicy.enabled,

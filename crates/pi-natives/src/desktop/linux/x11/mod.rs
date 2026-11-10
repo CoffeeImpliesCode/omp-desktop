@@ -41,7 +41,9 @@ impl X11Backend {
 		let capture = X11Capture::new(display)?;
 		let input = X11Input::new(capture.connection(), capture.root())?;
 		let control = X11Control::new(capture.connection(), capture.root(), capture.root_size())?;
-		let ax = AtSpiAx::new().ok();
+		let ax = AtSpiAx::new()
+			.ok()
+			.map(|ax| ax.with_native_windows(Box::new(capture.clone())));
 		Ok(Self { capture, input, control, ax, display_server: std::env::var("DISPLAY").ok() })
 	}
 }

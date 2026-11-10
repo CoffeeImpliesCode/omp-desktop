@@ -2,7 +2,7 @@
 
 This fork of [oh-my-pi](https://github.com/can1357/oh-my-pi) improves desktop computer use specifically for **Linux Wayland**.
 
-Upstream base: [v18.18.2](https://github.com/can1357/oh-my-pi/releases/tag/v18.18.2).
+Upstream base: [v18.18.6](https://github.com/can1357/oh-my-pi/releases/tag/v18.18.6).
 
 ## Linux Wayland improvements
 
@@ -17,7 +17,6 @@ Upstream base: [v18.18.2](https://github.com/can1357/oh-my-pi/releases/tag/v18.1
 
 Native capture requires a Linux build with the `wayland-pipewire` feature and system PipeWire libraries.
 See the [Linux build guide](LOCAL-PIPEWIRE-BUILD.md).
-The local compile helper accepts `OMP_LOCAL_OUTFILE` to select the output path.
 Per-window Wayland input remains unavailable, and AX access depends on each application's AT-SPI registration.
 
 **The upstream packages and installers below do not include these fork changes.**
@@ -372,7 +371,7 @@ Auth tags below: `oauth` signs in with your provider account, `plan` routes thro
 
 Direct APIs and gateways. Mix providers per role.
 
-Anthropic `oauth` · OpenAI · OpenAI Codex `oauth` · Google Gemini · Google Vertex · Google Antigravity `oauth` · xAI · SuperGrok `oauth` · DeepSeek · Mistral · Groq · Cerebras · SambaNova · Fireworks · Together · Modular · Baseten · DeepInfra · Hugging Face · NVIDIA · Meta · Inception · Amazon Bedrock · Azure OpenAI · SiliconFlow · GMI Cloud · CoreWeave · Sakana AI · Command Code · Charm Hyper · StepFun · Helmcode · OpenRouter · Synthetic · Vercel AI Gateway · Cloudflare AI Gateway · Wafer Serverless · Scaleway
+Anthropic `oauth` · OpenAI · OpenAI Codex `oauth` · Google Gemini · Google Vertex · Google Antigravity `oauth` · xAI · SuperGrok `oauth` · DeepSeek · Mistral · Groq · Cerebras · SambaNova · Fireworks · Together · Modular · Baseten · DeepInfra · Hugging Face · NVIDIA · Meta · Inception · Amazon Bedrock · Azure OpenAI · SiliconFlow · GMI Cloud · CoreWeave · Sakana AI · Command Code · Charm Hyper · StepFun · Helmcode · OpenRouter · Synthetic · Vercel AI Gateway · Cloudflare AI Gateway · Wafer Serverless · Scaleway · Otari
 
 ### Coding plans
 
