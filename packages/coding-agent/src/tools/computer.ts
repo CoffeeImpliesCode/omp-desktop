@@ -302,6 +302,7 @@ async function invokeComputer(
 			if (lifetime.isClosed()) throw new ToolError("Computer session is closed");
 			return await runComputer(session, controller, params, context);
 		case "capabilities": {
+			// A disposed session has no controller left to ask; the closed state is the whole answer.
 			const capabilities = lifetime.isClosed()
 				? undefined
 				: await controller.capabilities(buildComputerSnapshot(session, true), context.signal);
@@ -317,7 +318,7 @@ async function invokeComputer(
 			};
 		}
 		case "close":
-			await lifetime.close();
+			await controller.reset();
 			throwIfAborted(context.signal);
 			return { content: [{ type: "text", text: "Closed computer session" }] };
 	}

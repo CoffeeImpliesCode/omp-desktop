@@ -100,6 +100,12 @@ export interface ComputerController {
 	discardCell?(cellId: string): void;
 	/** Commit the cell's AX baseline only after Eval accepts its complete output. */
 	acceptCell?(cellId: string): void;
+	/**
+	 * Ends the desktop session the model sees (`computer.close()`): its handles, frames, refs and control go, the
+	 * user's Escape stops stay, and the next call opens a new session.
+	 */
+	reset(): Promise<void>;
+	/** Ends the controller for good when its agent session is disposed; later calls fail. */
 	close(): Promise<void>;
 }
 
@@ -660,6 +666,11 @@ export class ComputerSupervisor implements ComputerController {
 		await worker?.terminate().catch(() => undefined);
 	}
 
+	async reset(): Promise<void> {
+		if (this.#closed) return;
+		await this.#shutdown();
+	}
+
 	async close(): Promise<void> {
 		if (this.#closed) return;
 		this.#closed = true;
@@ -670,6 +681,11 @@ export class ComputerSupervisor implements ComputerController {
 				// An addon without the Escape exports kept no count to drop; the worker must still close.
 			}
 		}
+		await this.#shutdown();
+	}
+
+	/** Asks the worker to close its native session, then terminates it; a later `#start()` spawns a new one. */
+	async #shutdown(): Promise<void> {
 		const worker = this.#worker;
 		if (!worker) return;
 		const closed = Promise.withResolvers<void>();
@@ -683,7 +699,8 @@ export class ComputerSupervisor implements ComputerController {
 			// Forced termination below is the bounded close fallback.
 		} finally {
 			unsubscribe();
-			await this.#terminate(new ToolError("Computer session closed"));
+			// A crash while closing already terminated this worker; a call since may have started its successor.
+			if (this.#worker === worker) await this.#terminate(new ToolError("Computer session closed"));
 		}
 	}
 }

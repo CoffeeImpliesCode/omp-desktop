@@ -7,6 +7,68 @@
 - Clearing or rebuilding the transcript now releases detached cards and their render caches while keeping reused cards readable.
 - Completed edits discard superseded streaming previews, and retired tool cards release render caches without losing results or image replay.
 
+## [18.19.0] - 2026-11-12
+
+### Added
+
+- GitHub Actions watch cards now show current-step progress and can be expanded with Ctrl+O to display ordered step states and durations in ANSI and native Tern views.
+
+### Fixed
+
+- Fixed comparison charts mislabeling gaps against a rival column as improvements or regressions.
+- Fixed Tern edit diffs showing unrelated one-line hunks and incorrect line numbers around distant changes.
+- Fixed table charts incorrectly interpreting words such as “with,” “to,” and “from” in column names as comparison conditions.
+- Fixed chart row names containing trailing numbers, such as “EmbeddingGemma 2” and “Jev 15,” being split or incorrectly nested.
+- Fixed `read` rejecting colon-separated line ranges and displaying a single requested range as multiple rows.
+
+### Removed
+
+- Removed the `blocked` status from `TodoStatus`, the `blocker` field from `TodoItem`, and the `block`/`unblock` operations from `TodoOperation`.
+
+## [18.18.9] - 2026-11-11
+
+### Added
+
+- Added the Sofya label for `sofya` web search results ([#18185](https://github.com/can1357/oh-my-pi/pull/18185) by [@yusufgurdogan](https://github.com/yusufgurdogan))
+- The context breakdown counts instruction files and skills from the system prompt as built, matching `/context`, and lists Instruction files as its own category ([#17971](https://github.com/can1357/oh-my-pi/pull/17971) by [@c-w-z](https://github.com/c-w-z))
+- Context Viewer adds an Instruction Files category and opens Skills like any other category; `ContextViewEntry.sourceMarkers` colors viewer-only source markers by category in previews and full content, and `ContextViewData.notices` lists snapshot caveats under the Overview legend ([#17971](https://github.com/can1357/oh-my-pi/pull/17971) by [@c-w-z](https://github.com/c-w-z))
+
+### Fixed
+
+- In Tern, an `ask` question outside a `<fieldset>` gets its own tab instead of sharing the tab of the question before it ([#18660](https://github.com/can1357/oh-my-pi/pull/18660) by [@DocksDocks](https://github.com/DocksDocks))
+- The `/resume` picker shows dates of sessions older than a week in the locale from `LC_ALL`, `LC_TIME` or `LANG` instead of always using `MM/DD/YYYY` ([#18863](https://github.com/can1357/oh-my-pi/pull/18863) by [@raoulkent](https://github.com/raoulkent))
+- Fixed an `ask` HTML form in Tern not taking typing after a click on its Other row or a text well while a composer draft held the keyboard: the click now hands the keys to the form, as ↑/↓ does, instead of every key still editing the draft
+- Agent Hub status scopes (All, Running, Done, Parked) show icons in Tern instead of empty squares ([#18880](https://github.com/can1357/oh-my-pi/pull/18880) by [@a-glapinski](https://github.com/a-glapinski))
+- Fixed streaming tables that overflow the screen staying squeezed to their header's column widths after the rows arrive ([#18909](https://github.com/can1357/oh-my-pi/pull/18909) by [@JustasMasiulis](https://github.com/JustasMasiulis))
+
+### Removed
+
+- Removed `estimateSkillsTokens()` and the `skillful` context-usage option; Skills tokens come from the built prompt's sources ([#17971](https://github.com/can1357/oh-my-pi/pull/17971) by [@c-w-z](https://github.com/c-w-z))
+
+## [18.18.8] - 2026-11-11
+
+- The live transcript reuses its per-block walk list across each frame's readers instead of rebuilding it three times per frame, so settled transcripts cost fewer short-lived allocations per frame ([#18705](https://github.com/can1357/oh-my-pi/pull/18705) by [@yuzu-octopus](https://github.com/yuzu-octopus))
+
+### Changed
+
+- Ask forms support notes on options: `n` on radio/checkbox rows and `Alt+n` on select menus (`app.ask.note`), with selected notes shown alongside submitted answers and notes on unchosen options marked as drafts ([#18779](https://github.com/can1357/oh-my-pi/pull/18779) by [@Shadorain](https://github.com/Shadorain))
+
+### Fixed
+
+- Ask form textareas edited from Tern now restart the inactivity timeout instead of submitting mid-edit
+- Fixed a picture in an `ask` form staying painted on screen after the form closed ([#18693](https://github.com/can1357/oh-my-pi/pull/18693) by [@jaredlyon](https://github.com/jaredlyon))
+- Fixed terminal Device Attributes replies (such as `^[[?64;1;2;4;6;17;18;21;22c`) leaking into the shell prompt on exit ([#18662](https://github.com/can1357/oh-my-pi/pull/18662) by [@asuffield](https://github.com/asuffield))
+
+## [18.18.7] - 2026-11-10
+
+### Changed
+
+- `grep` and `ast_grep` results with no matches render as one line with `0 matches` in the warning color, dropping the separate `No matches found` row ([#18700](https://github.com/can1357/oh-my-pi/pull/18700) by [@JustasMasiulis](https://github.com/JustasMasiulis))
+
+### Fixed
+
+- Saved-reset messages name the Claude Fable weekly limit as "Claude Fable weekly" instead of its raw id ([#18661](https://github.com/can1357/oh-my-pi/pull/18661) by [@TheAifam5](https://github.com/TheAifam5))
+
 ## [18.18.6] - 2026-11-09
 
 ### Added
@@ -2563,4 +2625,4 @@
 - Fixed tmux offscreen-shrink frames to skip repainting when the visible tail is unchanged, avoiding intermittent blank/refresh flashes in pane terminals ([#2046](https://github.com/can1357/oh-my-pi/issues/2046)).
 - Fixed Windows ConPTY hosts (Windows Terminal, Tabby, Hyper, VS Code) parking the viewport at the top of a full paint after a `/resume` or any long-session repaint. `ProcessTerminal#safeWrite` now splits oversized writes into ≤ 8 KiB pieces at line boundaries on `win32` and inside WSL (where stdout still crosses ConPTY at the `wslhost` boundary) so each underlying `WriteFile` stays below the ~32 KiB threshold where ConPTY stops tracking the cursor; the data was always delivered, but the host UI's scroll position would not follow until any focus event forced a re-query. ([#2034](https://github.com/can1357/oh-my-pi/issues/2034))
 
-Older entries are archived in [packages/tui/CHANGELOG.md@bdbb5c920f69](https://github.com/can1357/oh-my-pi/blob/bdbb5c920f693caff287c50996c116e42e37992b/packages/tui/CHANGELOG.md).
+Older entries are archived in [packages/tui/CHANGELOG.md@7049d1b1afeb](https://github.com/can1357/oh-my-pi/blob/7049d1b1afeb8e421e7f9fba5c1dcebd7c382232/packages/tui/CHANGELOG.md).

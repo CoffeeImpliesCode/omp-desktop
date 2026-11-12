@@ -24,6 +24,7 @@ import {
 	type ComputerWorkerOutbound,
 	type ComputerWorkerTransport,
 	ESCAPE_AFTER_CALL_MESSAGE,
+	ESCAPE_REFUSED_MESSAGE,
 	ESCAPE_STOPPED_MESSAGE,
 	SCREEN_LOCKED_CAPTURE_NOTE,
 } from "@oh-my-pi/pi-coding-agent/tools/computer/protocol";
@@ -1044,6 +1045,7 @@ function stubController(stub: StubController): SettlingController {
 		async capabilities() {
 			return undefined;
 		},
+		async reset() {},
 		async close() {},
 	};
 	return controller;
@@ -1092,11 +1094,13 @@ function workerPrelude(session: ToolSession, native: NativeDesktopSession): Eval
 		async capabilities() {
 			return native.capabilities;
 		},
-		async close() {
-			transport.inbound({ type: "close" });
-			await transport.waitFor(message => message.type === "closed");
-		},
+		reset: closeWorker,
+		close: closeWorker,
 	}));
+	async function closeWorker(): Promise<void> {
+		transport.inbound({ type: "close" });
+		await transport.waitFor(message => message.type === "closed");
+	}
 }
 afterAll(async () => {
 	await Promise.all([disposeAllKernelSessions(), disposeAllVmContexts()]);
@@ -1111,6 +1115,7 @@ describe("computer prelude", () => {
 			async capabilities() {
 				return undefined;
 			},
+			async reset() {},
 			async close() {},
 		}));
 		const context = { session: toolSession(), toolCallId: "computer-validation" };
@@ -1166,14 +1171,13 @@ describe("computer prelude", () => {
 		await prelude.invoke({ action: "close" }, context);
 	});
 
-	it("routes run, capabilities, images, cancellation inputs, and close through one host controller", async () => {
+	it("routes run, capabilities, images, and cancellation inputs through one host controller", async () => {
 		const calls: Array<{
 			code: string;
 			timeoutMs: number;
 			snapshot: ComputerSessionSnapshot;
 			signal?: AbortSignal;
 		}> = [];
-		let closeCount = 0;
 		const controller: ComputerController = {
 			async run(code: string, timeoutMs: number, runSnapshot: ComputerSessionSnapshot, signal?: AbortSignal) {
 				calls.push({ code, timeoutMs, snapshot: runSnapshot, signal });
@@ -1190,9 +1194,8 @@ describe("computer prelude", () => {
 			async capabilities() {
 				return capabilities;
 			},
-			async close() {
-				closeCount += 1;
-			},
+			async reset() {},
+			async close() {},
 		};
 		const session = toolSession();
 		const prelude = createComputerPrelude(session, () => controller);
@@ -1261,12 +1264,6 @@ describe("computer prelude", () => {
 
 		const capabilityResult = await prelude.invoke({ action: "capabilities" }, context);
 		expect(capabilityResult.details).toEqual(capabilities);
-		await prelude.invoke({ action: "close" }, context);
-		await prelude.invoke({ action: "close" }, context);
-		expect(closeCount).toBe(1);
-		await expect(prelude.invoke({ action: "run", code: "await desktop.windows()" }, context)).rejects.toThrow(
-			"Computer session is closed",
-		);
 	});
 
 	it("installs a frozen JavaScript facade with handle proxies, runs, direct values, and display text", async () => {
@@ -1278,6 +1275,7 @@ describe("computer prelude", () => {
 			async capabilities() {
 				return undefined;
 			},
+			async reset() {},
 			async close() {},
 		}));
 		const calls: unknown[] = [];
@@ -1460,6 +1458,7 @@ describe("computer prelude", () => {
 			async capabilities() {
 				return undefined;
 			},
+			async reset() {},
 			async close() {},
 		}));
 		const calls: unknown[] = [];
@@ -1553,6 +1552,7 @@ describe("computer prelude", () => {
 			async capabilities() {
 				return undefined;
 			},
+			async reset() {},
 			async close() {},
 		}));
 		const callValues: Record<string, unknown> = {
@@ -2081,6 +2081,7 @@ describe("computer prelude", () => {
 			async capabilities() {
 				return undefined;
 			},
+			async reset() {},
 			async close() {},
 		}));
 		definitions = [
@@ -2114,6 +2115,7 @@ describe("computer prelude", () => {
 			async capabilities() {
 				return undefined;
 			},
+			async reset() {},
 			async close() {},
 		}));
 
@@ -2211,6 +2213,7 @@ describe("computer prelude", () => {
 				async capabilities() {
 					return native.capabilities;
 				},
+				async reset() {},
 				async close() {
 					transport.inbound({ type: "close" });
 				},
@@ -2429,7 +2432,7 @@ describe("computer worker round trips", () => {
 			if (locked) {
 				expect(result.content[0]).toMatchObject({
 					type: "text",
-					text: expect.stringMatching(/^Note: when this run ended the screen is locked\. /),
+					text: expect.stringMatching(/^Note: when this run ended the screen is locked\.\s/),
 				});
 			} else {
 				expect(notes).toEqual([]);
@@ -2453,7 +2456,7 @@ describe("computer worker round trips", () => {
 			if (result.ok) return;
 			const [first, ...rest] = result.error.message.split("\n");
 			expect(first).toBe("verification failed");
-			if (locked) expect(rest.join("\n")).toMatch(/^Note: when this run ended the screen is locked\. /);
+			if (locked) expect(rest.join("\n")).toMatch(/^Note: when this run ended the screen is locked\.\s/);
 			else expect(rest).toEqual([]);
 		}
 	});
@@ -2469,7 +2472,7 @@ describe("computer worker round trips", () => {
 		);
 		const [note] = result.content;
 		const text = note?.type === "text" ? note.text : "";
-		expect(text).toMatch(/^Note: when this run ended the session's display is asleep\. /);
+		expect(text).toMatch(/^Note: when this run ended the session's display is asleep\.\s/);
 		expect(text).toContain("Nothing on that display can be captured or clicked until it wakes.");
 		expect(text).toContain("`computer.display`");
 	});
@@ -2503,7 +2506,7 @@ describe("computer worker round trips", () => {
 		if (result.ok) return;
 		const [first, ...rest] = result.error.message.split("\n");
 		expect(first).toBe("Computer code execution timed out after 50ms");
-		expect(rest.join("\n")).toMatch(/^Note: when this run ended the screen is locked\. /);
+		expect(rest.join("\n")).toMatch(/^Note: when this run ended the screen is locked\.\s/);
 		expect(native.blockingReads).toBe(0);
 	});
 
@@ -3022,6 +3025,38 @@ describe("computer worker round trips", () => {
 			const result = await runWorker(transport, "numeric-miss", `await desktop.window(${id})`);
 			expect(result.ok).toBe(false);
 			if (!result.ok) expect(result.error.message.split("\n")[0]).toBe(`no window matches ${id}`);
+		});
+	});
+
+	it("prefers exact app names across all windows and keeps substring ambiguity otherwise", async () => {
+		const transport = new MemoryTransport();
+		const native = new FakeNativeSession();
+		native.listWindows = async () => [
+			{ ...windowFixture, app: "Google Chrome", title: "Home" },
+			{ ...windowFixture, id: "7", app: "Google Chrome for Testing", title: "Report" },
+			{ ...windowFixture, id: "8", app: "Google Chrome Canary", title: "Report" },
+		];
+		new ComputerWorkerCore(transport, () => native);
+		const result = await runWorker(
+			transport,
+			"exact-app",
+			`const listed = await desktop.windows({ app: "gOoGlE cHrOmE" });
+			const selected = await desktop.window({ app: "GOOGLE CHROME", wait: 100 });
+			const titled = await desktop.windows({ app: "Google Chrome", title: "Report" });
+			let miss; try { await desktop.window({ app: "Google Chrome", title: "Report" }); } catch (error) { miss = error.message; }
+			const partial = await desktop.windows({ app: "Chrome" });
+			let ambiguous; try { await desktop.window({ app: "Chrome" }); } catch (error) { ambiguous = error.message; }
+			return { listed: listed.map(w => w.id), selected: selected.id, titled, miss, partial: partial.length, ambiguous };`,
+		);
+		expect(result.ok).toBe(true);
+		if (!result.ok) return;
+		expect(result.payload.returnValue).toMatchObject({
+			listed: ["42"],
+			selected: "42",
+			titled: [],
+			miss: expect.stringContaining("no window matches"),
+			partial: 3,
+			ambiguous: expect.stringContaining("multiple windows match"),
 		});
 	});
 
@@ -4338,6 +4373,24 @@ describe("expanded computer APIs", () => {
 			isAbort: false,
 			message: ESCAPE_AFTER_CALL_MESSAGE,
 		});
+	});
+
+	it("reopens the desktop session after computer.close(), still refusing calls after the user's Escape", async () => {
+		const { native, prelude, context, close } = await escapeHarness();
+		try {
+			await prelude.invoke(CLICK, context);
+			await prelude.invoke({ action: "close" }, context);
+			expect(native.closeCount).toBe(1);
+			await prelude.invoke(CLICK, context);
+			expect(native.clickCount).toBe(2);
+
+			native.escapeStops += 1;
+			await prelude.invoke({ action: "close" }, context);
+			await expect(prelude.invoke(CLICK, context)).rejects.toThrow(ESCAPE_REFUSED_MESSAGE);
+			expect(native.clickCount).toBe(2);
+		} finally {
+			await close();
+		}
 	});
 
 	it("reports what the stopped operation said, such as a failed restoration, ahead of the stop", async () => {
@@ -6931,6 +6984,7 @@ describe("display hold follows the agent turn", () => {
 			releaseDisplay(turn) {
 				releases.push(turn);
 			},
+			async reset() {},
 			async close() {},
 		}));
 		const signal = new AbortController().signal;

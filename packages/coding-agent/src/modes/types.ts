@@ -32,6 +32,7 @@ import type { Skill } from "../extensibility/skills";
 import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import type { AgentSession } from "../session/agent-session";
+import type { BlockedKind } from "../utils/run-status";
 import type { DroppedPrompt } from "../session/agent-session-types";
 import type { AgentViewSession } from "../session/agent-session-handle";
 import type { CompactMode } from "../session/compact-modes";
@@ -413,7 +414,8 @@ export interface InteractiveModeContext {
 	// Lifecycle
 	init(options?: InteractiveModeInitOptions): Promise<void>;
 	playWelcomeIntro(): void;
-	shutdown(): Promise<void>;
+	/** Close and quit. Operator quits are cancellable by extensions; pass `cancellable: false` for forced closes. */
+	shutdown(options?: { cancellable?: boolean }): Promise<void>;
 	/** Tear down like {@link shutdown}, then relaunch the CLI with the original launch flags, resuming this session. */
 	restart(): Promise<void>;
 	/** Request graceful shutdown at the next fully settled boundary, including background turns. */
@@ -776,6 +778,7 @@ export interface InteractiveModeContext {
 		title: string,
 		options: ExtensionUISelectItem[],
 		dialogOptions?: InteractiveSelectorDialogOptions,
+		extra?: { kind?: BlockedKind },
 	): Promise<string | undefined>;
 	hideHookSelector(): void;
 	showHookInput(title: string, placeholder?: string): Promise<string | undefined>;
