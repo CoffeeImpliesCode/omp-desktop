@@ -538,6 +538,7 @@ export async function executeWithKernelBase<
 			? registerPyToolBridge(options.bridgeSessionId, runId, {
 					toolSession: options.toolSession,
 					signal: options.signal,
+					cellTimeoutMs: executionTimeoutMs ?? options.idleTimeoutMs ?? 0,
 					shieldedSignal: abortShield.signal,
 					emitStatus,
 					onReply: options.onReply,

@@ -105,6 +105,13 @@ fn work_area_rect(values: [u32; 4]) -> Option<Rect> {
 	Some(Rect { x: i32::try_from(x).ok()?, y: i32::try_from(y).ok()?, width, height })
 }
 
+/// How long a sent activation is given to move the focus after the user
+/// intervened, so the caller's hand-back can undo it: the shortest budget a
+/// takeover gives the WM to act on the same request.
+const QUEUED_ACTIVATION_WAIT: Duration = Duration::from_millis(800);
+/// Poll for that move; the user's keys reach the target until it is undone.
+const QUEUED_ACTIVATION_POLL: Duration = Duration::from_millis(2);
+
 pub(super) struct Atoms {
 	pub net_active_window:   Atom,
 	pub net_wm_pid:          Atom,
@@ -118,11 +125,13 @@ pub(super) struct Atoms {
 	/// The EWMH/ICCCM atoms of the window-control routes, in one table so every
 	/// route reads the same ids.
 	pub control:             ControlAtoms,
+	/// `_OMP_MPX_HOLDER`, the master pointer property naming the pair's holder.
+	pub mpx_holder:          Atom,
 }
 
 impl Atoms {
 	pub(super) fn intern(conn: &RustConnection) -> CoreResult<Self> {
-		const NAMES: [&str; 30] = [
+		const NAMES: [&str; 31] = [
 			"_NET_ACTIVE_WINDOW",
 			"_NET_WM_PID",
 			"_NET_WM_NAME",
@@ -153,6 +162,7 @@ impl Atoms {
 			"WM_DELETE_WINDOW",
 			"WM_CHANGE_STATE",
 			"_NET_SUPPORTED",
+			"_OMP_MPX_HOLDER",
 		];
 		let cookies = NAMES
 			.iter()
@@ -195,6 +205,7 @@ impl Atoms {
 			delete_window,
 			change_state,
 			supported,
+			mpx_holder,
 		] = atoms[..]
 		else {
 			return Err(wm_failed("interned atom count diverged from the name table"));
@@ -208,6 +219,7 @@ impl Atoms {
 			wm_state,
 			time_probe,
 			passive_popup_types: [tooltip, notification, dnd],
+			mpx_holder,
 			control: ControlAtoms {
 				supporting_wm_check,
 				number_of_desktops,
@@ -599,22 +611,33 @@ impl Wm<'_> {
 		&self,
 		window: Window,
 		current: Option<Window>,
+		check_user: impl Fn() -> CoreResult<()>,
 	) -> CoreResult<()> {
-		self.activate(window, current, false)
+		self.activate(window, current, false, check_user)
 	}
 
 	pub(super) fn restore_activation(&self, window: Window, current: Window) -> CoreResult<()> {
-		self.activate(window, Some(current), true)
+		self.activate(window, Some(current), true, || Ok(()))
 	}
 
-	fn activate(&self, window: Window, current: Option<Window>, restoring: bool) -> CoreResult<()> {
+	fn activate(
+		&self,
+		window: Window,
+		current: Option<Window>,
+		restoring: bool,
+		check_user: impl Fn() -> CoreResult<()>,
+	) -> CoreResult<()> {
+		control::check()?;
+		let time = self.server_time();
+		#[cfg(test)]
+		super::input::named_change_tests::after_server_time();
 		control::check()?;
 		// Timestamp acquisition can yield to physical input. Re-check the
 		// guard immediately before requesting a restore, not just before it.
-		if restoring && !current.is_some_and(|current| self.is_focused(current, true)) {
+		if restoring && !current.is_some_and(|current| self.is_focused(current, false)) {
 			return Ok(());
 		}
-		let time = self.server_time();
+		check_user()?;
 		self.send_to_root(window, self.atoms.net_active_window, [
 			2,
 			time,
@@ -622,11 +645,19 @@ impl Wm<'_> {
 			0,
 			0,
 		])?;
-		control::check()?;
+		#[cfg(test)]
+		super::input::named_change_tests::after_send();
+		// The WM holds the request and can move the focus once the caller has
+		// looked; let it, so the hand-back sees the move and undoes it. Escape
+		// both cancels and counts as a press, so neither may skip the wait.
+		if let Err(error) = control::check().and_then(|()| check_user()) {
+			self.await_activation(window);
+			return Err(error);
+		}
 		// Never override a newer focus switch while the WM handles the request.
 		if restoring
-			&& !self.is_focused(window, true)
-			&& !current.is_some_and(|current| self.is_focused(current, true))
+			&& !self.is_focused(window, false)
+			&& !current.is_some_and(|current| self.is_focused(current, false))
 		{
 			return Ok(());
 		}
@@ -635,6 +666,16 @@ impl Wm<'_> {
 			let _ = cookie.check();
 		}
 		self.conn.flush().map_err(wm_failed)
+	}
+
+	/// Waits, bounded, for core focus to reach `window` after its activation
+	/// was sent; a WM that declines the request leaves it at the bound. A
+	/// cancel does not end it: the caller's hand-back needs to see the move.
+	pub(super) fn await_activation(&self, window: Window) {
+		let deadline = Instant::now() + QUEUED_ACTIVATION_WAIT;
+		while Instant::now() < deadline && !self.is_focused(window, false) {
+			control::settle(QUEUED_ACTIVATION_POLL);
+		}
 	}
 
 	/// Whether `window` is the active window (when an EWMH WM tracks one) and
@@ -737,20 +778,59 @@ impl Wm<'_> {
 	/// A mapped popup is evidence that input may be grabbed, not proof of
 	/// who owns the grab. Never use this heuristic to authorize core input.
 	pub(super) fn grab_popup_of(&self, pid: u32) -> Option<Window> {
-		self.children(self.root).into_iter().rev().find(|&child| {
-			let Some(attributes) = self
-				.conn
-				.get_window_attributes(child)
-				.ok()
-				.and_then(|cookie| cookie.reply().ok())
-			else {
-				return false;
-			};
-			attributes.override_redirect
-				&& attributes.map_state == MapState::VIEWABLE
-				&& self.root_child_pid(child) == Some(pid)
-				&& !self.is_passive_popup(child)
-		})
+		self
+			.children(self.root)
+			.into_iter()
+			.rev()
+			.find(|&child| self.is_grab_popup_of(child, pid))
+	}
+
+	/// Every popup [`Self::grab_popup_of`] would consider, topmost first: a
+	/// submenu and the menu it opened from are one grab.
+	pub(super) fn grab_popups_of(&self, pid: u32) -> Vec<Window> {
+		let mut children = self.children(self.root);
+		children.retain(|&child| self.is_grab_popup_of(child, pid));
+		children.reverse();
+		children
+	}
+
+	fn is_grab_popup_of(&self, child: Window, pid: u32) -> bool {
+		let Some(attributes) = self
+			.conn
+			.get_window_attributes(child)
+			.ok()
+			.and_then(|cookie| cookie.reply().ok())
+		else {
+			return false;
+		};
+		attributes.override_redirect
+			&& attributes.map_state == MapState::VIEWABLE
+			&& self.root_child_pid(child) == Some(pid)
+			&& !self.is_passive_popup(child)
+	}
+
+	/// Whether screen point (`x`, `y`) lies inside `window`; `false` when its
+	/// geometry cannot be read.
+	pub(super) fn contains_point(&self, window: Window, x: i16, y: i16) -> bool {
+		let geometry = self
+			.conn
+			.get_geometry(window)
+			.ok()
+			.and_then(|cookie| cookie.reply().ok());
+		let origin = self
+			.conn
+			.translate_coordinates(window, self.root, 0, 0)
+			.ok()
+			.and_then(|cookie| cookie.reply().ok());
+		let (Some(geometry), Some(origin)) = (geometry, origin) else {
+			return false;
+		};
+		let (left, top) = (i32::from(origin.dst_x), i32::from(origin.dst_y));
+		let (px, py) = (i32::from(x), i32::from(y));
+		px >= left
+			&& py >= top
+			&& px < left + i32::from(geometry.width)
+			&& py < top + i32::from(geometry.height)
 	}
 
 	fn is_passive_popup(&self, window: Window) -> bool {

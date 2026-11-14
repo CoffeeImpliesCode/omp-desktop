@@ -20,7 +20,7 @@ use crate::desktop::{
 	error::{CoreResult, DesktopError},
 	frame::FrameGeometry,
 	keys::KeyName,
-	linux::ax::{AtSpiAx, AtSpiWindow, resolve_focus},
+	linux::ax::{self, AtSpiAx, AtSpiWindow, resolve_focus},
 	types::{
 		CaptureCaps, DesktopCapabilities, DesktopControlCapabilities, DesktopDisplay, DesktopWindow,
 		DesktopWindowState, DesktopWorkspace, DisplaySelector, Target,
@@ -55,6 +55,9 @@ pub struct WaylandBackend {
 	/// own AT-SPI frames never count as the focused application window. On
 	/// Plasma it is `kwin_wayland_wrapper`, which owns no frames.
 	compositor_pid:    Option<u32>,
+	/// Bus names of the applications that did not answer the last window
+	/// listing, whose windows it therefore left out.
+	unanswered:        Vec<String>,
 }
 
 /// Reads the compositor's PID from niri IPC or from peer credentials of the
@@ -113,6 +116,7 @@ impl WaylandBackend {
 			input_unavailable: OnceCell::new(),
 			displays,
 			compositor_pid: compositor_pid(),
+			unanswered: Vec::new(),
 		}
 	}
 
@@ -161,8 +165,8 @@ impl WaylandBackend {
 		result
 	}
 
-	fn atspi_windows(&self) -> CoreResult<Vec<AtSpiWindow>> {
-		self
+	fn atspi_windows(&mut self) -> CoreResult<Vec<AtSpiWindow>> {
+		let listed = self
 			.ax
 			.as_ref()
 			.ok_or_else(|| {
@@ -171,7 +175,9 @@ impl WaylandBackend {
 					.clone()
 					.unwrap_or_else(DesktopError::ax_unsupported)
 			})?
-			.windows()
+			.windows()?;
+		self.unanswered = listed.unanswered;
+		Ok(listed.windows)
 	}
 }
 
@@ -199,6 +205,8 @@ impl Backend for WaylandBackend {
 			applications: crate::desktop::applications::supported(),
 			menus: self.ax.is_some(),
 			held_input: !input_unavailable,
+			secure_input: false,
+			secure_input_app: None,
 			spaces: false,
 			global_escape: false,
 			capture_permission: if cfg!(feature = "wayland-pipewire") {
@@ -268,9 +276,23 @@ impl Backend for WaylandBackend {
 		}
 		let mut windows = self.atspi_windows()?;
 		if let Some(ax) = self.ax.as_ref() {
-			resolve_focus(&mut windows, self.compositor_pid, |window| ax.holds_focus(window));
+			resolve_focus(&mut windows, self.compositor_pid, !self.unanswered.is_empty(), |window| {
+				ax.holds_focus(window)
+			});
 		}
 		Ok(windows.into_iter().map(|entry| entry.window).collect())
+	}
+
+	fn missing_window(&self, target: &Target) -> Option<DesktopError> {
+		// Window ids are `atspi:{bus name}:{object path}`.
+		let skipped = match target {
+			Target::Window(id) => {
+				let bus = id.strip_prefix("atspi:")?.split_once(":/")?.0;
+				self.unanswered.iter().any(|name| name == bus)
+			},
+			Target::Desktop | Target::Display(_) => !self.unanswered.is_empty(),
+		};
+		skipped.then(ax::not_answering)
 	}
 
 	/// Reads the unresolved list. A native app's frame has no known position,
@@ -283,7 +305,11 @@ impl Backend for WaylandBackend {
 			.atspi_windows()?
 			.into_iter()
 			.find(|entry| entry.window.focused)
-			.ok_or_else(|| DesktopError::invalid_target("no focused Wayland window was found"))?;
+			.ok_or_else(|| {
+				self.missing_window(&Target::Desktop).unwrap_or_else(|| {
+					DesktopError::invalid_target("no focused Wayland window was found")
+				})
+			})?;
 		if !entry.position_known {
 			return Err(DesktopError::invalid_target(
 				"the focused Wayland surface has no known global position; cannot safely target \
@@ -320,10 +346,10 @@ impl Backend for WaylandBackend {
 			let frames = capture::capture()?;
 			self.displays = geometry::metadata(&frames, &known)?;
 			let explicit = target.display_selector();
-			let selected = selector.or(explicit.as_ref()).unwrap_or(&self.display);
+			let selected = selector.or(explicit.as_ref()).unwrap_or(&self.display).clone();
 			match target {
 				Target::Desktop | Target::Display(_) => {
-					let (image, displays) = geometry::compose(frames, selected, &known)?;
+					let (image, displays) = geometry::compose(frames, &selected, &known)?;
 					let frame = FrameGeometry::for_displays(&displays);
 					Ok((image, frame))
 				},
@@ -333,7 +359,9 @@ impl Backend for WaylandBackend {
 						.into_iter()
 						.find(|entry| &entry.window.id == id)
 						.ok_or_else(|| {
-							DesktopError::window_not_found(format!("Wayland window {id} not found"))
+							self.missing_window(target).unwrap_or_else(|| {
+								DesktopError::window_not_found(format!("Wayland window {id} not found"))
+							})
 						})?;
 					if !entry.position_known {
 						return Err(DesktopError::capture_failed(format!(
@@ -343,7 +371,7 @@ impl Backend for WaylandBackend {
 					}
 					let displays = &self.displays;
 					for ((image, geometry), display) in frames.iter().zip(displays) {
-						if matches!(selected, DisplaySelector::Id(id) if id != &display.id && id != &display.name)
+						if matches!(&selected, DisplaySelector::Id(id) if id != &display.id && id != &display.name)
 						{
 							continue;
 						}
@@ -504,6 +532,7 @@ mod tests {
 			input_unavailable: OnceCell::from(None),
 			displays:          Vec::new(),
 			compositor_pid:    None,
+			unanswered:        Vec::new(),
 		}
 	}
 	/// Holds `ENV_LOCK` with `LIBEI_SOCKET` set to a test's value (removed
@@ -546,6 +575,36 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn a_window_of_an_application_that_did_not_answer_reports_the_timeout() {
+		use crate::desktop::error::ErrorCode;
+		let code = |backend: &WaylandBackend, target: &str| {
+			backend
+				.missing_window(&Target::parse(target))
+				.map(|error| error.code)
+		};
+		let mut backend = backend_without_services();
+		backend.unanswered = vec![":1.8".to_owned()];
+		assert_eq!(
+			code(&backend, "atspi::1.8:/org/a11y/atspi/accessible/2"),
+			Some(ErrorCode::Timeout)
+		);
+		assert_eq!(code(&backend, "atspi::1.7:/org/a11y/atspi/accessible/2"), None);
+		assert_eq!(
+			backend
+				.missing_window(&Target::Desktop)
+				.map(|error| error.code),
+			Some(ErrorCode::Timeout)
+		);
+		backend.unanswered.clear();
+		assert_eq!(code(&backend, "atspi::1.8:/org/a11y/atspi/accessible/2"), None);
+		assert_eq!(
+			backend
+				.missing_window(&Target::Desktop)
+				.map(|error| error.code),
+			None
+		);
+	}
 	fn with_fake_libei(action: impl FnOnce(&mut WaylandBackend)) -> bool {
 		let socket = std::env::temp_dir().join(format!("omp-libei-test-{}", std::process::id()));
 		let _env = LibeiSocket::set(Some(socket.as_os_str()));

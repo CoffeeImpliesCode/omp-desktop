@@ -52,6 +52,8 @@ export type { JsStatusEvent } from "./shared/types";
 export interface ToolBridgeOptions {
 	session: ToolSession;
 	signal?: AbortSignal;
+	/** The cell's `timeout` in ms, the budget of a prelude call that sets none (`EvalPreludeContext.cellTimeoutMs`). */
+	cellTimeoutMs?: number;
 	emitStatus?: (event: JsStatusEvent) => void;
 	identity?: RuntimeCallIdentity;
 	shadowCell?: EvalShadowCellSession;
@@ -239,6 +241,7 @@ export async function callSessionTool(name: string, args: unknown, options: Tool
 					toolCallId,
 					signal: options.signal,
 					cell: options.cell,
+					cellTimeoutMs: options.cellTimeoutMs,
 					context: options.session.getToolContext?.(),
 				}),
 			);

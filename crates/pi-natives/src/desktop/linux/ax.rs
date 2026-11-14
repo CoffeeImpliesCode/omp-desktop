@@ -1,30 +1,50 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 use atspi::{
-	CoordType, Layer, ObjectRefOwned, Role, State, StateSet, proxy::accessible::ObjectRefExt, zbus,
-	zbus::names::UniqueName,
+	CoordType, Layer, ObjectRefOwned, Role, State, StateSet,
+	proxy::{
+		accessible::{AccessibleProxy, ObjectRefExt},
+		bus::BusProxy,
+	},
+	zbus::{self, Connection, names::UniqueName, proxy::CacheProperties},
 };
 use tokio::runtime::{Builder, Runtime};
 
 use crate::desktop::{
 	ax::{
-		AxBounds, AxHandle, AxProps, WalkBounds, normalize_role_atspi, text_readback, truncate_chars,
+		AxBounds, AxHandle, AxProps, WalkBounds, masks, normalize_role_atspi, text_readback,
+		truncate_chars,
 	},
 	backend::AxBackend,
 	control,
-	error::{CoreResult, DesktopError},
+	error::{CoreResult, DesktopError, ErrorCode},
 	types::DesktopWindow,
 };
 
 mod menus;
 
+/// How long an application gets to answer before it counts as not answering:
+/// one request reads one element (about a dozen calls) or walks a short chain
+/// of its parents or children, and a read of a whole application or menu
+/// bounds each call instead. libatspi gives each call 800 ms; a text edit in
+/// an office suite can take 2 s.
+///
+/// at-spi2-core's ATK bridge (GTK 3 apps) replies to `DoAction` before it runs
+/// the action inside its D-Bus dispatch, so an action that opens a modal
+/// dialog leaves the app answering no request until that dialog closes.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Most windows [`AtSpiAx::windows`] lists.
+const MAX_WINDOWS: usize = 48;
+
 pub struct AtSpiAx {
-	rt:         Runtime,
-	connection: atspi::AccessibilityConnection,
+	rt:            Runtime,
+	connection:    Connection,
+	/// [`REPLY_TIMEOUT`] outside tests.
+	reply_timeout: Duration,
 	/// The display server's own list of windows, where it knows where each one
 	/// is (X11).
-	native:     Option<Box<dyn NativeWindows>>,
-	frames:     FrameCache,
+	native:        Option<Box<dyn NativeWindows>>,
+	frames:        FrameCache,
 }
 
 /// A native top-level window's geometry as the display server reports it.
@@ -118,6 +138,72 @@ fn state_enabled(states: StateSet) -> bool {
 	states.contains(State::Sensitive)
 }
 
+fn unanswered(who: &str, within: Duration) -> DesktopError {
+	DesktopError::timeout(format!(
+		"AT-SPI: {who} did not answer within {} s. An app answers no accessibility request while it \
+		 is busy, and a GTK 3 app none while a modal dialog that an accessibility action (press, \
+		 menu select) opened is up; use screenshots and pointer or key input until it answers again",
+		within.as_secs_f64()
+	))
+}
+
+/// The error for a lookup that missed what an application that did not answer
+/// [`AtSpiAx::windows`] holds.
+pub(crate) fn not_answering() -> DesktopError {
+	unanswered("the application", REPLY_TIMEOUT)
+}
+
+/// `error`, saying that an action or value the application did not confirm
+/// may still take effect.
+fn unconfirmed(mut error: DesktopError) -> DesktopError {
+	if error.code == ErrorCode::Timeout {
+		error
+			.message
+			.push_str(". What was sent to it may still take effect when it answers");
+	}
+	error
+}
+
+/// `future`, or [`unanswered`] once it has waited `within`.
+async fn answered<T>(
+	who: &str,
+	within: Duration,
+	future: impl Future<Output = T>,
+) -> CoreResult<T> {
+	tokio::time::timeout(within, future)
+		.await
+		.map_err(|_| unanswered(who, within))
+}
+
+/// Bounds AT-SPI service work without replaying a request after cancellation.
+///
+/// The per-call [`answered`] bounds stop one silent call from holding an
+/// operation forever; this bounds the whole operation as well, so a run that
+/// the host abandoned never holds the desktop worker past its own deadline.
+fn wait_for_ax<T>(runtime: &Runtime, future: impl Future<Output = T>) -> CoreResult<T> {
+	let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+	if let Some(run_deadline) = control::current_token().and_then(|token| token.deadline()) {
+		deadline = deadline.min(run_deadline);
+	}
+	runtime.block_on(async {
+		control::cancellable(tokio::time::timeout_at(deadline.into(), future))
+			.await?
+			.map_err(|_| {
+				DesktopError::timeout(
+					"AT-SPI request exceeded its deadline; effects may be partial; inspect before \
+					 retrying",
+				)
+			})
+	})
+}
+
+/// The windows of the applications that answered, and the bus names of those
+/// that did not.
+pub struct AtSpiWindows {
+	pub windows:    Vec<AtSpiWindow>,
+	pub unanswered: Vec<String>,
+}
+
 /// An AT-SPI top-level frame and whether its reported screen position is real.
 ///
 /// Native Wayland clients cannot learn where the compositor placed them, so
@@ -141,21 +227,25 @@ pub struct AtSpiWindow {
 /// one that `holds_focus` (contains the keyboard-focused element) wins. Two
 /// active titled application windows leave none focused, rather than naming
 /// one at random.
+/// If an application did not answer, a shell or untitled candidate needs
+/// positive keyboard focus: Active alone may merely outlive the skipped app.
 pub fn resolve_focus(
 	windows: &mut [AtSpiWindow],
 	compositor_pid: Option<u32>,
+	unanswered: bool,
 	mut holds_focus: impl FnMut(&DesktopWindow) -> bool,
 ) {
 	let mut active: Vec<usize> = (0..windows.len())
 		.filter(|&index| windows[index].window.focused)
 		.collect();
-	if active.len() < 2 {
+	if active.len() < 2 && !unanswered {
 		return;
 	}
 	let all_active = active.clone();
-	if compositor_pid.is_some() {
+	if active.len() > 1 && compositor_pid.is_some() {
 		active.retain(|&index| windows[index].window.pid != compositor_pid);
 	}
+	let mut focus_checked = false;
 	if active.len() > 1 {
 		let titled: Vec<usize> = active
 			.iter()
@@ -163,6 +253,7 @@ pub fn resolve_focus(
 			.filter(|&index| !windows[index].window.title.trim().is_empty())
 			.collect();
 		active = if titled.is_empty() {
+			focus_checked = true;
 			active
 				.into_iter()
 				.filter(|&index| holds_focus(&windows[index].window))
@@ -172,30 +263,17 @@ pub fn resolve_focus(
 		};
 	}
 	let focused = match active.as_slice() {
-		[only] => Some(*only),
+		[only] => {
+			let window = &windows[*only].window;
+			let shell_candidate = window.title.trim().is_empty()
+				|| compositor_pid.is_some_and(|pid| window.pid == Some(pid));
+			(!unanswered || !shell_candidate || focus_checked || holds_focus(window)).then_some(*only)
+		},
 		_ => None,
 	};
 	for index in all_active {
 		windows[index].window.focused = Some(index) == focused;
 	}
-}
-
-/// Bounds AT-SPI service work without replaying a request after cancellation.
-fn wait_for_ax<T>(runtime: &Runtime, future: impl Future<Output = T>) -> CoreResult<T> {
-	let mut deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-	if let Some(run_deadline) = control::current_token().and_then(|token| token.deadline()) {
-		deadline = deadline.min(run_deadline);
-	}
-	runtime.block_on(async {
-		control::cancellable(tokio::time::timeout_at(deadline.into(), future))
-			.await?
-			.map_err(|_| {
-				DesktopError::timeout(
-					"AT-SPI request exceeded its deadline; effects may be partial; inspect before \
-					 retrying",
-				)
-			})
-	})
 }
 
 impl AtSpiAx {
@@ -204,9 +282,24 @@ impl AtSpiAx {
 			.enable_all()
 			.build()
 			.map_err(|err| DesktopError::ax_failed(format!("AT-SPI runtime: {err}")))?;
-		let connection = wait_for_ax(&rt, atspi::AccessibilityConnection::new())?
-			.map_err(|err| DesktopError::ax_failed(format!("AT-SPI connection: {err}")))?;
-		Ok(Self { rt, connection, native: None, frames: FrameCache::default() })
+		// Not `AccessibilityConnection::new`: it also asks every application for
+		// a peer-to-peer address, so one application that does not answer
+		// would hang every new session and menu command.
+		let connection = wait_for_ax(&rt, async {
+			let session = Connection::session().await?;
+			let address = BusProxy::new(&session).await?.get_address().await?;
+			atspi::zbus::connection::Builder::address(address.as_str())?
+				.build()
+				.await
+		})?
+		.map_err(|err| DesktopError::ax_failed(format!("AT-SPI connection: {err}")))?;
+		Ok(Self {
+			rt,
+			connection,
+			reply_timeout: REPLY_TIMEOUT,
+			native: None,
+			frames: FrameCache::default(),
+		})
 	}
 
 	/// Places elements of toolkits that cannot report screen positions by
@@ -214,6 +307,25 @@ impl AtSpiAx {
 	pub(crate) fn with_native_windows(mut self, native: Box<dyn NativeWindows>) -> Self {
 		self.native = Some(native);
 		self
+	}
+
+	/// Runs `future` until it finishes, the current operation is cancelled or
+	/// its deadline passes, so a call no application answers never holds the
+	/// desktop worker past the run that made it.
+	fn run<T>(&self, future: impl Future<Output = T>) -> CoreResult<T> {
+		wait_for_ax(&self.rt, future)
+	}
+
+	/// Single-element reads and mutations retain an operation budget.
+	/// Application, focus, ownership and hit-test scans use per-call replies.
+	fn request<T>(&self, future: impl Future<Output = CoreResult<T>>) -> CoreResult<T> {
+		self.run(answered("the application", self.reply_timeout, future))??
+	}
+
+	/// One call to an application, bounded on its own: for reads of a whole
+	/// application or menu, which can take longer than one reply may.
+	async fn reply<T>(&self, call: impl Future<Output = T>) -> CoreResult<T> {
+		answered("the application", self.reply_timeout, call).await
 	}
 
 	const fn object(h: &AxHandle) -> &ObjectRefOwned {
@@ -224,117 +336,155 @@ impl AtSpiAx {
 		}
 	}
 
-	pub(crate) fn windows(&self) -> CoreResult<Vec<AtSpiWindow>> {
-		wait_for_ax(&self.rt, async {
-			let mut windows = Vec::new();
-			for app in Self::apps(&self.connection)
+	pub(crate) fn windows(&self) -> CoreResult<AtSpiWindows> {
+		self.run(async {
+			let apps = Self::apps(&self.connection)
 				.await
-				.map_err(DesktopError::ax_failed)?
-			{
-				let app_proxy = app
-					.as_accessible_proxy(self.connection.connection())
-					.await
-					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI application: {err}")))?;
-				let app_name = app_proxy.name().await.unwrap_or_default();
-				let pid = if let Some(bus_name) = app.name() {
-					let dbus = atspi::zbus::fdo::DBusProxy::new(self.connection.connection())
-						.await
-						.ok();
-					if let Some(dbus) = dbus {
-						dbus
-							.get_connection_unix_process_id(bus_name.clone().into())
-							.await
-							.ok()
-					} else {
-						None
-					}
-				} else {
-					None
-				};
-				for frame in Self::frames(&self.connection, &app)
-					.await
-					.unwrap_or_default()
-				{
-					let frame_proxy = frame
-						.as_accessible_proxy(self.connection.connection())
-						.await
-						.map_err(|err| DesktopError::ax_failed(format!("AT-SPI frame: {err}")))?;
-					let title = frame_proxy.name().await.unwrap_or_default();
-					let state = frame_proxy.get_state().await.ok();
-					let Ok(component) = Self::component(self.connection.connection(), &frame).await
-					else {
-						continue;
-					};
-					let Ok((x, y, width, height)) = component.get_extents(CoordType::Screen).await
-					else {
-						continue;
-					};
-					if width < 16 || height < 16 {
-						continue;
-					}
-					let position_known = component
-						.get_extents(CoordType::Window)
-						.await
-						.is_ok_and(|(window_x, window_y, ..)| (window_x, window_y) != (x, y));
-					let id = atspi_window_id(&frame);
-					windows.push(AtSpiWindow {
-						window: DesktopWindow {
-							id,
-							title,
-							app: app_name.clone(),
-							pid,
-							position_known: Some(position_known),
-							x,
-							y,
-							width: width as u32,
-							height: height as u32,
-							focused: state.as_ref().is_some_and(|states| {
-								states.contains(State::Focused) || states.contains(State::Active)
-							}),
-						},
-						position_known,
-					});
-					if windows.len() == 48 {
-						return Ok(windows);
-					}
+				.map_err(DesktopError::ax_failed)?;
+			// Every application is asked at once, so ones that do not answer
+			// cost the listing one reply limit together, not one each, and are
+			// left out rather than holding back every other application's.
+			let answers =
+				futures::future::join_all(apps.iter().map(|app| self.app_windows(app, MAX_WINDOWS)))
+					.await;
+			let mut listed = AtSpiWindows { windows: Vec::new(), unanswered: Vec::new() };
+			for (app, answer) in apps.iter().zip(answers) {
+				match answer {
+					Ok(windows) => listed.windows.extend(windows),
+					Err(error) if error.code == ErrorCode::Timeout => {
+						listed
+							.unanswered
+							.extend(app.name().map(ToString::to_string));
+					},
+					Err(error) => return Err(error),
 				}
 			}
-			Ok(windows)
+			listed.windows.truncate(MAX_WINDOWS);
+			Ok(listed)
 		})?
 	}
 
 	/// Whether the window's frame contains the keyboard-focused element. A
 	/// lookup that fails counts as not holding focus.
 	pub(crate) fn holds_focus(&self, window: &DesktopWindow) -> bool {
-		wait_for_ax(&self.rt, async {
-			let compositor = window
-				.id
-				.starts_with("niri:")
-				.then(super::wayland::compositor_pid)
-				.flatten();
-			let Ok((app, _)) = Self::app_for_window(&self.connection, window, compositor).await else {
-				return false;
-			};
-			let Ok(frames) = Self::frames(&self.connection, &app).await else {
-				return false;
-			};
-			for frame in frames {
-				if atspi_window_id(&frame) == window.id {
-					return Self::find_focused(self.connection.connection(), frame, 0)
-						.await
-						.is_ok_and(|found| found.is_some());
+		let compositor = window
+			.id
+			.starts_with("niri:")
+			.then(super::wayland::compositor_pid)
+			.flatten();
+		self
+			.run(async {
+				let Ok((app, _)) = Self::app_for_window(&self.connection, window, compositor).await
+				else {
+					return false;
+				};
+				let Ok(frames) = Self::frames(&self.connection, &app, self.reply_timeout).await else {
+					return false;
+				};
+				for frame in frames {
+					if atspi_window_id(&frame) == window.id {
+						return Self::find_focused(&self.connection, frame, 0, self.reply_timeout)
+							.await
+							.is_ok_and(|found| found.is_some());
+					}
 				}
-			}
-			false
-		})
-		.unwrap_or(false)
+				false
+			})
+			.unwrap_or(false)
 	}
 
-	async fn apps(
-		connection: &atspi::AccessibilityConnection,
-	) -> Result<Vec<ObjectRefOwned>, String> {
-		let root = connection
-			.root_accessible_on_registry()
+	async fn app_windows(&self, app: &ObjectRefOwned, limit: usize) -> CoreResult<Vec<AtSpiWindow>> {
+		let mut windows = Vec::new();
+		let app_proxy = self
+			.reply(app.as_accessible_proxy(&self.connection))
+			.await?
+			.map_err(|err| DesktopError::ax_failed(format!("AT-SPI application: {err}")))?;
+		let app_name = self.reply(app_proxy.name()).await?.unwrap_or_default();
+		let pid = if let Some(bus_name) = app.name() {
+			let dbus = self
+				.reply(atspi::zbus::fdo::DBusProxy::new(&self.connection))
+				.await?
+				.ok();
+			if let Some(dbus) = dbus {
+				self
+					.reply(dbus.get_connection_unix_process_id(bus_name.clone().into()))
+					.await?
+					.ok()
+			} else {
+				None
+			}
+		} else {
+			None
+		};
+		let children = self
+			.reply(app_proxy.get_children())
+			.await?
+			.unwrap_or_default();
+		for frame in children {
+			let frame_proxy = self
+				.reply(frame.as_accessible_proxy(&self.connection))
+				.await?
+				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI frame: {err}")))?;
+			if !self
+				.reply(frame_proxy.get_role())
+				.await?
+				.is_ok_and(|role| top_level_role(role, true))
+			{
+				continue;
+			}
+			let title = self.reply(frame_proxy.name()).await?.unwrap_or_default();
+			let state = self.reply(frame_proxy.get_state()).await?.ok();
+			let Ok(component) = self
+				.reply(Self::component(&self.connection, &frame))
+				.await?
+			else {
+				continue;
+			};
+			let Ok((x, y, width, height)) =
+				self.reply(component.get_extents(CoordType::Screen)).await?
+			else {
+				continue;
+			};
+			if width < 16 || height < 16 {
+				continue;
+			}
+			let position_known = self
+				.reply(component.get_extents(CoordType::Window))
+				.await?
+				.is_ok_and(|(window_x, window_y, ..)| (window_x, window_y) != (x, y));
+			let id = atspi_window_id(&frame);
+			windows.push(AtSpiWindow {
+				window: DesktopWindow {
+					id,
+					title,
+					app: app_name.clone(),
+					pid,
+					position_known: Some(position_known),
+					x,
+					y,
+					width: width as u32,
+					height: height as u32,
+					focused: state.as_ref().is_some_and(|states| {
+						states.contains(State::Focused) || states.contains(State::Active)
+					}),
+				},
+				position_known,
+			});
+			if windows.len() == limit {
+				break;
+			}
+		}
+		Ok(windows)
+	}
+
+	async fn apps(connection: &Connection) -> Result<Vec<ObjectRefOwned>, String> {
+		// The registry implements too little of the D-Bus properties interface
+		// to cache its properties.
+		let root = AccessibleProxy::builder(connection)
+			.destination("org.a11y.atspi.Registry")
+			.map_err(|err| err.to_string())?
+			.cache_properties(CacheProperties::No)
+			.build()
 			.await
 			.map_err(|err| err.to_string())?;
 		root.get_children().await.map_err(|err| err.to_string())
@@ -344,7 +494,7 @@ impl AtSpiAx {
 	/// accessibility connection when ownership, not the application name,
 	/// established the match.
 	async fn app_for_window(
-		connection: &atspi::AccessibilityConnection,
+		connection: &Connection,
 		win: &DesktopWindow,
 		compositor: Option<u32>,
 	) -> Result<(ObjectRefOwned, Option<u32>), String> {
@@ -365,7 +515,7 @@ impl AtSpiAx {
 			// its windows this is.
 			if win.pid.is_none() && !win.id.starts_with("niri:") {
 				let proxy = app
-					.as_accessible_proxy(connection.connection())
+					.as_accessible_proxy(connection)
 					.await
 					.map_err(|err| err.to_string())?;
 				if proxy
@@ -381,7 +531,7 @@ impl AtSpiAx {
 			let Some(bus_name) = app.name() else {
 				continue;
 			};
-			let dbus = atspi::zbus::fdo::DBusProxy::new(connection.connection())
+			let dbus = atspi::zbus::fdo::DBusProxy::new(connection)
 				.await
 				.map_err(|err| err.to_string())?;
 			if let Ok(owner) = dbus
@@ -409,32 +559,27 @@ impl AtSpiAx {
 		}
 	}
 
+	/// `app`'s children that are top-level windows. Each reply, not the
+	/// traversal, gets a deadline.
 	async fn frames(
-		connection: &atspi::AccessibilityConnection,
+		connection: &Connection,
 		app: &ObjectRefOwned,
-	) -> Result<Vec<ObjectRefOwned>, String> {
-		Self::top_levels(connection.connection(), app).await
-	}
-
-	/// `app`'s children that are top-level windows.
-	async fn top_levels(
-		connection: &atspi::zbus::Connection,
-		app: &ObjectRefOwned,
-	) -> Result<Vec<ObjectRefOwned>, String> {
-		let proxy = app
-			.as_accessible_proxy(connection)
-			.await
-			.map_err(|err| err.to_string())?;
-		let children = proxy.get_children().await.map_err(|err| err.to_string())?;
+		reply_timeout: Duration,
+	) -> CoreResult<Vec<ObjectRefOwned>> {
+		let proxy = answered("the application", reply_timeout, app.as_accessible_proxy(connection))
+			.await?
+			.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
+		let children = answered("the application", reply_timeout, proxy.get_children())
+			.await?
+			.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
 		let mut frames = Vec::new();
 		for child in children {
-			let child_proxy = child
-				.as_accessible_proxy(connection)
-				.await
-				.map_err(|err| err.to_string())?;
-			if child_proxy
-				.get_role()
-				.await
+			let child_proxy =
+				answered("the application", reply_timeout, child.as_accessible_proxy(connection))
+					.await?
+					.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
+			if answered("the application", reply_timeout, child_proxy.get_role())
+				.await?
 				.is_ok_and(|role| top_level_role(role, true))
 			{
 				frames.push(child);
@@ -445,18 +590,21 @@ impl AtSpiAx {
 
 	/// Whether `frame` is the only top-level frame of its application.
 	async fn sole_frame(
-		connection: &atspi::AccessibilityConnection,
-		frame: &atspi::proxy::accessible::AccessibleProxy<'_>,
-	) -> Result<bool, String> {
-		let app = frame.parent().await.map_err(|err| err.to_string())?;
+		connection: &Connection,
+		frame: &AccessibleProxy<'_>,
+		reply_timeout: Duration,
+	) -> CoreResult<bool> {
+		let app = answered("the application", reply_timeout, frame.parent())
+			.await?
+			.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
 		if app.is_null() {
 			return Ok(false);
 		}
-		Ok(Self::frames(connection, &app).await?.len() == 1)
+		Ok(Self::frames(connection, &app, reply_timeout).await?.len() == 1)
 	}
 
 	async fn component<'a>(
-		connection: &'a zbus::Connection,
+		connection: &'a Connection,
 		object: &'a ObjectRefOwned,
 	) -> Result<atspi::proxy::component::ComponentProxy<'a>, String> {
 		let name = object
@@ -477,7 +625,7 @@ impl AtSpiAx {
 	/// fills itself with `GetAll`, which Qt 5 crashes on and newer Qt refuses,
 	/// so `NActions` is read with `Get`.
 	async fn action<'a>(
-		connection: &'a atspi::zbus::Connection,
+		connection: &'a Connection,
 		object: &'a ObjectRefOwned,
 	) -> Result<atspi::proxy::action::ActionProxy<'a>, String> {
 		let name = object
@@ -499,26 +647,27 @@ impl AtSpiAx {
 	/// containment: overlapping windows and same-process dialogs are distinct
 	/// input destinations.
 	async fn top_level(
-		connection: &atspi::zbus::Connection,
+		connection: &Connection,
 		mut object: ObjectRefOwned,
+		reply_timeout: Duration,
 	) -> CoreResult<ObjectRefOwned> {
 		for _ in 0..64 {
-			let proxy = object
-				.as_accessible_proxy(connection)
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window owner: {err}")))?;
-			let role = proxy
-				.get_role()
-				.await
+			let proxy =
+				answered("the application", reply_timeout, object.as_accessible_proxy(connection))
+					.await?
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window owner: {err}")))?;
+			let role = answered("the application", reply_timeout, proxy.get_role())
+				.await?
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window role: {err}")))?;
 			if top_level_role(role, false) {
 				return Ok(object);
 			}
-			let parent = proxy
-				.parent()
-				.await
+			let parent = answered("the application", reply_timeout, proxy.parent())
+				.await?
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window parent: {err}")))?;
-			if top_level_role(role, true) && Self::is_application(connection, &parent).await {
+			if top_level_role(role, true)
+				&& Self::is_application(connection, &parent, reply_timeout).await?
+			{
 				return Ok(object);
 			}
 			if parent.is_null() || parent == object {
@@ -530,42 +679,53 @@ impl AtSpiAx {
 		Err(DesktopError::ax_failed("AT-SPI element has no identifiable top-level window"))
 	}
 
-	async fn is_application(connection: &atspi::zbus::Connection, object: &ObjectRefOwned) -> bool {
+	async fn is_application(
+		connection: &Connection,
+		object: &ObjectRefOwned,
+		reply_timeout: Duration,
+	) -> CoreResult<bool> {
 		if object.is_null() {
-			return false;
+			return Ok(false);
 		}
-		let Ok(proxy) = object.as_accessible_proxy(connection).await else {
-			return false;
+		let Ok(proxy) =
+			answered("the application", reply_timeout, object.as_accessible_proxy(connection)).await?
+		else {
+			return Ok(false);
 		};
-		proxy
-			.get_role()
-			.await
-			.is_ok_and(|role| role == Role::Application)
+		Ok(answered("the application", reply_timeout, proxy.get_role())
+			.await?
+			.is_ok_and(|role| role == Role::Application))
 	}
 
+	/// Each call has its own reply timeout: reading a whole application can
+	/// take longer than one reply may.
 	async fn find_focused(
-		connection: &atspi::zbus::Connection,
+		connection: &Connection,
 		root: ObjectRefOwned,
 		depth: u8,
-	) -> Result<Option<ObjectRefOwned>, String> {
+		reply_timeout: Duration,
+	) -> CoreResult<Option<ObjectRefOwned>> {
 		// Chromium/Electron frames report children that are the AT-SPI null
 		// object.
 		if depth > 40 || root.is_null() {
 			return Ok(None);
 		}
-		let proxy = root
-			.as_accessible_proxy(connection)
-			.await
-			.map_err(|err| err.to_string())?;
-		if proxy
-			.get_state()
-			.await
+		let proxy = answered("the application", reply_timeout, root.as_accessible_proxy(connection))
+			.await?
+			.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
+		if answered("the application", reply_timeout, proxy.get_state())
+			.await?
 			.is_ok_and(|state| state.contains(State::Focused))
 		{
 			return Ok(Some(root));
 		}
-		for child in proxy.get_children().await.unwrap_or_default() {
-			if let Some(found) = Box::pin(Self::find_focused(connection, child, depth + 1)).await? {
+		for child in answered("the application", reply_timeout, proxy.get_children())
+			.await?
+			.unwrap_or_default()
+		{
+			if let Some(found) =
+				Box::pin(Self::find_focused(connection, child, depth + 1, reply_timeout)).await?
+			{
 				return Ok(Some(found));
 			}
 		}
@@ -575,10 +735,10 @@ impl AtSpiAx {
 	/// An element's properties, with its bounds when `bounds` asks for them.
 	fn read_props(&mut self, h: &AxHandle, bounds: WalkBounds) -> CoreResult<AxProps> {
 		let object = Self::object(h).clone();
-		let Self { rt, connection, native, frames } = self;
-		wait_for_ax(rt, async {
+		let Self { rt, connection, native, frames, reply_timeout } = self;
+		let read = answered("the application", *reply_timeout, async {
 			let proxy = object
-				.as_accessible_proxy(connection.connection())
+				.as_accessible_proxy(connection)
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI accessible: {err}")))?;
 			let title = proxy.name().await.ok().filter(|s| !s.is_empty());
@@ -594,15 +754,15 @@ impl AtSpiAx {
 			let multiline = state
 				.as_ref()
 				.is_some_and(|states| states.contains(State::MultiLine));
-			let value = text_value(connection.connection(), &object).await;
+			let value = text_value(&*connection, &object).await;
 			let bounds = if bounds == WalkBounds::Read {
 				frames
-					.screen_bounds(connection.connection(), native.as_deref(), &object)
+					.screen_bounds(connection, native.as_deref(), &object)
 					.await
 			} else {
 				None
 			};
-			let actions = match Self::action(connection.connection(), &object).await {
+			let actions = match Self::action(connection, &object).await {
 				Ok(action) => action_names(&action).await.unwrap_or_default(),
 				Err(_) => Vec::new(),
 			};
@@ -622,20 +782,23 @@ impl AtSpiAx {
 				child_count,
 				identity: None,
 				partial: false,
+				label_complete: false,
 				selected: false,
 				role_name: None,
 			})
-		})?
+		});
+		wait_for_ax(rt, read)??
 	}
 
 	/// The deepest element under `root` at screen point (`x`, `y`). A placed
 	/// frame is hit-tested in its window coordinates.
 	async fn descend(
-		connection: &zbus::Connection,
+		connection: &Connection,
 		root: ObjectRefOwned,
 		placement: Option<Placement>,
 		x: i32,
 		y: i32,
+		reply_timeout: Duration,
 	) -> CoreResult<Option<AxHandle>> {
 		let (coords, x, y) = match placement {
 			Some(placement) => {
@@ -647,13 +810,14 @@ impl AtSpiAx {
 		let mut ancestors = Vec::new();
 		for _ in 0..64 {
 			let has_component = {
-				let accessible = current
-					.as_accessible_proxy(connection)
-					.await
-					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI hit-test element: {err}")))?;
-				accessible
-					.get_interfaces()
-					.await
+				let accessible =
+					answered("the application", reply_timeout, current.as_accessible_proxy(connection))
+						.await?
+						.map_err(|err| {
+							DesktopError::ax_failed(format!("AT-SPI hit-test element: {err}"))
+						})?;
+				answered("the application", reply_timeout, accessible.get_interfaces())
+					.await?
 					.map_err(|err| {
 						DesktopError::ax_failed(format!("AT-SPI hit-test interfaces: {err}"))
 					})?
@@ -664,26 +828,33 @@ impl AtSpiAx {
 			}
 			// GetAccessibleAtPoint returns an immediate child, not
 			// necessarily the leaf that owns the requested pixel.
-			let child = Self::component(connection, &current)
-				.await
-				.map_err(DesktopError::ax_failed)?
-				.get_accessible_at_point(x, y, coords)
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI element at point: {err}")))?;
+			let component =
+				answered("the application", reply_timeout, Self::component(connection, &current))
+					.await?
+					.map_err(DesktopError::ax_failed)?;
+			let child = answered(
+				"the application",
+				reply_timeout,
+				component.get_accessible_at_point(x, y, coords),
+			)
+			.await?
+			.map_err(|err| DesktopError::ax_failed(format!("AT-SPI element at point: {err}")))?;
 			if child.is_null() || child == current {
 				return Ok(Some(AxHandle::AtSpi(current)));
 			}
 			// GTK4 returns the deepest element from the frame, then offsets the
 			// point twice below it and can name a child the point is not in.
 			if placement.is_some() {
-				let inside = Self::component(connection, &child)
-					.await
-					.map_err(DesktopError::ax_failed)?
-					.get_extents(CoordType::Window)
-					.await
-					.is_ok_and(|(left, top, width, height)| {
-						Placement { x: left, y: top, width, height }.contains(x, y)
-					});
+				let component =
+					answered("the application", reply_timeout, Self::component(connection, &child))
+						.await?
+						.map_err(DesktopError::ax_failed)?;
+				let inside =
+					answered("the application", reply_timeout, component.get_extents(CoordType::Window))
+						.await?
+						.is_ok_and(|(left, top, width, height)| {
+							Placement { x: left, y: top, width, height }.contains(x, y)
+						});
 				if !inside {
 					return Ok(Some(AxHandle::AtSpi(current)));
 				}
@@ -917,6 +1088,65 @@ fn atspi_window_id(frame: &ObjectRefOwned) -> String {
 	format!("atspi:{name}:{}", frame.path())
 }
 
+/// How long a numeric write's read-back waits for the value to arrive, for
+/// a toolkit that applies the write a moment after answering it.
+const VALUE_SETTLE: Duration = Duration::from_millis(500);
+
+/// Sets an element's numeric value and reads it back: a toolkit clamps the
+/// value to its range, rounds it to its steps or ignores it while answering
+/// the write (Qt answers every `CurrentValue` write), so the call reports
+/// what the element holds. The proxy keeps no property cache, whose
+/// `GetAll` crashes Qt 6 before 6.9.2 (QTBUG-137344).
+async fn write_value(
+	connection: &atspi::zbus::Connection,
+	name: &UniqueName<'static>,
+	object: &ObjectRefOwned,
+	value: f64,
+) -> CoreResult<()> {
+	let failed = |err: atspi::zbus::Error| DesktopError::ax_failed(format!("AT-SPI value: {err}"));
+	let proxy = atspi::proxy::value::ValueProxy::builder(connection)
+		.destination(name.clone())
+		.and_then(|b| b.path(object.path().clone()))
+		.map_err(failed)?
+		.cache_properties(atspi::zbus::proxy::CacheProperties::No)
+		.build()
+		.await
+		.map_err(failed)?;
+	proxy.set_current_value(value).await.map_err(failed)?;
+	let deadline = tokio::time::Instant::now() + VALUE_SETTLE;
+	loop {
+		let Ok(actual) = proxy.current_value().await else {
+			return Err(DesktopError::ax_failed(format!(
+				"wrote {value}, but the control's value could not be read back; inspect the target \
+				 before writing again"
+			)));
+		};
+		// Within float precision: a toolkit that stores the value as `float`
+		// reads back 0.3 as 0.30000001192092896.
+		if (actual - value).abs() <= value.abs().max(1.0) * f64::from(f32::EPSILON) {
+			return Ok(());
+		}
+		if tokio::time::Instant::now() >= deadline {
+			// The range only where it explains the value: an unbounded control
+			// reports ±f64::MAX, hundreds of digits each.
+			let range = match futures::join!(proxy.minimum_value(), proxy.maximum_value()) {
+				(Ok(min), _) if value < min && min != -f64::MAX => {
+					format!(" (its minimum is {min})")
+				},
+				(_, Ok(max)) if value > max && max != f64::MAX => {
+					format!(" (its maximum is {max})")
+				},
+				_ => String::new(),
+			};
+			return Err(DesktopError::ax_failed(format!(
+				"wrote {value}; the control now reads {actual}{range}. The app may have clamped, \
+				 rounded or not taken it: inspect the target before writing again"
+			)));
+		}
+		tokio::time::sleep(Duration::from_millis(25)).await;
+	}
+}
+
 /// Replaces an element's text and reads it back: Gecko (Firefox, Thunderbird)
 /// accepts the write and keeps the old text. A field that hides its text reads
 /// back one mask character per character, whatever its role (a GTK4 entry
@@ -930,6 +1160,7 @@ async fn write_text(
 	name: &UniqueName<'static>,
 	object: &ObjectRefOwned,
 	value: &str,
+	emptied: &mut bool,
 ) -> CoreResult<()> {
 	let editable = atspi::proxy::editable_text::EditableTextProxy::builder(connection)
 		.destination(name.clone())
@@ -961,48 +1192,36 @@ async fn write_text(
 		if replace("").await?.as_deref() != Some("") {
 			return text_readback(value, value, None, true);
 		}
-		let emptied = |mut error: DesktopError| {
-			error
-				.message
-				.push_str(". setValue emptied the field before this write, so it may now be empty");
-			error
-		};
-		let rewritten = replace(value).await.map_err(emptied)?;
+		// Keep the confirmed clear outside the request future so dropping the
+		// rewrite on timeout or cancellation does not lose the warning.
+		*emptied = true;
+		let rewritten = replace(value).await?;
 		if rewritten
 			.as_deref()
 			.is_some_and(|actual| masks(actual, value))
 		{
 			return Ok(());
 		}
-		return text_readback(value, value, None, true).map_err(emptied);
+		return text_readback(value, value, None, true);
 	}
-	// A role that cannot be read counts as a password field's, so no password
-	// enters an error.
-	let secure = actual.as_deref().is_some_and(masked)
-		|| accessible
-			.get_role()
-			.await
-			.ok()
-			.is_none_or(|role| role == Role::PasswordText);
+	// A role that cannot be read counts as a password field's, so what such a
+	// field reads never enters an error.
+	let secure = accessible
+		.get_role()
+		.await
+		.ok()
+		.is_none_or(|role| role == Role::PasswordText);
 	text_readback(value, value, actual.as_deref(), secure)
 }
 
-/// Whether `actual` is one repeated mask character: one of GTK's, or the `*`
-/// toolkits fall back on.
-fn masked(actual: &str) -> bool {
-	let mut chars = actual.chars();
-	chars.next().is_some_and(|first| {
-		['●', '•', '✱', '✺', '*'].contains(&first) && chars.all(|char| char == first)
-	})
+fn text_write_error(mut error: DesktopError, emptied: bool) -> DesktopError {
+	if emptied {
+		error
+			.message
+			.push_str(". setValue emptied the field before this write, so it may now be empty");
+	}
+	error
 }
-
-/// Whether `actual` masks `value`: one mask character per character, or per
-/// UTF-16 unit as Qt masks.
-fn masks(actual: &str, value: &str) -> bool {
-	let shown = actual.chars().count();
-	masked(actual) && (shown == value.chars().count() || shown == value.encode_utf16().count())
-}
-
 /// The whole text of an element with the `Text` interface.
 async fn text_contents(
 	connection: &atspi::zbus::Connection,
@@ -1222,37 +1441,43 @@ const fn top_level_role(role: Role, child_of_application: bool) -> bool {
 	}
 }
 
+/// Machine names that activate an element, compared by [`folds_to`]: GTK
+/// (`click`, `activate`), Qt (`Toggle`), Chromium and Electron (`click`,
+/// `open`, `jump`, `clickAncestor`, and `doDefault` on elements without a
+/// verb), and `do default` / `do-default` from other ATK bridges. `press`
+/// itself matches before these are tried.
+const ACTIVATIONS: [&str; 8] =
+	["click", "clickancestor", "activate", "invoke", "toggle", "open", "jump", "dodefault"];
+
+/// Chromium's, Firefox's and `LibreOffice`'s activation of menu items,
+/// options and tabs, taken only when an element has none of [`ACTIVATIONS`]:
+/// a GTK colour swatch lists `select` (set the selected flag) before
+/// `activate`.
+const SELECT: &str = "select";
+
+/// Whether `name` is `safe`, ignoring case and the spaces, hyphens and
+/// underscores toolkits spell action names with.
+fn folds_to(name: &str, safe: &str) -> bool {
+	name
+		.bytes()
+		.filter(|byte| !matches!(byte, b' ' | b'-' | b'_'))
+		.map(|byte| byte.to_ascii_lowercase())
+		.eq(safe.bytes())
+}
+
 /// Generic press means activation, not action zero (GTK4 text views put
 /// `buffer.delete-line` there). Explicit advertised actions remain available.
 fn action_index<'a>(
-	mut actions: impl Iterator<Item = &'a str> + Clone,
+	actions: impl Iterator<Item = &'a str> + Clone,
 	requested: &str,
 ) -> Option<usize> {
-	actions
-		.clone()
-		.position(|name| name.eq_ignore_ascii_case(requested))
-		.or_else(|| {
-			requested
-				.eq_ignore_ascii_case("press")
-				.then(|| {
-					actions.position(|name| {
-						[
-							"click",
-							"clickAncestor",
-							"activate",
-							"invoke",
-							"toggle",
-							"open",
-							"jump",
-							"do default",
-							"do-default",
-						]
-						.iter()
-						.any(|safe| name.eq_ignore_ascii_case(safe))
-					})
-				})
-				.flatten()
-		})
+	let position = |matches: &dyn Fn(&str) -> bool| actions.clone().position(matches);
+	position(&|name| name.eq_ignore_ascii_case(requested)).or_else(|| {
+		requested.eq_ignore_ascii_case("press").then(|| {
+			position(&|name| ACTIVATIONS.iter().any(|safe| folds_to(name, safe)))
+				.or_else(|| position(&|name| folds_to(name, SELECT)))
+		})?
+	})
 }
 
 /// The most actions read of one element: the count comes from the app.
@@ -1312,9 +1537,12 @@ impl AxBackend for AtSpiAx {
 			.starts_with("niri:")
 			.then(super::wayland::compositor_pid)
 			.flatten();
-		let result = wait_for_ax(&self.rt, async {
-			let (app, owner) = Self::app_for_window(&self.connection, win, compositor).await?;
-			let frames = Self::frames(&self.connection, &app).await?;
+		let failed = |err: String| DesktopError::ax_failed(format!("AT-SPI window root: {err}"));
+		let candidates = self.run(async {
+			let (app, owner) = Self::app_for_window(&self.connection, win, compositor)
+				.await
+				.map_err(failed)?;
+			let frames = Self::frames(&self.connection, &app, self.reply_timeout).await?;
 			let mut named = Vec::new();
 			for frame in frames {
 				let id = atspi_window_id(&frame);
@@ -1324,30 +1552,30 @@ impl AxBackend for AtSpiAx {
 					}
 					continue;
 				}
-				let proxy = frame
-					.as_accessible_proxy(self.connection.connection())
-					.await
-					.map_err(|err| err.to_string())?;
-				let name = proxy.name().await.map_err(|err| err.to_string())?;
+				let proxy = self
+					.reply(frame.as_accessible_proxy(&self.connection))
+					.await?
+					.map_err(|err| failed(err.to_string()))?;
+				let name = self
+					.reply(proxy.name())
+					.await?
+					.map_err(|err| failed(err.to_string()))?;
 				named.push((frame, name));
 			}
 			Ok(FrameCandidates { owner, frames: named })
-		})?;
-		result
-			.and_then(|candidates| {
-				let sole_window = |owner: u32| {
-					super::wayland::compositor_windows().is_some_and(|windows| {
-						windows
-							.iter()
-							.filter(|window| owner_serves_window(owner, window, compositor))
-							.count()
-							== 1
-					})
-				};
-				select_frame(candidates, win, sole_window)
+		})??;
+		let sole_window = |owner: u32| {
+			super::wayland::compositor_windows().is_some_and(|windows| {
+				windows
+					.iter()
+					.filter(|window| owner_serves_window(owner, window, compositor))
+					.count()
+					== 1
 			})
+		};
+		select_frame(candidates, win, sole_window)
 			.map(AxHandle::AtSpi)
-			.map_err(|err: String| DesktopError::ax_failed(format!("AT-SPI window root: {err}")))
+			.map_err(failed)
 	}
 
 	fn window_id(&mut self, h: &AxHandle, windows: &[DesktopWindow]) -> CoreResult<String> {
@@ -1357,9 +1585,9 @@ impl AxBackend for AtSpiAx {
 			.any(|window| window.id.starts_with("niri:"))
 			.then(super::wayland::compositor_pid)
 			.flatten();
-		wait_for_ax(&self.rt, async {
-			let connection = self.connection.connection();
-			let object = Self::top_level(connection, object).await?;
+		self.run(async {
+			let connection = &self.connection;
+			let object = Self::top_level(connection, object, self.reply_timeout).await?;
 			let id = atspi_window_id(&object);
 			if windows.iter().any(|window| window.id == id) {
 				return Ok(id);
@@ -1382,15 +1610,16 @@ impl AxBackend for AtSpiAx {
 				.name()
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window title: {err}")))?;
-			let sole_frame = Self::sole_frame(&self.connection, &proxy)
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI frames: {err}")))?;
+			let sole_frame = Self::sole_frame(connection, &proxy, self.reply_timeout).await?;
 			let id = native_window_for_frame(
 				windows,
 				|window| owner_serves_window(pid, window, compositor),
 				&title,
 				sole_frame,
 			)?;
+			// An accessibility position in a window whose origin the compositor
+			// knows must agree with it; otherwise the caller would address input
+			// in a coordinate frame that is not the compositor's.
 			if id.starts_with("niri:") {
 				let window = windows
 					.iter()
@@ -1404,7 +1633,9 @@ impl AxBackend for AtSpiAx {
 				}
 				let component = Self::component(connection, &object)
 					.await
-					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI window component: {err}")))?;
+					.map_err(|err| {
+						DesktopError::ax_failed(format!("AT-SPI window component: {err}"))
+					})?;
 				let (x, y, ..) = component
 					.get_extents(CoordType::Screen)
 					.await
@@ -1435,9 +1666,9 @@ impl AxBackend for AtSpiAx {
 
 	fn children(&mut self, h: &AxHandle) -> CoreResult<Vec<AxHandle>> {
 		let object = Self::object(h).clone();
-		wait_for_ax(&self.rt, async {
+		self.request(async {
 			let proxy = object
-				.as_accessible_proxy(self.connection.connection())
+				.as_accessible_proxy(&self.connection)
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI children: {err}")))?;
 			proxy
@@ -1451,14 +1682,14 @@ impl AxBackend for AtSpiAx {
 						.collect()
 				})
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI children: {err}")))
-		})?
+		})
 	}
 
 	fn parent(&mut self, h: &AxHandle) -> CoreResult<Option<AxHandle>> {
 		let object = Self::object(h).clone();
-		wait_for_ax(&self.rt, async {
+		self.request(async {
 			let proxy = object
-				.as_accessible_proxy(self.connection.connection())
+				.as_accessible_proxy(&self.connection)
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI parent: {err}")))?;
 			let parent = proxy
@@ -1466,101 +1697,112 @@ impl AxBackend for AtSpiAx {
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI parent: {err}")))?;
 			Ok((!parent.is_null()).then_some(AxHandle::AtSpi(parent)))
-		})?
+		})
 	}
 
 	fn perform(&mut self, h: &AxHandle, action: &str) -> CoreResult<()> {
 		let object = Self::object(h).clone();
-		wait_for_ax(&self.rt, async {
-			let proxy = Self::action(self.connection.connection(), &object)
-				.await
-				.map_err(DesktopError::ax_failed)?;
-			let accessible = object
-				.as_accessible_proxy(self.connection.connection())
-				.await
-				.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
-			let index = resolve_action(&proxy, &accessible, action).await?;
-			proxy
-				.do_action(index)
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI action: {err}")))?
-				.ok_or_else(|| DesktopError::ax_failed(format!("AT-SPI action '{action}' failed")))
-		})?
+		self
+			.request(async {
+				let proxy = Self::action(&self.connection, &object)
+					.await
+					.map_err(DesktopError::ax_failed)?;
+				let accessible = object
+					.as_accessible_proxy(&self.connection)
+					.await
+					.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
+				let index = resolve_action(&proxy, &accessible, action).await?;
+				proxy
+					.do_action(index)
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI action: {err}")))?
+					.ok_or_else(|| DesktopError::ax_failed(format!("AT-SPI action '{action}' failed")))
+			})
+			.map_err(unconfirmed)
 	}
 
 	fn set_value(&mut self, h: &AxHandle, value: &str) -> CoreResult<()> {
 		let object = Self::object(h).clone();
-		wait_for_ax(&self.rt, async {
-			let name = object
-				.name()
-				.ok_or_else(|| DesktopError::ax_failed("AT-SPI object has no bus name"))?
-				.clone();
-			let accessible = object
-				.as_accessible_proxy(self.connection.connection())
-				.await
-				.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
-			let interfaces = accessible
-				.get_interfaces()
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI interfaces: {err}")))?;
-			if interfaces.contains(atspi::Interface::EditableText) {
-				return write_text(self.connection.connection(), &accessible, &name, &object, value)
+		let mut emptied = false;
+		self
+			.request(async {
+				let name = object
+					.name()
+					.ok_or_else(|| DesktopError::ax_failed("AT-SPI object has no bus name"))?
+					.clone();
+				let accessible = object
+					.as_accessible_proxy(&self.connection)
+					.await
+					.map_err(|err| DesktopError::ax_failed(err.to_string()))?;
+				let interfaces = accessible
+					.get_interfaces()
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI interfaces: {err}")))?;
+				if interfaces.contains(atspi::Interface::EditableText) {
+					return write_text(
+						&self.connection,
+						&accessible,
+						&name,
+						&object,
+						value,
+						&mut emptied,
+					)
 					.await;
-			}
-			if !interfaces.contains(atspi::Interface::Value) {
-				return Err(DesktopError::ax_failed("AT-SPI element has no writable value interface"));
-			}
-			let numeric = value.parse::<f64>().map_err(|_| {
-				DesktopError::ax_failed("AT-SPI value is not editable text or a number")
-			})?;
-			if !numeric.is_finite() {
-				return Err(DesktopError::ax_failed("AT-SPI numeric value must be finite"));
-			}
-			let proxy = atspi::proxy::value::ValueProxy::builder(self.connection.connection())
-				.destination(name)
-				.and_then(|b| b.path(object.path().clone()))
-				.map_err(|err| DesktopError::ax_failed(err.to_string()))?
-				.build()
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI value: {err}")))?;
-			proxy
-				.set_current_value(numeric)
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI value: {err}")))
-		})?
+				}
+				if !interfaces.contains(atspi::Interface::Value) {
+					return Err(DesktopError::ax_failed(
+						"AT-SPI element has no writable value interface",
+					));
+				}
+				let numeric = value.parse::<f64>().map_err(|_| {
+					DesktopError::ax_failed("AT-SPI value is not editable text or a number")
+				})?;
+				if !numeric.is_finite() {
+					return Err(DesktopError::ax_failed("AT-SPI numeric value must be finite"));
+				}
+				write_value(&self.connection, &name, &object, numeric).await
+			})
+			.map_err(|error| text_write_error(unconfirmed(error), emptied))
 	}
 
 	fn focus(&mut self, h: &AxHandle) -> CoreResult<()> {
 		let object = Self::object(h).clone();
-		wait_for_ax(&self.rt, async {
-			let component = Self::component(self.connection.connection(), &object)
-				.await
-				.map_err(DesktopError::ax_failed)?;
-			component
-				.grab_focus()
-				.await
-				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI focus: {err}")))?
-				.ok_or_else(|| DesktopError::ax_failed("AT-SPI focus request was rejected"))
-		})?
+		self
+			.request(async {
+				let component = Self::component(&self.connection, &object)
+					.await
+					.map_err(DesktopError::ax_failed)?;
+				component
+					.grab_focus()
+					.await
+					.map_err(|err| DesktopError::ax_failed(format!("AT-SPI focus: {err}")))?
+					.ok_or_else(|| DesktopError::ax_failed("AT-SPI focus request was rejected"))
+			})
+			.map_err(unconfirmed)
 	}
 
 	fn element_at(&mut self, x: f64, y: f64) -> CoreResult<Option<AxHandle>> {
 		let x = x.round() as i32;
 		let y = y.round() as i32;
-		let Self { rt, connection, native, frames: cache } = self;
+		let Self { rt, connection, native, frames: cache, reply_timeout } = self;
 		cache.refresh();
-		wait_for_ax(rt, async {
-			let bus = connection.connection();
+		let find = async {
+			let bus = &*connection;
 			let mut root: Option<(ObjectRefOwned, Option<Placement>)> = None;
 			for app in Self::apps(connection)
 				.await
 				.map_err(DesktopError::ax_failed)?
 			{
-				for frame in Self::frames(connection, &app)
-					.await
-					.map_err(DesktopError::ax_failed)?
-				{
-					let Some(placement) = cache.claim(bus, native.as_deref(), &frame, x, y).await?
+				let frames = Self::frames(connection, &app, *reply_timeout).await?;
+				for frame in frames {
+					// This probes one frame, not the traversal: retain its
+					// single-element operation budget.
+					let Some(placement) = answered(
+						"the application",
+						*reply_timeout,
+						cache.claim(bus, native.as_deref(), &frame, x, y),
+					)
+					.await??
 					else {
 						continue;
 					};
@@ -1581,32 +1823,40 @@ impl AxBackend for AtSpiAx {
 			let Some((root, placement)) = root else {
 				return Ok(None);
 			};
-			Self::descend(bus, root, placement, x, y).await
-		})?
+			Self::descend(bus, root, placement, x, y, *reply_timeout).await
+		};
+		wait_for_ax(rt, find)?
 	}
 
 	fn focused_element(&mut self) -> CoreResult<Option<AxHandle>> {
-		wait_for_ax(&self.rt, async {
+		self.run(async {
+			let mut unanswered_app = false;
 			for app in Self::apps(&self.connection)
 				.await
 				.map_err(DesktopError::ax_failed)?
 			{
-				if let Some(found) = Self::find_focused(self.connection.connection(), app, 0)
-					.await
-					.map_err(DesktopError::ax_failed)?
-				{
-					return Ok(Some(AxHandle::AtSpi(found)));
+				match Self::find_focused(&self.connection, app, 0, self.reply_timeout).await {
+					Ok(Some(found)) => return Ok(Some(AxHandle::AtSpi(found))),
+					Ok(None) => {},
+					// The focus may be in an application that does not answer,
+					// which no other application's lack of focus rules out.
+					Err(error) if error.code == ErrorCode::Timeout => unanswered_app = true,
+					Err(error) => return Err(error),
 				}
 			}
-			Ok(None)
+			if unanswered_app {
+				Err(unanswered("an application", self.reply_timeout))
+			} else {
+				Ok(None)
+			}
 		})?
 	}
 
 	fn attributes(&mut self, h: &AxHandle) -> CoreResult<Vec<(String, String)>> {
 		let object = Self::object(h).clone();
-		wait_for_ax(&self.rt, async {
+		self.request(async {
 			let proxy = object
-				.as_accessible_proxy(self.connection.connection())
+				.as_accessible_proxy(&self.connection)
 				.await
 				.map_err(|err| DesktopError::ax_failed(format!("AT-SPI attributes: {err}")))?;
 			let mut attrs: Vec<_> = proxy
@@ -1618,7 +1868,7 @@ impl AxBackend for AtSpiAx {
 				.collect();
 			attrs.sort_by(|a, b| a.0.cmp(&b.0));
 			Ok(attrs)
-		})?
+		})
 	}
 }
 
@@ -1642,8 +1892,8 @@ impl AtSpiAx {
 			DesktopError::ax_failed(format!("AT-SPI focus state: {error}"))
 		}
 		let object = Self::object(h).clone();
-		wait_for_ax(&self.rt, async {
-			let connection = self.connection.connection();
+		self.request(async {
+			let connection = &self.connection;
 			let proxy = object
 				.as_accessible_proxy(connection)
 				.await
@@ -1672,110 +1922,13 @@ impl AtSpiAx {
 			.await;
 			let (toolkit, version) = toolkit.unwrap_or_default();
 			Ok(ElementFocus { focused, toolkit, version })
-		})?
+		})
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn an_unanswered_ax_method_obeys_cancellation_and_deadlines_without_poisoning_the_connection() {
-		use std::{
-			sync::{
-				Arc,
-				atomic::{AtomicUsize, Ordering},
-			},
-			time::{Duration, Instant},
-		};
-
-		use atspi::zbus::{connection::Builder as ConnectionBuilder, interface};
-
-		use crate::desktop::error::ErrorCode;
-
-		struct Node {
-			source: control::CancellationSource,
-			cancel: bool,
-			calls:  Arc<AtomicUsize>,
-		}
-		#[interface(name = "org.a11y.atspi.Accessible")]
-		impl Node {
-			async fn get_role(&self) -> u32 {
-				if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
-					if self.cancel {
-						self.source.cancel();
-					}
-					// The watchdog reply makes the pre-fix test finish instead of
-					// hanging.
-					tokio::time::sleep(Duration::from_millis(150)).await;
-				}
-				Role::Button as u32
-			}
-		}
-		for cancel in [true, false] {
-			let rt = Builder::new_current_thread().enable_all().build().unwrap();
-			let source = control::CancellationSource::default();
-			let calls = Arc::new(AtomicUsize::new(0));
-			let (server, client) = rt.block_on(async {
-				let (client, server) = tokio::net::UnixStream::pair().unwrap();
-				let server = ConnectionBuilder::unix_stream(server)
-					.server(atspi::zbus::Guid::generate())
-					.unwrap()
-					.p2p()
-					.serve_at("/button", Node {
-						source: source.clone(),
-						cancel,
-						calls: Arc::clone(&calls),
-					})
-					.unwrap()
-					.build();
-				let client = ConnectionBuilder::unix_stream(client).p2p().build();
-				tokio::try_join!(server, client).unwrap()
-			});
-			let read = || async {
-				let object = ObjectRefOwned::from_static_str_unchecked(":1.7", "/button");
-				object
-					.as_accessible_proxy(&client)
-					.await
-					.unwrap()
-					.get_role()
-					.await
-			};
-			let token = source.token();
-			if !cancel {
-				source.set_deadline(Some(Instant::now() + Duration::from_millis(50)));
-			}
-			let result = control::with_token_for_test(&token, || wait_for_ax(&rt, read()));
-			source.set_deadline(None);
-			let recovered = control::with_token_for_test(&source.token(), || wait_for_ax(&rt, read()));
-			drop(server);
-			assert_eq!(
-				result.err().map(|error| error.code),
-				Some(if cancel {
-					ErrorCode::Cancelled
-				} else {
-					ErrorCode::Timeout
-				})
-			);
-			assert_eq!(recovered.unwrap().unwrap(), Role::Button);
-			assert_eq!(calls.load(Ordering::Acquire), 2, "cancellation must not replay a read");
-		}
-	}
-
-	#[test]
-	fn gtk_sensitive_text_controls_are_not_reported_disabled() {
-		// GetState from a live GTK entry: Editable, Focusable, Focused and
-		// Sensitive are set, but Enabled is not.
-		let state = atspi::StateSet::from_bits(1_124_079_744 | (1024_u64 << 32)).unwrap();
-		assert!(state_enabled(state), "an editable GTK control must not be shown as disabled");
-	}
-
-	#[test]
-	fn application_enabled_state_does_not_enable_insensitive_controls() {
-		let state = atspi::StateSet::new(State::Enabled | State::Focused);
-		assert!(!state_enabled(state), "an insensitive control cannot accept user interaction");
-	}
 
 	#[test]
 	fn text_value_reads_text_without_get_all() {
@@ -1873,18 +2026,25 @@ mod tests {
 		assert_eq!(action_index(std::iter::empty(), "press"), None);
 	}
 
-	fn window(id: &str, pid: u32, title: &str) -> DesktopWindow {
-		DesktopWindow {
-			id:             id.to_owned(),
-			pid:            Some(pid),
-			position_known: Some(true),
-			title:          title.into(),
-			app:            "Editor".into(),
-			x:              0,
-			y:              0,
-			width:          100,
-			height:         100,
-			focused:        false,
+	/// Machine names in order, as the GTK 3, GTK 4, Qt 5, Qt 6 and Chromium
+	/// 156 matrix fixtures on Ubuntu 22.04 list them (the colour swatch as GTK
+	/// declares it), with the action `action_index` resolves a generic press to.
+	#[test]
+	fn generic_press_takes_each_toolkits_activation() {
+		let cases: [(&str, &[&str], Option<usize>); 10] = [
+			("GTK 4 label", &["clipboard.copy", "link.open", "menu.popup"], None),
+			("Qt slider", &["SetFocus", "Increase", "Decrease"], None),
+			("Qt menu bar item", &["ShowMenu"], None),
+			("Chromium ARIA menu item", &["select", "showContextMenu"], Some(0)),
+			("Chromium tab", &["doDefault", "showContextMenu"], Some(0)),
+			("Chromium section", &["clickAncestor", "showContextMenu"], Some(0)),
+			("GTK colour swatch", &["select", "activate", "customize"], Some(1)),
+			("spaced spelling", &["Do Default"], Some(0)),
+			("hyphenated spelling", &["do-default"], Some(0)),
+			("context menu only", &["showContextMenu"], None),
+		];
+		for (widget, actions, expected) in cases {
+			assert_eq!(action_index(actions.iter().copied(), "press"), expected, "{widget}");
 		}
 	}
 
@@ -1978,7 +2138,7 @@ mod tests {
 			}
 		}
 
-		/// An error naming what the field reads, one that names no text, or one
+		/// An error naming what the field reads, one that quotes no text, or one
 		/// saying the field was emptied.
 		enum Verdict {
 			Ok,
@@ -2073,7 +2233,12 @@ mod tests {
 				let object = ObjectRefOwned::from_static_str_unchecked(PEER, path);
 				let name = object.name().unwrap().clone();
 				let accessible = object.as_accessible_proxy(&client).await.unwrap();
-				results.push(write_text(&client, &accessible, &name, &object, "new ä€😀").await);
+				let mut emptied = false;
+				results.push(
+					write_text(&client, &accessible, &name, &object, "new ä€😀", &mut emptied)
+						.await
+						.map_err(|error| text_write_error(error, emptied)),
+				);
 			}
 			drop(server);
 			results
@@ -2084,7 +2249,9 @@ mod tests {
 				(Verdict::Ok, Ok(())) => {},
 				(Verdict::Reads(text), Err(err)) if err.message.contains(text) => {},
 				(Verdict::Hidden, Err(err))
-					if err.message.contains("secure") && !err.message.contains("new") => {},
+					if !err.message.contains("new")
+						&& !err.message.contains(r#""old""#)
+						&& !err.message.contains("emptied") => {},
 				(Verdict::Emptied, Err(err))
 					if err.message.contains("emptied") && !err.message.contains("new") => {},
 				(_, result) => panic!("{path}: {result:?}"),
@@ -2093,107 +2260,153 @@ mod tests {
 	}
 
 	#[test]
+	fn a_numeric_write_the_app_clamps_or_ignores_fails() {
+		use std::sync::{Arc, Mutex};
+
+		use atspi::zbus::{connection::Builder as ConnectionBuilder, interface};
+
+		/// What a control does with a write: takes it, clamps it to its range
+		/// (GTK, Qt), keeps its old value while answering (Qt), takes it after
+		/// the first read back, or stores it as `float`.
+		#[derive(Clone, Copy)]
+		enum Takes {
+			Exact,
+			Clamped,
+			Ignored,
+			Later,
+			Single,
+		}
+
+		/// `org.a11y.atspi.Value` with optional bounds.
+		struct Value {
+			current: Arc<Mutex<f64>>,
+			pending: Mutex<Option<f64>>,
+			takes:   Takes,
+			bounds:  Option<(f64, f64)>,
+		}
+
+		#[interface(name = "org.a11y.atspi.Value")]
+		impl Value {
+			#[zbus(property)]
+			fn current_value(&self) -> f64 {
+				let current = *self.current.lock().unwrap();
+				// A write the toolkit applies late shows from the second read on.
+				let pending = self.pending.lock().unwrap().take();
+				if let Some(value) = pending {
+					*self.current.lock().unwrap() = value;
+				}
+				current
+			}
+
+			#[zbus(property)]
+			fn set_current_value(&mut self, value: f64) {
+				let mut current = self.current.lock().unwrap();
+				match self.takes {
+					Takes::Exact => *current = value,
+					Takes::Clamped => {
+						let (min, max) = self.bounds.unwrap_or((0.0, 100.0));
+						*current = value.clamp(min, max);
+					},
+					Takes::Ignored => {},
+					Takes::Later => *self.pending.get_mut().unwrap() = Some(value),
+					#[expect(clippy::cast_possible_truncation, reason = "a float-storing toolkit")]
+					Takes::Single => *current = f64::from(value as f32),
+				}
+			}
+
+			#[zbus(property)]
+			fn minimum_value(&self) -> atspi::zbus::fdo::Result<f64> {
+				self.range(|(min, _)| min)
+			}
+
+			#[zbus(property)]
+			fn maximum_value(&self) -> atspi::zbus::fdo::Result<f64> {
+				self.range(|(_, max)| max)
+			}
+		}
+
+		impl Value {
+			fn range(&self, bound: impl FnOnce((f64, f64)) -> f64) -> atspi::zbus::fdo::Result<f64> {
+				self
+					.bounds
+					.map(bound)
+					.ok_or_else(|| atspi::zbus::fdo::Error::Failed("no range".to_owned()))
+			}
+		}
+
+		const PEER: &str = ":1.7";
+		// Path, what the control does, its bounds, the value written,
+		// and the error's text (`None`: the write succeeds).
+		type Case = (&'static str, Takes, Option<(f64, f64)>, f64, Option<&'static str>);
+		let bounded = Some((0.0, 100.0));
+		let cases: [Case; 8] = [
+			("/exact", Takes::Exact, bounded, 37.25, None),
+			("/later", Takes::Later, bounded, 37.0, None),
+			("/single", Takes::Single, bounded, 0.3, None),
+			(
+				"/minimum_only",
+				Takes::Clamped,
+				Some((0.0, f64::MAX)),
+				-1.0,
+				Some("wrote -1; the control now reads 0 (its minimum is 0)."),
+			),
+			(
+				"/maximum_only",
+				Takes::Clamped,
+				Some((-f64::MAX, 100.0)),
+				150.0,
+				Some("wrote 150; the control now reads 100 (its maximum is 100)."),
+			),
+			(
+				"/clamped",
+				Takes::Clamped,
+				bounded,
+				150.0,
+				Some("wrote 150; the control now reads 100 (its maximum is 100)"),
+			),
+			("/ignored", Takes::Ignored, bounded, 37.0, Some("wrote 37; the control now reads 20.")),
+			("/unranged", Takes::Clamped, None, 150.0, Some("wrote 150; the control now reads 100.")),
+		];
+		let rt = Builder::new_current_thread().enable_all().build().unwrap();
+		let results = rt.block_on(async {
+			let (client, server) = tokio::net::UnixStream::pair().unwrap();
+			let mut builder = ConnectionBuilder::unix_stream(server)
+				.server(atspi::zbus::Guid::generate())
+				.unwrap()
+				.p2p();
+			for &(path, takes, bounds, ..) in &cases {
+				let current = Arc::new(Mutex::new(20.0));
+				let control = Value { current, pending: Mutex::new(None), takes, bounds };
+				builder = builder.serve_at(path, control).unwrap();
+			}
+			let client = ConnectionBuilder::unix_stream(client).p2p().build();
+			let (server, client) = tokio::try_join!(builder.build(), client).unwrap();
+			let mut results = Vec::new();
+			for &(path, _, _, value, _) in &cases {
+				let object = ObjectRefOwned::from_static_str_unchecked(PEER, path);
+				let name = object.name().unwrap().clone();
+				results.push(write_value(&client, &name, &object, value).await);
+			}
+			drop(server);
+			results
+		});
+		for ((path, .., error), result) in cases.iter().zip(results) {
+			match (error, result) {
+				(None, Ok(())) => {},
+				(Some(text), Err(err)) if err.message.contains(text) => {},
+				(_, result) => panic!("{path}: {result:?}"),
+			}
+		}
+	}
+
+	#[test]
 	fn frame_ownership_requires_unique_process_and_title() {
 		let owned_by = |owner: u32| move |window: &DesktopWindow| window.pid == Some(owner);
-		let mut windows = vec![window("1", 10, "Document"), window("2", 20, "Document")];
+		let mut windows = vec![owned_window("1", 10, "Document"), owned_window("2", 20, "Document")];
 		assert_eq!(native_window_for_frame(&windows, owned_by(20), "Document", false).unwrap(), "2");
 		assert!(native_window_for_frame(&windows, owned_by(30), "Document", false).is_err());
-		windows.push(window("3", 20, "Document"));
+		windows.push(owned_window("3", 20, "Document"));
 		assert!(native_window_for_frame(&windows, owned_by(20), "Document", false).is_err());
-	}
-
-	/// A frame without the window's title maps to the owner's window only when
-	/// the owner serves exactly one; with two windows of one application either
-	/// could be meant.
-	#[test]
-	fn untitled_frame_needs_a_sole_served_window() {
-		let owned_by = |owner: u32| move |window: &DesktopWindow| window.pid == Some(owner);
-		let mut windows = vec![window("niri:1", 10, "Part A"), window("niri:2", 20, "Other")];
-		// AccessKit frames may be unnamed or keep a title the app never updated.
-		for frame_title in ["", "Untitled"] {
-			assert_eq!(
-				native_window_for_frame(&windows, owned_by(10), frame_title, true).unwrap(),
-				"niri:1"
-			);
-		}
-		assert!(
-			native_window_for_frame(&windows, owned_by(10), "", false).is_err(),
-			"another frame of the application could be this window"
-		);
-		windows.push(window("niri:3", 10, "Part B"));
-		assert!(native_window_for_frame(&windows, owned_by(10), "", true).is_err());
-		let x11 = [window("0x1", 10, "Part A")];
-		assert!(
-			native_window_for_frame(&x11, owned_by(10), "", true).is_err(),
-			"only the compositor's complete window list proves a sole window"
-		);
-	}
-
-	#[test]
-	fn titled_frame_wins_and_untitled_frame_needs_proven_ownership() {
-		let candidates = |frames: &[(u8, &str)]| FrameCandidates {
-			owner:  Some(10),
-			frames: frames
-				.iter()
-				.map(|&(id, name)| (id, name.to_owned()))
-				.collect(),
-		};
-		let win = window("niri:1", 10, "Part A");
-		assert_eq!(select_frame(candidates(&[(1, ""), (2, "Part A")]), &win, |_| false), Ok(2));
-		assert_eq!(select_frame(candidates(&[(1, "")]), &win, |_| true), Ok(1));
-		assert_eq!(select_frame(candidates(&[(1, "Untitled")]), &win, |_| true), Ok(1));
-		// Two windows of one application: the compositor reports another
-		// window the same owner serves, so the frame may be either's.
-		assert!(select_frame(candidates(&[(1, "")]), &win, |_| false).is_err());
-		assert!(select_frame(candidates(&[(1, ""), (2, "Settings")]), &win, |_| true).is_err());
-		assert!(select_frame(candidates(&[(1, "Part A"), (2, "Part A")]), &win, |_| true).is_err());
-		let named_only = FrameCandidates { owner: None, frames: vec![(1_u8, String::new())] };
-		assert!(
-			select_frame(named_only, &win, |_| true).is_err(),
-			"a name-matched application proves no ownership"
-		);
-		let x11 = window("0x1", 10, "Part A");
-		assert!(select_frame(candidates(&[(1, "")]), &x11, |_| true).is_err());
-	}
-
-	/// The compositor spawns Xwayland bridges and launched apps, so its own
-	/// accessibility tree must never be taken for one of their windows.
-	#[test]
-	fn compositor_ancestry_proves_no_ownership() {
-		let parent_of = |pid: u32| {
-			let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
-			stat
-				.rsplit_once(')')
-				.and_then(|(_, fields)| fields.split_whitespace().nth(1))
-				.and_then(|pid| pid.parse::<u32>().ok())
-				.expect("parent pid")
-		};
-		let client = std::process::id();
-		let parent = parent_of(client);
-		let win = window("niri:1", client, "Part A");
-		assert!(owner_serves_window(parent, &win, Some(1)), "an ancestor owns a child's window");
-		assert!(!owner_serves_window(parent, &win, Some(parent)), "the compositor owns nothing");
-		assert!(!owner_serves_window(parent, &win, None), "ancestry needs a known compositor");
-		assert!(owner_serves_window(client, &win, Some(client)), "the client owns its window");
-		// A terminal that launched the app is a farther ancestor than the app's
-		// own process, so the app's accessibility tree ranks first.
-		let grandparent = parent_of(parent);
-		let rank = |owner| ownership_rank(owner, &win, Some(1));
-		assert!(rank(client) < rank(parent));
-		if grandparent > 1 {
-			assert!(rank(parent) < rank(grandparent));
-		}
-	}
-
-	#[test]
-	fn flatpak_instance_id_comes_from_the_instance_group() {
-		let info = concat!(
-			"[Application]\nname=ai.storyteller.pdfcraft\ninstance-id=decoy\n\n",
-			"[Instance]\ninstance-id=1280135730\napp-path=/app\n",
-		);
-		assert_eq!(flatpak_instance_id(info), Some("1280135730"));
-		assert_eq!(flatpak_instance_id("[Instance]\ninstance-id=\n"), None);
-		assert_eq!(flatpak_instance_id("[Application]\nname=x\n"), None);
 	}
 
 	#[test]
@@ -2204,12 +2417,12 @@ mod tests {
 				pid: Some(pid),
 				title: title.into(),
 				app: "app".into(),
+				position_known: Some(false),
 				x: 0,
 				y: 0,
 				width: 100,
 				height: 100,
 				focused,
-				position_known: Some(false),
 			},
 			position_known: false,
 		};
@@ -2227,39 +2440,72 @@ mod tests {
 		// GNOME: gnome-shell (the compositor, pid 1) keeps its "Main stage"
 		// active.
 		let mut gnome = vec![frame("Main stage", 1, true), frame("notes.txt - gedit", 7, true)];
-		resolve_focus(&mut gnome, Some(1), no_lookup);
+		resolve_focus(&mut gnome, Some(1), false, no_lookup);
 		assert_eq!(focused(&gnome), ["notes.txt - gedit"]);
 
 		// KDE: plasma-keyboard's untitled frame stays active.
 		let mut kde = vec![frame("", 5, true), frame("notes.txt — Kate", 8, true)];
-		resolve_focus(&mut kde, None, no_lookup);
+		resolve_focus(&mut kde, None, false, no_lookup);
 		assert_eq!(focused(&kde), ["notes.txt — Kate"]);
 
 		// The GNOME overview: only the shell is active, and it keeps focus.
 		let mut overview = vec![frame("Main stage", 1, true), frame("notes.txt - gedit", 7, false)];
-		resolve_focus(&mut overview, Some(1), no_lookup);
+		resolve_focus(&mut overview, Some(1), false, no_lookup);
 		assert_eq!(focused(&overview), ["Main stage"]);
 
 		// Two active application windows: none is named.
 		let mut two = vec![frame("Main stage", 1, true), frame("A", 7, true), frame("B", 9, true)];
-		resolve_focus(&mut two, Some(1), no_lookup);
+		resolve_focus(&mut two, Some(1), false, no_lookup);
 		assert!(focused(&two).is_empty());
 
 		// An untitled application window still wins over gnome-shell's frame.
 		let mut untitled = vec![frame("Main stage", 1, true), frame("", 7, true)];
-		resolve_focus(&mut untitled, Some(1), no_lookup);
+		resolve_focus(&mut untitled, Some(1), false, no_lookup);
 		assert_eq!(focused(&untitled), [""]);
 
 		// KDE with an untitled app beside plasma-keyboard: the frame holding
 		// keyboard focus wins.
 		let mut kde_untitled = vec![frame("", 5, true), frame("", 8, true)];
-		resolve_focus(&mut kde_untitled, None, |window| window.pid == Some(8));
+		resolve_focus(&mut kde_untitled, None, false, |window| window.pid == Some(8));
 		let ids: Vec<&str> = kde_untitled
 			.iter()
 			.filter(|w| w.window.focused)
 			.map(|w| w.window.id.as_str())
 			.collect();
 		assert_eq!(ids, ["-8"]);
+
+		// A shell's permanent Active state cannot stand in for a skipped app.
+		let mut skipped_gnome = vec![frame("Main stage", 1, true)];
+		resolve_focus(&mut skipped_gnome, Some(1), true, |_| false);
+		assert!(focused(&skipped_gnome).is_empty());
+		let mut skipped_kde = vec![frame("", 5, true)];
+		resolve_focus(&mut skipped_kde, None, true, |_| false);
+		assert!(focused(&skipped_kde).is_empty());
+
+		// Positive keyboard focus still permits the overview or an untitled app.
+		let mut focused_overview = vec![frame("Main stage", 1, true)];
+		resolve_focus(&mut focused_overview, Some(1), true, |_| true);
+		assert_eq!(focused(&focused_overview), ["Main stage"]);
+		let mut focused_untitled = vec![frame("", 8, true)];
+		resolve_focus(&mut focused_untitled, None, true, |_| true);
+		assert_eq!(focused(&focused_untitled), [""]);
+
+		// A named application's Active state does not require a shell probe.
+		let mut answered_app = vec![frame("notes.txt", 7, true)];
+		resolve_focus(&mut answered_app, Some(1), true, no_lookup);
+		assert_eq!(focused(&answered_app), ["notes.txt"]);
+
+		// An all-untitled tie already proves keyboard focus, so do not scan
+		// twice.
+		let mut checked_kde = vec![frame("", 5, true), frame("", 8, true)];
+		let mut probes = 0;
+		resolve_focus(&mut checked_kde, None, true, |window| {
+			probes += 1;
+			window.pid == Some(8)
+		});
+		assert!(!checked_kde[0].window.focused);
+		assert!(checked_kde[1].window.focused);
+		assert_eq!(probes, 2);
 	}
 
 	#[test]
@@ -2322,11 +2568,11 @@ mod tests {
 			let (server, client) = tokio::try_join!(server.build(), client).unwrap();
 			let object = |path| ObjectRefOwned::from_static_str_unchecked(PEER, path);
 			let path = |object: ObjectRefOwned| object.path_as_str().to_owned();
-			let top_levels = AtSpiAx::top_levels(&client, &object("/app")).await;
+			let top_levels = AtSpiAx::frames(&client, &object("/app"), REPLY_TIMEOUT).await;
 			let mut owners = Vec::new();
 			for element in ["/open", "/dialog", "/ok"] {
 				owners.push(
-					AtSpiAx::top_level(&client, object(element))
+					AtSpiAx::top_level(&client, object(element), REPLY_TIMEOUT)
 						.await
 						.map(path)
 						.ok(),
@@ -2335,7 +2581,7 @@ mod tests {
 			drop(server);
 			(top_levels.map(|items| items.into_iter().map(path).collect::<Vec<_>>()), owners)
 		});
-		assert_eq!(top_levels, Ok(vec!["/dialog".to_owned(), "/frame".to_owned()]));
+		assert_eq!(top_levels.unwrap(), vec!["/dialog".to_owned(), "/frame".to_owned()]);
 		assert_eq!(owners, [Some("/dialog".into()), Some("/dialog".into()), Some("/frame".into())]);
 	}
 
@@ -2393,7 +2639,7 @@ mod tests {
 			let client = ConnectionBuilder::unix_stream(client).p2p().build();
 			let (server, client) = tokio::try_join!(server, client).unwrap();
 			let root = ObjectRefOwned::from_static_str_unchecked(PEER, "/root");
-			let found = AtSpiAx::find_focused(&client, root, 0).await;
+			let found = AtSpiAx::find_focused(&client, root, 0, REPLY_TIMEOUT).await;
 			drop(server);
 			found
 		});
@@ -2700,7 +2946,7 @@ mod tests {
 		fn new(windows: &[(&str, &str, i32, i32)]) -> Self {
 			let windows = windows
 				.iter()
-				.map(|&(id, title, x, y)| native_test_window(id, title, x, y));
+				.map(|&(id, title, x, y)| window(id, title, x, y));
 			Self(std::sync::Mutex::new(windows.collect()), std::sync::atomic::AtomicU32::new(0))
 		}
 
@@ -2709,18 +2955,35 @@ mod tests {
 		}
 	}
 
-	fn native_test_window(id: &str, title: &str, x: i32, y: i32) -> DesktopWindow {
+	fn window(id: &str, title: &str, x: i32, y: i32) -> DesktopWindow {
 		DesktopWindow {
 			id: id.into(),
 			pid: Some(7),
-			position_known: Some(true),
 			title: title.into(),
 			app: "app".into(),
+			position_known: Some(true),
 			x,
 			y,
 			width: 890,
 			height: 550,
 			focused: false,
+		}
+	}
+
+	/// A native window owned by `pid`: ownership, not a name, decides which
+	/// application's accessibility tree serves it.
+	fn owned_window(id: &str, pid: u32, title: &str) -> DesktopWindow {
+		DesktopWindow {
+			id:             id.to_owned(),
+			pid:            Some(pid),
+			position_known: Some(true),
+			title:          title.into(),
+			app:            "Editor".into(),
+			x:              0,
+			y:              0,
+			width:          100,
+			height:         100,
+			focused:        false,
 		}
 	}
 
@@ -2826,7 +3089,7 @@ mod tests {
 			// One walk reads the frame's window once, whatever it places.
 			let walk_reads = native.reads();
 			// The window was replaced by one elsewhere before the next operation.
-			*native.0.lock().unwrap() = vec![native_test_window("43", "Desktop", 500, 100)];
+			*native.0.lock().unwrap() = vec![window("43", "Desktop", 500, 100)];
 			cache.refresh();
 			bounds.push(read_bounds(&mut cache, &client, Some(&native), "/downloads").await);
 			// Without a display server that knows (Wayland), as reported.
@@ -2844,32 +3107,6 @@ mod tests {
 			Some((506.0, 342.0, 168.0, 36.0)),
 			Some((0.0, 0.0, 168.0, 36.0)),
 		]);
-	}
-
-	#[test]
-	fn gtk4_native_matching_requires_a_unique_process_and_title() {
-		let rt = Builder::new_current_thread().enable_all().build().unwrap();
-		rt.block_on(async {
-			let (server, client) = serve(vec![
-				("/app", node(Role::Application, "app", "/null"), None),
-				("/frame", node(Role::Frame, "Desktop", "/app"), Some(Extents::gtk4((0, 0, 890, 550)))),
-			])
-			.await;
-			let native = Native::new(&[("42", "Desktop", 300, 200)]);
-			let frame = object("/frame");
-			let mut other = native_test_window("43", "Desktop", 500, 100);
-			other.pid = Some(8);
-			native.0.lock().unwrap().push(other);
-			assert_eq!(native_window(&client, &native, &frame).await.as_deref(), Some("42"));
-
-			native.0.lock().unwrap()[0].title = "Another document".into();
-			assert_eq!(native_window(&client, &native, &frame).await, None);
-
-			native.0.lock().unwrap()[0].title = "Desktop".into();
-			native.0.lock().unwrap()[1].pid = Some(7);
-			assert_eq!(native_window(&client, &native, &frame).await, None);
-			drop(server);
-		});
 	}
 
 	#[test]
@@ -2947,7 +3184,7 @@ mod tests {
 				.0
 				.lock()
 				.unwrap()
-				.push(native_test_window("44", "Hidden", 100, 50));
+				.push(window("44", "Hidden", 100, 50));
 			cache.refresh();
 			claims.push(
 				cache
@@ -2959,7 +3196,7 @@ mod tests {
 			for (path, placement, x, y) in
 				[("/frame", claims[0].flatten(), 390, 460), ("/editor", None, 20, 15)]
 			{
-				let element = AtSpiAx::descend(&client, object(path), placement, x, y)
+				let element = AtSpiAx::descend(&client, object(path), placement, x, y, REPLY_TIMEOUT)
 					.await
 					.unwrap();
 				found.push(element.map(|element| AtSpiAx::object(&element).path_as_str().to_owned()));
@@ -2979,5 +3216,847 @@ mod tests {
 			Some(Some(shown)),
 		]);
 		assert_eq!(found, [Some("/downloads".to_owned()), Some("/open".to_owned())]);
+	}
+
+	mod unanswered {
+		use atspi::zbus::{
+			Guid, connection::Builder as ConnectionBuilder, interface, zvariant::OwnedObjectPath,
+		};
+
+		use super::*;
+		use crate::desktop::control;
+
+		const PEER: &str = ":1.7";
+		/// Long enough for every call this process answers itself.
+		const HUNG_CALL_TIMEOUT: Duration = Duration::from_secs(1);
+
+		fn path(p: &str) -> OwnedObjectPath {
+			OwnedObjectPath::try_from(p).unwrap()
+		}
+
+		/// The backend over a peer-to-peer connection to what `serve` serves.
+		fn backend(
+			reply_timeout: Duration,
+			serve: impl FnOnce(ConnectionBuilder<'static>) -> ConnectionBuilder<'static>,
+		) -> (AtSpiAx, Connection) {
+			let rt = Builder::new_current_thread().enable_all().build().unwrap();
+			let (server, connection) = rt.block_on(async {
+				let (client, server) = tokio::net::UnixStream::pair().unwrap();
+				let server = ConnectionBuilder::unix_stream(server)
+					.server(Guid::generate())
+					.unwrap()
+					.p2p();
+				let client = ConnectionBuilder::unix_stream(client).p2p().build();
+				tokio::try_join!(serve(server).build(), client).unwrap()
+			});
+			(
+				AtSpiAx { rt, connection, reply_timeout, native: None, frames: FrameCache::default() },
+				server,
+			)
+		}
+
+		/// An element of an application that answers no method call, as a GTK 3
+		/// app does while a dialog an accessibility action opened is up. (It
+		/// has no properties: the server answers those inline, so a property
+		/// that never answers would silence every other element too.)
+		struct Silent {
+			/// Cancelled when the first call arrives, as the host cancels a run
+			/// that times out.
+			cancel: Option<control::CancellationSource>,
+		}
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl Silent {
+			async fn get_role_name(&self) -> String {
+				if let Some(cancel) = &self.cancel {
+					cancel.cancel();
+				}
+				std::future::pending().await
+			}
+
+			async fn get_state(&self) -> Vec<u32> {
+				std::future::pending().await
+			}
+
+			async fn get_children(&self) -> Vec<(String, OwnedObjectPath)> {
+				std::future::pending().await
+			}
+		}
+
+		struct Element {
+			delay:    Duration,
+			name:     &'static str,
+			role:     Role,
+			focused:  bool,
+			children: Vec<(String, OwnedObjectPath)>,
+		}
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl Element {
+			#[zbus(property)]
+			fn name(&self) -> String {
+				self.name.to_owned()
+			}
+
+			async fn get_role(&self) -> u32 {
+				tokio::time::sleep(self.delay).await;
+				self.role as u32
+			}
+
+			async fn get_state(&self) -> Vec<u32> {
+				tokio::time::sleep(self.delay).await;
+				let state = if self.focused {
+					State::Focused as u64
+				} else {
+					0
+				};
+				vec![state as u32, (state >> 32) as u32]
+			}
+
+			fn get_children(&self) -> Vec<(String, OwnedObjectPath)> {
+				self.children.clone()
+			}
+		}
+
+		/// A frame at `(x, y)` on screen, and at the origin in window
+		/// coordinates.
+		struct Extents {
+			x:     i32,
+			y:     i32,
+			delay: Duration,
+		}
+
+		#[interface(name = "org.a11y.atspi.Component")]
+		impl Extents {
+			async fn get_extents(&self, coord_type: u32) -> (i32, i32, i32, i32) {
+				tokio::time::sleep(self.delay).await;
+				if coord_type == CoordType::Window as u32 {
+					(0, 0, 300, 200)
+				} else {
+					(self.x, self.y, 300, 200)
+				}
+			}
+		}
+
+		fn silent_element(
+			reply_timeout: Duration,
+			cancel: Option<control::CancellationSource>,
+		) -> (AtSpiAx, Connection) {
+			backend(reply_timeout, |server| server.serve_at("/silent", Silent { cancel }).unwrap())
+		}
+
+		#[test]
+		fn a_request_the_application_never_answers_times_out() {
+			let (mut ax, _server) = silent_element(HUNG_CALL_TIMEOUT, None);
+			let element = AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/silent"));
+			assert_eq!(ax.props(&element).unwrap_err().code, ErrorCode::Timeout);
+		}
+
+		#[test]
+		fn a_cancel_frees_a_request_the_application_never_answers() {
+			let source = control::CancellationSource::default();
+			let (mut ax, _server) = silent_element(REPLY_TIMEOUT, Some(source.clone()));
+			let element = AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/silent"));
+			let error =
+				control::with_token_for_test(&source.token(), || ax.props(&element)).unwrap_err();
+			assert_eq!(error.code, ErrorCode::Cancelled);
+		}
+
+		#[test]
+		fn interrupted_masked_text_write_warns_if_the_field_may_be_empty() {
+			use std::sync::{Arc, Mutex};
+
+			struct Accessible([&'static str; 2]);
+			#[interface(name = "org.a11y.atspi.Accessible")]
+			impl Accessible {
+				fn get_interfaces(&self) -> &[&str] {
+					&self.0
+				}
+			}
+
+			struct Text(Arc<Mutex<String>>);
+			#[interface(name = "org.a11y.atspi.Text")]
+			impl Text {
+				#[zbus(property)]
+				fn character_count(&self) -> i32 {
+					self.0.lock().unwrap().chars().count() as i32
+				}
+
+				fn get_text(&self, start_offset: i32, end_offset: i32) -> String {
+					std::iter::repeat_n('●', self.0.lock().unwrap().chars().count())
+						.skip(start_offset as usize)
+						.take((end_offset - start_offset) as usize)
+						.collect()
+				}
+			}
+
+			struct Editable {
+				text:    Arc<Mutex<String>>,
+				count:   Mutex<usize>,
+				stop_at: usize,
+				cancel:  Option<control::CancellationSource>,
+			}
+			#[interface(name = "org.a11y.atspi.EditableText")]
+			impl Editable {
+				async fn set_text_contents(&self, text: String) -> bool {
+					let count = {
+						let mut count = self.count.lock().unwrap();
+						*count += 1;
+						*count
+					};
+					if count == self.stop_at {
+						if let Some(cancel) = &self.cancel {
+							cancel.cancel();
+						}
+						return std::future::pending().await;
+					}
+					*self.text.lock().unwrap() = text;
+					true
+				}
+			}
+
+			// Before any clear, during the clear, and during the rewrite.
+			for stop_at in 1..=3 {
+				for cancelled in [false, true] {
+					let source = control::CancellationSource::default();
+					let text = Arc::new(Mutex::new("old secret".to_owned()));
+					let (mut ax, _server) = backend(HUNG_CALL_TIMEOUT, |server| {
+						server
+							.serve_at(
+								"/password",
+								Accessible(["org.a11y.atspi.EditableText", "org.a11y.atspi.Text"]),
+							)
+							.unwrap()
+							.serve_at("/password", Text(text.clone()))
+							.unwrap()
+							.serve_at("/password", Editable {
+								text: text.clone(),
+								count: Mutex::new(0),
+								stop_at,
+								cancel: cancelled.then(|| source.clone()),
+							})
+							.unwrap()
+					});
+					let element =
+						AxHandle::AtSpi(ObjectRefOwned::from_static_str_unchecked(PEER, "/password"));
+					let error = control::with_token_for_test(&source.token(), || {
+						ax.set_value(&element, "new secret")
+					})
+					.unwrap_err();
+					assert_eq!(
+						error.code,
+						if cancelled {
+							ErrorCode::Cancelled
+						} else {
+							ErrorCode::Timeout
+						}
+					);
+					assert_eq!(
+						error.message.contains("may now be empty"),
+						stop_at == 3,
+						"stop_at={stop_at}, cancelled={cancelled}: {error:?}"
+					);
+					assert!(!error.message.contains("old secret"));
+					assert!(!error.message.contains("new secret"));
+					if stop_at == 3 {
+						assert!(text.lock().unwrap().is_empty());
+					}
+				}
+			}
+		}
+
+		/// A desktop of two applications: one that answers nothing on bus
+		/// `:1.8`, listed first, and an editor whose document frame, at
+		/// `(10, 20)` on screen, has the focus when `focused`. (A peer-to-peer
+		/// connection ignores the destination, so this process serves both.)
+		fn desktop(focused: bool) -> (AtSpiAx, Connection) {
+			desktop_with_delay(focused, Duration::ZERO)
+		}
+
+		fn desktop_with_delay(focused: bool, delay: Duration) -> (AtSpiAx, Connection) {
+			backend(HUNG_CALL_TIMEOUT, |server| {
+				server
+					.serve_at("/org/a11y/atspi/accessible/root", Element {
+						delay:    Duration::ZERO,
+						name:     "main",
+						role:     Role::DesktopFrame,
+						focused:  false,
+						children: vec![
+							(":1.8".to_owned(), path("/silent")),
+							(PEER.to_owned(), path("/editor")),
+						],
+					})
+					.unwrap()
+					.serve_at("/silent", Silent { cancel: None })
+					.unwrap()
+					.serve_at("/editor", Element {
+						delay:    Duration::ZERO,
+						name:     "Editor",
+						role:     Role::Application,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/editor/frame"))],
+					})
+					.unwrap()
+					.serve_at("/editor/frame", Element {
+						delay: Duration::ZERO,
+						name: "Document",
+						role: Role::Frame,
+						focused,
+						children: Vec::new(),
+					})
+					.unwrap()
+					.serve_at("/editor/frame", Extents { x: 10, y: 20, delay })
+					.unwrap()
+			})
+		}
+
+		fn slow_tree() -> (AtSpiAx, Connection, DesktopWindow) {
+			let (ax, server) = backend(HUNG_CALL_TIMEOUT, |server| {
+				server
+					.serve_at("/org/a11y/atspi/accessible/root", Element {
+						delay:    Duration::ZERO,
+						name:     "main",
+						role:     Role::DesktopFrame,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/editor"))],
+					})
+					.unwrap()
+					.serve_at("/editor", Element {
+						delay:    Duration::ZERO,
+						name:     "Editor",
+						role:     Role::Application,
+						focused:  false,
+						children: vec![
+							(PEER.to_owned(), path("/editor/frame")),
+							(PEER.to_owned(), path("/editor/other")),
+						],
+					})
+					.unwrap()
+					.serve_at("/editor/frame", Element {
+						delay:    Duration::from_millis(600),
+						name:     "",
+						role:     Role::Frame,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/editor/frame/entry"))],
+					})
+					.unwrap()
+					.serve_at("/editor/other", Element {
+						delay:    Duration::from_millis(600),
+						name:     "",
+						role:     Role::Frame,
+						focused:  false,
+						children: Vec::new(),
+					})
+					.unwrap()
+					.serve_at("/editor/frame/entry", Element {
+						delay:    Duration::from_millis(600),
+						name:     "",
+						role:     Role::Entry,
+						focused:  true,
+						children: Vec::new(),
+					})
+					.unwrap()
+			});
+			let window = DesktopWindow {
+				id:      format!("atspi:{PEER}:/editor/frame"),
+				title:   String::new(),
+				app:     "Editor".to_owned(),
+				pid:     None,
+				position_known: Some(true),
+				x:       0,
+				y:       0,
+				width:   300,
+				height:  200,
+				focused: true,
+			};
+			(ax, server, window)
+		}
+
+		#[test]
+		fn focus_scan_keeps_a_responsive_tree_past_one_reply_limit() {
+			let (ax, _server, window) = slow_tree();
+			assert!(ax.holds_focus(&window));
+		}
+
+		#[test]
+		fn window_root_keeps_a_responsive_frame_scan_past_one_reply_limit() {
+			let (mut ax, _server, window) = slow_tree();
+			let root = ax.window_root(&window).unwrap();
+			assert_eq!(AtSpiAx::object(&root).path_as_str(), "/editor/frame");
+		}
+
+		#[test]
+		fn windows_keep_an_application_whose_replies_together_exceed_the_limit() {
+			let (ax, _server) = desktop_with_delay(true, Duration::from_millis(600));
+			let listed = ax.windows().unwrap();
+			assert_eq!(listed.windows.len(), 1);
+			assert_eq!(listed.windows[0].window.title, "Document");
+			assert_eq!(listed.unanswered, [":1.8"]);
+		}
+
+		#[test]
+		fn windows_and_focus_leave_out_an_application_that_never_answers() {
+			let (mut ax, _server) = desktop(true);
+			let listed = ax.windows().unwrap();
+			assert_eq!(
+				listed
+					.windows
+					.iter()
+					.map(|listed| (listed.window.app.as_str(), listed.window.title.as_str()))
+					.collect::<Vec<_>>(),
+				[("Editor", "Document")]
+			);
+			assert_eq!(listed.unanswered, [":1.8"]);
+			let Some(AxHandle::AtSpi(focused)) = ax.focused_element().unwrap() else {
+				panic!("the answering application's focus must be found");
+			};
+			assert_eq!(focused.path_as_str(), "/editor/frame");
+		}
+
+		#[test]
+		fn applications_that_never_answer_cost_the_listing_one_reply_limit_together() {
+			let (ax, _server) = backend(HUNG_CALL_TIMEOUT, |server| {
+				server
+					.serve_at("/org/a11y/atspi/accessible/root", Element {
+						delay:    Duration::ZERO,
+						name:     "main",
+						role:     Role::DesktopFrame,
+						focused:  false,
+						children: (0..3)
+							.map(|index| (format!(":1.{}", 8 + index), path(&format!("/silent{index}"))))
+							.collect(),
+					})
+					.unwrap()
+					.serve_at("/silent0", Silent { cancel: None })
+					.unwrap()
+					.serve_at("/silent1", Silent { cancel: None })
+					.unwrap()
+					.serve_at("/silent2", Silent { cancel: None })
+					.unwrap()
+			});
+			let started = std::time::Instant::now();
+			let listed = ax.windows().unwrap();
+			assert_eq!(listed.unanswered, [":1.8", ":1.9", ":1.10"]);
+			assert!(started.elapsed() < HUNG_CALL_TIMEOUT * 2, "{:?}", started.elapsed());
+		}
+
+		#[test]
+		fn focus_found_nowhere_else_may_be_in_an_application_that_never_answers() {
+			let (mut ax, _server) = desktop(false);
+			assert_eq!(ax.focused_element().err().map(|error| error.code), Some(ErrorCode::Timeout));
+		}
+
+		#[test]
+		fn a_point_an_application_that_never_answers_may_own_is_not_resolved() {
+			let (mut ax, _server) = desktop(true);
+			assert_eq!(
+				ax.element_at(50.0, 50.0).err().map(|error| error.code),
+				Some(ErrorCode::Timeout)
+			);
+		}
+
+		/// A menu bar that names its parent frame and then answers no method
+		/// call.
+		struct SilentMenuBar {
+			parent: (String, OwnedObjectPath),
+		}
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl SilentMenuBar {
+			#[zbus(property)]
+			fn parent(&self) -> (String, OwnedObjectPath) {
+				self.parent.clone()
+			}
+
+			async fn get_role(&self) -> u32 {
+				std::future::pending().await
+			}
+		}
+
+		#[test]
+		fn a_menu_read_fails_when_the_application_stops_answering_part_way() {
+			let (mut ax, _server) = backend(HUNG_CALL_TIMEOUT, |server| {
+				server
+					.serve_at("/org/a11y/atspi/accessible/root", Element {
+						delay:    Duration::ZERO,
+						name:     "main",
+						role:     Role::DesktopFrame,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/editor"))],
+					})
+					.unwrap()
+					.serve_at("/editor", Element {
+						delay:    Duration::ZERO,
+						name:     "Editor",
+						role:     Role::Application,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/editor/frame"))],
+					})
+					.unwrap()
+					.serve_at("/editor/frame", Element {
+						delay:    Duration::ZERO,
+						name:     "Document",
+						role:     Role::Frame,
+						focused:  true,
+						children: vec![(PEER.to_owned(), path("/editor/frame/menubar"))],
+					})
+					.unwrap()
+					.serve_at("/editor/frame/menubar", SilentMenuBar {
+						parent: (PEER.to_owned(), path("/editor/frame")),
+					})
+					.unwrap()
+			});
+			let window = DesktopWindow {
+				id:      format!("atspi:{PEER}:/editor/frame"),
+				title:   "Document".into(),
+				app:     "Editor".into(),
+				pid:     None,
+				position_known: Some(true),
+				x:       0,
+				y:       0,
+				width:   300,
+				height:  200,
+				focused: true,
+			};
+			assert_eq!(
+				ax.menu_items(&window, &[]).err().map(|error| error.code),
+				Some(ErrorCode::Timeout)
+			);
+		}
+
+		/// A menu element that names its parent, as `menu_children` checks.
+		struct MenuNode {
+			name:     &'static str,
+			role:     Role,
+			parent:   &'static str,
+			children: &'static [&'static str],
+		}
+
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl MenuNode {
+			#[zbus(property)]
+			fn name(&self) -> String {
+				self.name.to_owned()
+			}
+
+			#[zbus(property)]
+			fn parent(&self) -> (String, OwnedObjectPath) {
+				(PEER.to_owned(), path(self.parent))
+			}
+
+			fn get_role(&self) -> u32 {
+				self.role as u32
+			}
+
+			#[allow(clippy::unused_self, reason = "every fake menu element is enabled")]
+			fn get_state(&self) -> Vec<u32> {
+				let state = State::Enabled as u64 | State::Sensitive as u64;
+				vec![state as u32, (state >> 32) as u32]
+			}
+
+			fn get_children(&self) -> Vec<(String, OwnedObjectPath)> {
+				self
+					.children
+					.iter()
+					.map(|child| (PEER.to_owned(), path(child)))
+					.collect()
+			}
+		}
+
+		/// Qt 5 and 6 publish a menu bar item's menu as a `PopupMenu` child of
+		/// that item, where GTK publishes a `Menu`.
+		#[test]
+		fn a_qt_menu_bar_item_opens_its_popup_menu() {
+			let (mut ax, _server) = backend(HUNG_CALL_TIMEOUT, |server| {
+				let menu = |name, role, parent, children: &'static [&'static str]| MenuNode {
+					name,
+					role,
+					parent,
+					children,
+				};
+				server
+					.serve_at("/org/a11y/atspi/accessible/root", Element {
+						delay:    Duration::ZERO,
+						name:     "main",
+						role:     Role::DesktopFrame,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/qt"))],
+					})
+					.unwrap()
+					.serve_at("/qt", Element {
+						delay:    Duration::ZERO,
+						name:     "qtapp",
+						role:     Role::Application,
+						focused:  false,
+						children: vec![(PEER.to_owned(), path("/qt/frame"))],
+					})
+					.unwrap()
+					.serve_at("/qt/frame", Element {
+						delay:    Duration::ZERO,
+						name:     "Notes",
+						role:     Role::Frame,
+						focused:  true,
+						children: vec![(PEER.to_owned(), path("/qt/bar"))],
+					})
+					.unwrap()
+					.serve_at("/qt/bar", menu("", Role::MenuBar, "/qt/frame", &["/qt/file"]))
+					.unwrap()
+					.serve_at("/qt/file", menu("File", Role::MenuItem, "/qt/bar", &["/qt/popup"]))
+					.unwrap()
+					.serve_at(
+						"/qt/popup",
+						menu("", Role::PopupMenu, "/qt/file", &["/qt/mark", "/qt/other"]),
+					)
+					.unwrap()
+					.serve_at("/qt/mark", menu("Mark", Role::MenuItem, "/qt/popup", &[]))
+					.unwrap()
+					.serve_at("/qt/other", menu("Other", Role::MenuItem, "/qt/popup", &[]))
+					.unwrap()
+			});
+			let window = DesktopWindow {
+				id:      format!("atspi:{PEER}:/qt/frame"),
+				title:   "Notes".into(),
+				app:     "qtapp".into(),
+				pid:     None,
+				position_known: Some(true),
+				x:       0,
+				y:       0,
+				width:   300,
+				height:  200,
+				focused: true,
+			};
+			let bar = ax.menu_items(&window, &[]).unwrap();
+			assert_eq!(
+				bar.iter()
+					.map(|item| (item.title.as_str(), item.has_submenu))
+					.collect::<Vec<_>>(),
+				[("File", true)]
+			);
+			let file = ax.menu_items(&window, &["File".to_owned()]).unwrap();
+			assert_eq!(
+				file
+					.iter()
+					.map(|item| (item.path.join(" > "), item.has_submenu))
+					.collect::<Vec<_>>(),
+				[("File > Mark".to_owned(), false), ("File > Other".to_owned(), false)]
+			);
+		}
+	}
+
+	#[test]
+	fn an_unanswered_ax_method_obeys_cancellation_and_deadlines_without_poisoning_the_connection() {
+		use std::{
+			sync::{
+				Arc,
+				atomic::{AtomicUsize, Ordering},
+			},
+			time::{Duration, Instant},
+		};
+
+		use atspi::zbus::{connection::Builder as ConnectionBuilder, interface};
+
+		use crate::desktop::error::ErrorCode;
+
+		struct Node {
+			source: control::CancellationSource,
+			cancel: bool,
+			calls:  Arc<AtomicUsize>,
+		}
+		#[interface(name = "org.a11y.atspi.Accessible")]
+		impl Node {
+			async fn get_role(&self) -> u32 {
+				if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+					if self.cancel {
+						self.source.cancel();
+					}
+					// The watchdog reply makes the pre-fix test finish instead of
+					// hanging.
+					tokio::time::sleep(Duration::from_millis(150)).await;
+				}
+				Role::Button as u32
+			}
+		}
+		for cancel in [true, false] {
+			let rt = Builder::new_current_thread().enable_all().build().unwrap();
+			let source = control::CancellationSource::default();
+			let calls = Arc::new(AtomicUsize::new(0));
+			let (server, client) = rt.block_on(async {
+				let (client, server) = tokio::net::UnixStream::pair().unwrap();
+				let server = ConnectionBuilder::unix_stream(server)
+					.server(atspi::zbus::Guid::generate())
+					.unwrap()
+					.p2p()
+					.serve_at("/button", Node {
+						source: source.clone(),
+						cancel,
+						calls: Arc::clone(&calls),
+					})
+					.unwrap()
+					.build();
+				let client = ConnectionBuilder::unix_stream(client).p2p().build();
+				tokio::try_join!(server, client).unwrap()
+			});
+			let read = || async {
+				let object = ObjectRefOwned::from_static_str_unchecked(":1.7", "/button");
+				object
+					.as_accessible_proxy(&client)
+					.await
+					.unwrap()
+					.get_role()
+					.await
+			};
+			let token = source.token();
+			if !cancel {
+				source.set_deadline(Some(Instant::now() + Duration::from_millis(50)));
+			}
+			let result = control::with_token_for_test(&token, || wait_for_ax(&rt, read()));
+			source.set_deadline(None);
+			let recovered = control::with_token_for_test(&source.token(), || wait_for_ax(&rt, read()));
+			drop(server);
+			assert_eq!(
+				result.err().map(|error| error.code),
+				Some(if cancel {
+					ErrorCode::Cancelled
+				} else {
+					ErrorCode::Timeout
+				})
+			);
+			assert_eq!(recovered.unwrap().unwrap(), Role::Button);
+			assert_eq!(calls.load(Ordering::Acquire), 2, "cancellation must not replay a read");
+		}
+	}
+
+	#[test]
+	fn gtk_sensitive_text_controls_are_not_reported_disabled() {
+		// GetState from a live GTK entry: Editable, Focusable, Focused and
+		// Sensitive are set, but Enabled is not.
+		let state = atspi::StateSet::from_bits(1_124_079_744 | (1024_u64 << 32)).unwrap();
+		assert!(state_enabled(state), "an editable GTK control must not be shown as disabled");
+	}
+
+	#[test]
+	fn application_enabled_state_does_not_enable_insensitive_controls() {
+		let state = atspi::StateSet::new(State::Enabled | State::Focused);
+		assert!(!state_enabled(state), "an insensitive control cannot accept user interaction");
+	}
+
+	/// A frame without the window's title maps to the owner's window only when
+	/// the owner serves exactly one; with two windows of one application either
+	/// could be meant.
+	#[test]
+	fn untitled_frame_needs_a_sole_served_window() {
+		let owned_by = |owner: u32| move |window: &DesktopWindow| window.pid == Some(owner);
+		let mut windows = vec![owned_window("niri:1", 10, "Part A"), owned_window("niri:2", 20, "Other")];
+		// AccessKit frames may be unnamed or keep a title the app never updated.
+		for frame_title in ["", "Untitled"] {
+			assert_eq!(
+				native_window_for_frame(&windows, owned_by(10), frame_title, true).unwrap(),
+				"niri:1"
+			);
+		}
+		assert!(
+			native_window_for_frame(&windows, owned_by(10), "", false).is_err(),
+			"another frame of the application could be this window"
+		);
+		windows.push(owned_window("niri:3", 10, "Part B"));
+		assert!(native_window_for_frame(&windows, owned_by(10), "", true).is_err());
+		let x11 = [owned_window("0x1", 10, "Part A")];
+		assert!(
+			native_window_for_frame(&x11, owned_by(10), "", true).is_err(),
+			"only the compositor's complete window list proves a sole window"
+		);
+	}
+
+	#[test]
+	fn titled_frame_wins_and_untitled_frame_needs_proven_ownership() {
+		let candidates = |frames: &[(u8, &str)]| FrameCandidates {
+			owner:  Some(10),
+			frames: frames
+				.iter()
+				.map(|&(id, name)| (id, name.to_owned()))
+				.collect(),
+		};
+		let win = owned_window("niri:1", 10, "Part A");
+		assert_eq!(select_frame(candidates(&[(1, ""), (2, "Part A")]), &win, |_| false), Ok(2));
+		assert_eq!(select_frame(candidates(&[(1, "")]), &win, |_| true), Ok(1));
+		assert_eq!(select_frame(candidates(&[(1, "Untitled")]), &win, |_| true), Ok(1));
+		// Two windows of one application: the compositor reports another
+		// window the same owner serves, so the frame may be either's.
+		assert!(select_frame(candidates(&[(1, "")]), &win, |_| false).is_err());
+		assert!(select_frame(candidates(&[(1, ""), (2, "Settings")]), &win, |_| true).is_err());
+		assert!(select_frame(candidates(&[(1, "Part A"), (2, "Part A")]), &win, |_| true).is_err());
+		let named_only = FrameCandidates { owner: None, frames: vec![(1_u8, String::new())] };
+		assert!(
+			select_frame(named_only, &win, |_| true).is_err(),
+			"a name-matched application proves no ownership"
+		);
+		let x11 = owned_window("0x1", 10, "Part A");
+		assert!(select_frame(candidates(&[(1, "")]), &x11, |_| true).is_err());
+	}
+
+	/// The compositor spawns Xwayland bridges and launched apps, so its own
+	/// accessibility tree must never be taken for one of their windows.
+	#[test]
+	fn compositor_ancestry_proves_no_ownership() {
+		let parent_of = |pid: u32| {
+			let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat");
+			stat
+				.rsplit_once(')')
+				.and_then(|(_, fields)| fields.split_whitespace().nth(1))
+				.and_then(|pid| pid.parse::<u32>().ok())
+				.expect("parent pid")
+		};
+		let client = std::process::id();
+		let parent = parent_of(client);
+		let win = owned_window("niri:1", client, "Part A");
+		assert!(owner_serves_window(parent, &win, Some(1)), "an ancestor owns a child's window");
+		assert!(!owner_serves_window(parent, &win, Some(parent)), "the compositor owns nothing");
+		assert!(!owner_serves_window(parent, &win, None), "ancestry needs a known compositor");
+		assert!(owner_serves_window(client, &win, Some(client)), "the client owns its window");
+		// A terminal that launched the app is a farther ancestor than the app's
+		// own process, so the app's accessibility tree ranks first.
+		let grandparent = parent_of(parent);
+		let rank = |owner| ownership_rank(owner, &win, Some(1));
+		assert!(rank(client) < rank(parent));
+		if grandparent > 1 {
+			assert!(rank(parent) < rank(grandparent));
+		}
+	}
+
+	#[test]
+	fn flatpak_instance_id_comes_from_the_instance_group() {
+		let info = concat!(
+			"[Application]\nname=ai.storyteller.pdfcraft\ninstance-id=decoy\n\n",
+			"[Instance]\ninstance-id=1280135730\napp-path=/app\n",
+		);
+		assert_eq!(flatpak_instance_id(info), Some("1280135730"));
+		assert_eq!(flatpak_instance_id("[Instance]\ninstance-id=\n"), None);
+		assert_eq!(flatpak_instance_id("[Application]\nname=x\n"), None);
+	}
+
+	#[test]
+	fn gtk4_native_matching_requires_a_unique_process_and_title() {
+		let rt = Builder::new_current_thread().enable_all().build().unwrap();
+		rt.block_on(async {
+			let (server, client) = serve(vec![
+				("/app", node(Role::Application, "app", "/null"), None),
+				("/frame", node(Role::Frame, "Desktop", "/app"), Some(Extents::gtk4((0, 0, 890, 550)))),
+			])
+			.await;
+			let native = Native::new(&[("42", "Desktop", 300, 200)]);
+			let frame = object("/frame");
+			let mut other = window("43", "Desktop", 500, 100);
+			other.pid = Some(8);
+			native.0.lock().unwrap().push(other);
+			assert_eq!(native_window(&client, &native, &frame).await.as_deref(), Some("42"));
+
+			native.0.lock().unwrap()[0].title = "Another document".into();
+			assert_eq!(native_window(&client, &native, &frame).await, None);
+
+			native.0.lock().unwrap()[0].title = "Desktop".into();
+			native.0.lock().unwrap()[1].pid = Some(7);
+			assert_eq!(native_window(&client, &native, &frame).await, None);
+			drop(server);
+		});
 	}
 }

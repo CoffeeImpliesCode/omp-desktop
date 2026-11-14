@@ -350,7 +350,9 @@ impl X11Control {
 				// window manager with focus-stealing prevention may refuse to
 				// raise the window, and nothing here moves the pointer.
 				let window = Self::window(id)?;
-				wm.request_activation(window, wm.active_window())
+				// A control request is explicit, not takeover input: it has no
+				// user-intervention gate of its own.
+				wm.request_activation(window, wm.active_window(), || Ok(()))
 			},
 			ControlAction::CloseWindow(id) => {
 				let window = Self::window(id)?;
@@ -489,7 +491,7 @@ impl X11Control {
 				}
 				wm.move_to_desktop(window, desktop)?;
 				if *focus {
-					wm.request_activation(window, wm.active_window())?;
+					wm.request_activation(window, wm.active_window(), || Ok(()))?;
 				}
 				Ok(())
 			},
