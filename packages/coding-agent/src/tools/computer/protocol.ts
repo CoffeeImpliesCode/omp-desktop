@@ -17,6 +17,8 @@ export const UNTAGGED_CELL_ID = "unbatched";
 export interface ComputerSessionSnapshot {
 	cwd: string;
 	sessionId: string;
+	/** Registry id of the agent the run acts for; another session waiting for its input lock names it. */
+	agentId?: string;
 	captureMaxWidth: number;
 	captureMaxHeight: number;
 	display: string;

@@ -1,15 +1,14 @@
 # Linux Wayland build: PipeWire capture
 
-Upstream's released builds compile the native addons with `crate_features = []`.
-On a Wayland session `capture()` is then reduced to
-`CaptureFailed: Wayland capture requires the wayland-pipewire feature`. The X11
-fallback does not help on niri: Xwayland is rootless, so the X root window is
-empty. The native backend probes the inherited Wayland socket or configured
-socket path; only a conclusively stale endpoint permits X11 fallback.
-Neither `~/.omp/agent/settings.json` nor `config.yml` enables the capture
-feature. The build below compiles both addons with `wayland-pipewire` and
-embeds them in the executable. The fork also keeps every authorized monitor
-stream, adds exact niri window capture, and integrates upstream v18.22.0.
+Linux native addons now load `libpipewire-0.3.so.0` at runtime; no Cargo feature
+is required. Without a loadable library, capture is unavailable. The native
+backend probes the inherited Wayland socket or configured socket path; only a
+conclusively stale endpoint permits X11 fallback. Xwayland is rootless on niri,
+so an X11 root-window capture cannot replace native Wayland capture.
+
+The build below embeds both native addon variants. The fork keeps every
+authorized monitor stream and exact niri window capture, and integrates upstream
+commit `2c18786227e2` after v18.22.0.
 
 ## Why a hand-dropped addon is not enough
 
@@ -17,7 +16,7 @@ stream, adds exact niri window capture, and integrates upstream v18.22.0.
 embedded descriptor by file size only, and `maybeExtractEmbeddedAddon`
 re-extracts the embedded archive over `~/.omp/natives/<version>/` whenever the
 size differs. A patched addon copied into that cache is therefore reverted on
-the next launch, and the feature flag has to live in the binary. The
+the next launch, so fork changes must be embedded in the executable. The
 `embeddedAddon = null` in the source tree is the state left by `--reset`.
 
 ## Prerequisites
@@ -47,7 +46,7 @@ because the executable may run on x64 hosts with different ISA support:
 ```sh
 export CARGO_BUILD_JOBS=2
 
-# Check that pkg-config can find PipeWire. The native build enables the feature.
+# Locate the runtime PipeWire library for the addon's RUNPATH.
 pkg-config --modversion libpipewire-0.3
 RP="$(pkg-config --variable=libdir libpipewire-0.3)"
 
@@ -120,6 +119,16 @@ Confirm the reported screenshot dimensions. A screenshot exercises capture but
 does not prove that coordinate mapping is safe; use discovered targets and
 verified geometry before testing input.
 
+### Browser regression checks
+
+Flatpak Chrome cannot read a Nix shell's private `/tmp` paths. Set the test
+process's `TMPDIR` to a temporary child of Chrome's existing `XDG_CACHE_HOME`
+(`flatpak run --command=printenv com.google.Chrome XDG_CACHE_HOME`). Pass it
+after `nix develop . --command env` so the shell does not replace it. Remove
+that test directory afterwards; no Flatpak permission changes are needed.
+For cold-start browser cases, use `bun test --timeout 30000` rather than the
+default five-second budget.
+
 ### Permission boundaries
 
 - Approve the ScreenCast portal selection yourself. The grant decides which
@@ -146,8 +155,6 @@ verified geometry before testing input.
 - Desktop capture needs a working `org.freedesktop.portal.ScreenCast`, and exact
   niri window capture needs niri's `org.gnome.Mutter.ScreenCast` service on the
   same compositor as its IPC socket. Missing or mismatched services fail closed.
-- Upstream keeps `wayland-pipewire` off by default, so every build redoes the
-  steps above.
 - Native Wayland window input stays unavailable. Niri window focus is available
   through `win.focus()`; use semantic accessibility actions or desktop input
   only after fresh state confirms the intended focus.

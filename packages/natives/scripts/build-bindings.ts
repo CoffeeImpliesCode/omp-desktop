@@ -7,9 +7,7 @@
  *
  * `OMP_NATIVE_CARGO_PROFILE` selects the cargo profile (default `local`:
  * incremental, unstripped). Image builds set `ci` for a stripped addon.
- * `OMP_NATIVE_FEATURES` adds comma- or space-separated Cargo features to the
- * local napi build while retaining the default Wayland PipeWire capture feature.
- * Cargo passes them to `napi build --features`; Bazel builds ignore this option.
+ *
  * `OMP_NATIVE_RUNTIME_LIBRARY_PATH` adds Linux runtime library directories to
  * the addon's RUNPATH before embedding; the Nix shell supplies audio clients.
  */
@@ -232,7 +230,6 @@ const napiBin = path.join(path.dirname(napiManifestPath), napiBinEntry);
 // Profiles live in the root Cargo.toml; `local` trades size for iteration
 // speed, `ci` strips and drops incremental state.
 const cargoProfile = Bun.env.OMP_NATIVE_CARGO_PROFILE?.trim() || "local";
-const extraFeatures = Bun.env.OMP_NATIVE_FEATURES?.trim();
 
 const napiArgs = [
 	"build",
@@ -248,14 +245,7 @@ const napiArgs = [
 	buildOutputDir,
 	"--profile",
 	cargoProfile,
-	// Local builds enable the Wayland PipeWire capture path. The shipped Bazel
-	// addons build with `crate_features = []`, so `capture()` is compiled down to
-	// a hard error and desktop capture can never work on a Wayland session.
-	"--features",
-	extraFeatures ? `wayland-pipewire,${extraFeatures}` : "wayland-pipewire",
 ];
-
-// Optional features accompany the default PipeWire capture feature above.
 
 // napi-rs / cargo route much failure detail to stdout (e.g. `cargo metadata`
 // errors), so a stderr-only error collapses real failures to a bare message.

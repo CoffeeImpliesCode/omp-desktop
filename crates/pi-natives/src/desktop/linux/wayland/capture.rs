@@ -1,6 +1,9 @@
 use std::{
-	cell::{Cell, RefCell},
-	os::fd::OwnedFd,
+	cell::Cell,
+	ffi::{CStr, c_char, c_int, c_void},
+	io,
+	os::fd::{IntoRawFd, OwnedFd},
+	ptr,
 	rc::Rc,
 	time::{Duration, Instant},
 };
@@ -10,10 +13,11 @@ use ashpd::desktop::{
 	screencast::{CursorMode, Screencast, SourceType},
 };
 use image::RgbaImage;
-use pipewire as pw;
-use pw::{properties::properties, spa};
 
-use super::portal::{read_token, store_token};
+use super::{
+	pipewire::{self, PipeWire, PixelFormat, Plane, SpaHook, SpaPod, StreamEvents, VideoFormat},
+	portal::{read_token, store_token},
+};
 use crate::desktop::{
 	control,
 	error::{CoreResult, DesktopError},
@@ -21,7 +25,6 @@ use crate::desktop::{
 };
 
 const SCREENCAST_TOKEN: &str = "screencast-token";
-const STREAM_NAME: &str = "omp-computer-capture";
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 const PORTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -126,34 +129,30 @@ struct PixelLayout {
 }
 
 impl PixelLayout {
-	fn new(format: spa::param::video::VideoFormat) -> Result<Self, String> {
-		use spa::param::video::VideoFormat as F;
+	fn new(format: u32) -> Result<Self, String> {
+		let format = PixelFormat::from_spa(format)
+			.ok_or_else(|| format!("PipeWire negotiated unsupported pixel format {format}"))?;
 		Ok(match format {
-			F::RGB => Self { size: 3, red: 0, green: 1, blue: 2, alpha: None },
-			F::BGR => Self { size: 3, red: 2, green: 1, blue: 0, alpha: None },
-			F::RGBA => Self { size: 4, red: 0, green: 1, blue: 2, alpha: Some(3) },
-			F::RGBx => Self { size: 4, red: 0, green: 1, blue: 2, alpha: None },
-			F::BGRA => Self { size: 4, red: 2, green: 1, blue: 0, alpha: Some(3) },
-			F::BGRx => Self { size: 4, red: 2, green: 1, blue: 0, alpha: None },
-			other => return Err(format!("PipeWire negotiated unsupported pixel format {other:?}")),
+			PixelFormat::Rgb => Self { size: 3, red: 0, green: 1, blue: 2, alpha: None },
+			PixelFormat::Bgr => Self { size: 3, red: 2, green: 1, blue: 0, alpha: None },
+			PixelFormat::Rgba => Self { size: 4, red: 0, green: 1, blue: 2, alpha: Some(3) },
+			PixelFormat::Rgbx => Self { size: 4, red: 0, green: 1, blue: 2, alpha: None },
+			PixelFormat::Bgra => Self { size: 4, red: 2, green: 1, blue: 0, alpha: Some(3) },
+			PixelFormat::Bgrx => Self { size: 4, red: 2, green: 1, blue: 0, alpha: None },
 		})
 	}
 }
 
-fn rgba_from_buffer(
-	format: &spa::param::video::VideoInfoRaw,
-	data: &mut pw::spa::buffer::Data,
-) -> Result<RgbaImage, String> {
-	let chunk = data.chunk();
-	let offset = chunk.offset() as usize;
-	let bytes = chunk.size() as usize;
-	let stride = chunk.stride();
+fn rgba_from_buffer(format: &VideoFormat, plane: &Plane<'_>) -> Result<RgbaImage, String> {
+	let offset = plane.chunk.offset as usize;
+	let bytes = plane.chunk.size as usize;
+	let stride = plane.chunk.stride;
 	if stride <= 0 {
 		return Err(format!("PipeWire returned unsupported frame stride {stride}"));
 	}
 	let stride = stride as usize;
-	let source = data
-		.data()
+	let source = plane
+		.memory
 		.ok_or_else(|| "PipeWire frame buffer is not memory-mapped".to_string())?;
 	let end = offset
 		.checked_add(bytes)
@@ -172,17 +171,12 @@ fn rgba_from_buffer(
 /// bytes, a frame larger than [`MAX_FRAME_PIXELS`], and a buffer that cannot
 /// hold the negotiated rows are all refused here rather than read out of
 /// bounds.
-fn rgba_from_rows(
-	format: &spa::param::video::VideoInfoRaw,
-	rows: &[u8],
-	stride: usize,
-) -> Result<RgbaImage, String> {
-	let size = format.size();
-	let (width, height) = (size.width, size.height);
+fn rgba_from_rows(format: &VideoFormat, rows: &[u8], stride: usize) -> Result<RgbaImage, String> {
+	let VideoFormat { width, height, .. } = *format;
 	if width == 0 || height == 0 {
 		return Err("PipeWire negotiated an empty frame".to_string());
 	}
-	let layout = PixelLayout::new(format.format())?;
+	let layout = PixelLayout::new(format.format)?;
 	let pixels = u64::from(width) * u64::from(height);
 	if pixels > MAX_FRAME_PIXELS {
 		return Err(format!(
@@ -225,7 +219,6 @@ fn rgba_from_rows(
 		.ok_or_else(|| "failed to construct PipeWire RGBA frame".to_string())
 }
 
-#[derive(Clone)]
 struct GrabbedFrame {
 	width:  u32,
 	height: u32,
@@ -235,17 +228,16 @@ struct GrabbedFrame {
 /// Validate the negotiated size and aggregate budget before touching pixels.
 /// Metadata never calls `read_pixels`, including on unmapped buffers.
 fn acquire_frame(
-	format: &spa::param::video::VideoInfoRaw,
+	format: &VideoFormat,
 	pixels: bool,
 	retained_pixels: &Cell<u64>,
 	read_pixels: impl FnOnce() -> Result<RgbaImage, String>,
 ) -> Result<GrabbedFrame, String> {
-	let size = format.size();
-	let (width, height) = (size.width, size.height);
+	let VideoFormat { width, height, .. } = *format;
 	if width == 0 || height == 0 {
 		return Err("PipeWire negotiated an empty frame".to_string());
 	}
-	PixelLayout::new(format.format())?;
+	PixelLayout::new(format.format)?;
 	let count = u64::from(width) * u64::from(height);
 	let total = retained_pixels
 		.get()
@@ -257,99 +249,154 @@ fn acquire_frame(
 	Ok(GrabbedFrame { width, height, image })
 }
 
-type SharedFrames = Rc<RefCell<Vec<Option<Result<GrabbedFrame, String>>>>>;
-
-/// Per-stream `PipeWire` state shared with the loop callbacks.
-struct StreamUserData {
-	/// Index of the stream this listener belongs to.
-	index:           usize,
-	/// `PipeWire` node the stream reads from, for error messages.
-	node:            u32,
-	/// Format the compositor negotiated for this stream.
-	format:          spa::param::video::VideoInfoRaw,
-	pixels:          bool,
-	/// First frame of every stream, filled in by whichever stream is ready.
-	frames:          SharedFrames,
-	/// Streams that have not reported a frame or an error yet.
-	pending:         Rc<Cell<usize>>,
-	retained_pixels: Rc<Cell<u64>>,
-	/// Loop to leave once no stream is pending.
-	mainloop:        pw::main_loop::MainLoopRc,
-}
-
-impl StreamUserData {
-	/// Record the first outcome of this stream and leave the loop when the last
-	/// one lands. Later frames and later state changes are ignored: a stream
-	/// that already reported must not be counted twice.
-	fn finish(&self, frame: Result<GrabbedFrame, String>) {
-		if self.frames.borrow()[self.index].is_some() {
-			return;
-		}
-		self.frames.borrow_mut()[self.index] = Some(frame);
-		let pending = self.pending.get() - 1;
-		self.pending.set(pending);
-		if pending == 0 {
-			self.mainloop.quit();
-		}
-	}
-
-	/// Whether this stream already reported an outcome.
-	fn reported(&self) -> bool {
-		self.frames.borrow()[self.index].is_some()
-	}
-}
-
 /// Pixel layouts a capture stream accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Formats {
 	/// Any packed RGB layout; a monitor stream is opaque.
 	Any,
 	/// Only layouts that carry alpha. A niri window cast offers `BGRx` before
-	/// `BGRA`, so a consumer that also accepts `BGRx` never sees which pixels
-	/// are translucent shadow and which are the window itself.
+	/// `BGRA`, so accepting `BGRx` loses the translucent shadow boundary.
 	Alpha,
 }
 
-/// The `VideoFormat` choice for one [`Formats`] request.
-fn video_format_property(formats: Formats) -> spa::pod::Property {
-	use spa::param::video::VideoFormat as F;
-	match formats {
-		Formats::Any => spa::pod::property!(
-			spa::param::format::FormatProperties::VideoFormat,
-			Choice,
-			Enum,
-			Id,
-			F::BGRx,
-			F::BGRx,
-			F::BGRA,
-			F::RGBx,
-			F::RGBA,
-			F::RGB,
-			F::BGR
-		),
-		Formats::Alpha => spa::pod::property!(
-			spa::param::format::FormatProperties::VideoFormat,
-			Choice,
-			Enum,
-			Id,
-			F::BGRA,
-			F::BGRA,
-			F::RGBA
-		),
+impl Formats {
+	fn offered(self) -> &'static [PixelFormat] {
+		match self {
+			Self::Any => &PixelFormat::OFFERED,
+			Self::Alpha => &[PixelFormat::Bgra, PixelFormat::Rgba],
+		}
 	}
 }
 
-/// Grab one frame from every node over a single `PipeWire` connection.
-///
-/// `remote` picks the connection: `Some` is a `ScreenCast` `PipeWire` remote
-/// whose consent the user already granted, `None` the default daemon, which a
-/// native compositor screencast feeds without a portal. One connection carries
-/// every node, so a multi-monitor capture needs neither a second permission
-/// session nor a second remote fd.
-///
-/// The wait is bounded by [`CAPTURE_TIMEOUT`], and a single failing or missing
-/// stream fails the whole capture rather than returning a partial desktop.
+/// A stable allocation for each stream's callbacks, used only by its loop.
+struct Listener {
+	pw:              &'static PipeWire,
+	stream:          *mut pipewire::Stream,
+	node:            u32,
+	pixels:          bool,
+	format:          Option<VideoFormat>,
+	frame:           Option<Result<GrabbedFrame, String>>,
+	pending:         Rc<Cell<usize>>,
+	retained_pixels: Rc<Cell<u64>>,
+}
+
+impl Listener {
+	fn finish(&mut self, frame: Result<GrabbedFrame, String>) {
+		if self.frame.is_none() {
+			self.frame = Some(frame);
+			self.pending.set(self.pending.get() - 1);
+		}
+	}
+}
+
+static STREAM_EVENTS: StreamEvents =
+	StreamEvents::new(on_state_changed, on_param_changed, on_process);
+
+unsafe extern "C" fn on_state_changed(
+	data: *mut c_void,
+	_old: c_int,
+	state: c_int,
+	error: *const c_char,
+) {
+	if state != -1 {
+		return;
+	}
+	// SAFETY: `data` is the live listener and callbacks run only while its
+	// owning thread is inside `pipewire::iterate`.
+	let listener = unsafe { &mut *data.cast::<Listener>() };
+	let message = if error.is_null() {
+		"unknown error".into()
+	} else {
+		// SAFETY: PipeWire supplies a NUL-terminated error for this callback.
+		unsafe { CStr::from_ptr(error) }.to_string_lossy()
+	};
+	listener.finish(Err(format!("PipeWire stream {}: {message}", listener.node)));
+}
+
+unsafe extern "C" fn on_param_changed(data: *mut c_void, id: u32, param: *const SpaPod) {
+	if id != pipewire::SPA_PARAM_FORMAT || param.is_null() {
+		return;
+	}
+	// SAFETY: `data` is the stream's live listener; nothing else borrows it
+	// while the loop dispatches callbacks.
+	let listener = unsafe { &mut *data.cast::<Listener>() };
+	// SAFETY: PipeWire passes a valid POD for the duration of the call.
+	listener.format = pipewire::parse_video_format(unsafe { pipewire::pod_bytes(param) });
+}
+
+unsafe extern "C" fn on_process(data: *mut c_void) {
+	// SAFETY: as in `on_param_changed`.
+	let listener = unsafe { &mut *data.cast::<Listener>() };
+	if listener.frame.is_some() {
+		return;
+	}
+	let pw = listener.pw;
+	// SAFETY: the stream is live while its listener is registered.
+	let buffer = unsafe { (pw.pw_stream_dequeue_buffer)(listener.stream) };
+	if buffer.is_null() {
+		return;
+	}
+	let format = listener
+		.format
+		.unwrap_or(VideoFormat { format: 0, width: 0, height: 0 });
+	let frame = acquire_frame(&format, listener.pixels, &listener.retained_pixels, || {
+		// SAFETY: `buffer` stays dequeued until it is queued back below. This
+		// closure is never called for metadata, so it does not map/read pixels.
+		let plane = unsafe { pipewire::first_plane(buffer) }
+			.ok_or_else(|| "PipeWire frame has no data".to_string())?;
+		rgba_from_buffer(&format, &plane)
+	});
+	listener.finish(frame);
+	// SAFETY: `buffer` was dequeued from this stream and is no longer read.
+	unsafe { (pw.pw_stream_queue_buffer)(listener.stream, buffer) };
+}
+
+/// The stream is destroyed before its hook and listener allocations are freed.
+struct CaptureStream {
+	stream:   *mut pipewire::Stream,
+	hook:     Box<SpaHook>,
+	listener: Box<Listener>,
+}
+
+impl Drop for CaptureStream {
+	fn drop(&mut self) {
+		// SAFETY: this stream is live and uniquely owned. Destruction unlinks
+		// the hook, after which no callback can reach the listener.
+		unsafe { (self.listener.pw.pw_stream_destroy)(self.stream) };
+	}
+}
+
+/// One connection carries every authorized stream, and outlives them all.
+struct Connection {
+	pw:        &'static PipeWire,
+	main_loop: *mut pipewire::MainLoop,
+	context:   *mut pipewire::Context,
+	core:      *mut pipewire::Core,
+	streams:   Vec<CaptureStream>,
+}
+
+impl Drop for Connection {
+	fn drop(&mut self) {
+		self.streams.clear();
+		// SAFETY: each pointer is null or an object this connection created
+		// and still owns. Streams and listeners were destroyed above.
+		unsafe {
+			if !self.core.is_null() {
+				(self.pw.pw_core_disconnect)(self.core);
+			}
+			if !self.context.is_null() {
+				(self.pw.pw_context_destroy)(self.context);
+			}
+			(self.pw.pw_main_loop_destroy)(self.main_loop);
+		}
+	}
+}
+
+/// Grab every node over one remote, or the default daemon for native casts.
+/// Missing/error streams fail the whole capture; cancellation and the deadline
+/// are checked at most one loop iteration (10 ms) apart.
 fn grab_pipewire_frames(
+	pw: &'static PipeWire,
 	nodes: &[u32],
 	remote: Option<OwnedFd>,
 	formats: Formats,
@@ -359,155 +406,134 @@ fn grab_pipewire_frames(
 		return Err("PipeWire capture needs at least one node".to_string());
 	}
 	control::check().map_err(|error| error.to_string())?;
-	pw::init();
-	let mainloop =
-		pw::main_loop::MainLoopRc::new(None).map_err(|err| format!("PipeWire main loop: {err}"))?;
-	let context = pw::context::ContextRc::new(&mainloop, None)
-		.map_err(|err| format!("PipeWire context: {err}"))?;
-	let core = match remote {
-		Some(fd) => context.connect_fd_rc(fd, None),
-		None => context.connect_rc(None),
+	let failed = |object: &str| format!("PipeWire {object}: creation failed");
+	// SAFETY: pw_main_loop_new accepts null properties.
+	let main_loop = unsafe { (pw.pw_main_loop_new)(ptr::null()) };
+	if main_loop.is_null() {
+		return Err(failed("main loop"));
 	}
-	.map_err(|err| format!("PipeWire remote: {err}"))?;
-	let total = nodes.len();
-	let frames = Rc::new(RefCell::new(vec![None; total]));
-	let pending = Rc::new(Cell::new(total));
-	let retained_pixels = Rc::new(Cell::new(0_u64));
-	let timed_out = Rc::new(Cell::new(false));
-	let cancelled = Rc::new(Cell::new(false));
-	let object = spa::pod::object!(
-		spa::utils::SpaTypes::ObjectParamFormat,
-		spa::param::ParamType::EnumFormat,
-		spa::pod::property!(
-			spa::param::format::FormatProperties::MediaType,
-			Id,
-			spa::param::format::MediaType::Video
-		),
-		spa::pod::property!(
-			spa::param::format::FormatProperties::MediaSubtype,
-			Id,
-			spa::param::format::MediaSubtype::Raw
-		),
-		video_format_property(formats),
-		spa::pod::property!(
-			spa::param::format::FormatProperties::VideoSize,
-			Choice,
-			Range,
-			Rectangle,
-			spa::utils::Rectangle { width: 1920, height: 1080 },
-			spa::utils::Rectangle { width: 1, height: 1 },
-			spa::utils::Rectangle { width: 16384, height: 16384 }
-		)
-	);
-	let values = spa::pod::serialize::PodSerializer::serialize(
-		std::io::Cursor::new(Vec::new()),
-		&spa::pod::Value::Object(object),
-	)
-	.map_err(|err| format!("PipeWire format serialization: {err}"))?
-	.0
-	.into_inner();
-	let param = spa::pod::Pod::from_bytes(&values)
-		.ok_or_else(|| "PipeWire rejected format parameters".to_string())?;
-	let mut attached = Vec::with_capacity(total);
-	for (index, &node) in nodes.iter().enumerate() {
-		let stream = pw::stream::StreamBox::new(&core, STREAM_NAME, properties! {
-			*pw::keys::MEDIA_TYPE => "Video",
-			*pw::keys::MEDIA_CATEGORY => "Capture",
-			*pw::keys::MEDIA_ROLE => "Screen",
-		})
-		.map_err(|err| format!("PipeWire stream {node}: {err}"))?;
-		let user_data = StreamUserData {
-			index,
-			node,
-			format: Default::default(),
-			pixels,
-			frames: Rc::clone(&frames),
-			pending: Rc::clone(&pending),
-			retained_pixels: Rc::clone(&retained_pixels),
-			mainloop: mainloop.clone(),
-		};
-		let listener = stream
-			.add_local_listener_with_user_data(user_data)
-			.param_changed(|_, user, id, param| {
-				let Some(param) = param else {
-					return;
-				};
-				if id == spa::param::ParamType::Format.as_raw() {
-					let _ = user.format.parse(param);
-				}
-			})
-			.state_changed(|_, user, _old, new| {
-				if let pw::stream::StreamState::Error(message) = new {
-					user.finish(Err(format!("PipeWire stream {}: {message}", user.node)));
-				}
-			})
-			.process(|stream, user| {
-				if user.reported() {
-					return;
-				}
-				let Some(mut buffer) = stream.dequeue_buffer() else {
-					return;
-				};
-				let frame = acquire_frame(&user.format, user.pixels, &user.retained_pixels, || {
-					let data = buffer
-						.datas_mut()
-						.first_mut()
-						.ok_or_else(|| "PipeWire frame has no data".to_string())?;
-					rgba_from_buffer(&user.format, data)
-				});
-				user.finish(frame);
-			})
-			.register()
-			.map_err(|err| format!("PipeWire listener {node}: {err}"))?;
-		let mut params = [param];
-		stream
-			.connect(
-				spa::utils::Direction::Input,
-				Some(node),
-				pw::stream::StreamFlags::AUTOCONNECT
-					| if pixels {
-						pw::stream::StreamFlags::MAP_BUFFERS
-					} else {
-						pw::stream::StreamFlags::empty()
-					},
-				&mut params,
-			)
-			.map_err(|err| format!("PipeWire connect {node}: {err}"))?;
-		attached.push((listener, stream));
+	let mut connection = Connection {
+		pw,
+		main_loop,
+		context: ptr::null_mut(),
+		core: ptr::null_mut(),
+		streams: Vec::with_capacity(nodes.len()),
+	};
+	// SAFETY: `main_loop` is live.
+	let pw_loop = unsafe { (pw.pw_main_loop_get_loop)(main_loop) };
+	// SAFETY: `pw_loop` is live; null properties are accepted.
+	connection.context = unsafe { (pw.pw_context_new)(pw_loop, ptr::null_mut(), 0) };
+	if connection.context.is_null() {
+		return Err(failed("context"));
 	}
-	let flag = Rc::clone(&timed_out);
-	let cancelled_flag = Rc::clone(&cancelled);
-	let timer_loop = mainloop.clone();
-	let deadline = Instant::now() + CAPTURE_TIMEOUT;
-	let timer = mainloop.loop_().add_timer(move |_| {
-		if control::check().is_err() {
-			cancelled_flag.set(true);
-			timer_loop.quit();
-		} else if Instant::now() >= deadline {
-			flag.set(true);
-			timer_loop.quit();
+	// SAFETY: the context is live. connect_fd takes ownership of the fd,
+	// closing it on disconnect or failure; connect uses the default daemon.
+	connection.core = unsafe {
+		match remote {
+			Some(fd) => {
+				(pw.pw_context_connect_fd)(connection.context, fd.into_raw_fd(), ptr::null_mut(), 0)
+			},
+			None => (pw.pw_context_connect)(connection.context, ptr::null_mut(), 0),
 		}
-	});
-	timer
-		.update_timer(Some(Duration::from_millis(10)), Some(Duration::from_millis(10)))
-		.into_sync_result()
-		.map_err(|err| format!("PipeWire capture deadline: {err}"))?;
-	mainloop.run();
-	for (_, stream) in &attached {
-		let _ = stream.disconnect();
+	};
+	if connection.core.is_null() {
+		return Err(failed("remote"));
 	}
-	drop(attached);
-	if timed_out.get() {
-		return Err(format!(
-			"PipeWire delivered no frame for {} of {total} stream(s) within {}s",
-			pending.get(),
-			CAPTURE_TIMEOUT.as_secs()
-		));
+	let format = pipewire::enum_format(formats.offered());
+	let pending = Rc::new(Cell::new(nodes.len()));
+	let retained_pixels = Rc::new(Cell::new(0));
+	for &node in nodes {
+		let items = [
+			pipewire::SpaDictItem { key: c"media.type".as_ptr(), value: c"Video".as_ptr() },
+			pipewire::SpaDictItem { key: c"media.category".as_ptr(), value: c"Capture".as_ptr() },
+			pipewire::SpaDictItem { key: c"media.role".as_ptr(), value: c"Screen".as_ptr() },
+		];
+		let dict =
+			pipewire::SpaDict { flags: 0, n_items: items.len() as u32, items: items.as_ptr() };
+		// SAFETY: the dict and strings outlive the call, which copies them;
+		// the stream takes ownership of the new properties.
+		let stream = unsafe {
+			let properties = (pw.pw_properties_new_dict)(&raw const dict);
+			(pw.pw_stream_new)(connection.core, c"omp-computer-capture".as_ptr(), properties)
+		};
+		if stream.is_null() {
+			return Err(failed("stream"));
+		}
+		connection.streams.push(CaptureStream {
+			stream,
+			hook: Box::new(SpaHook::new()),
+			listener: Box::new(Listener {
+				pw,
+				stream,
+				node,
+				pixels,
+				format: None,
+				frame: None,
+				pending: Rc::clone(&pending),
+				retained_pixels: Rc::clone(&retained_pixels),
+			}),
+		});
+		let attached = connection
+			.streams
+			.last_mut()
+			.expect("the stream was just inserted");
+		let mut params = [format.as_ptr().cast::<SpaPod>()];
+		// SAFETY: the stream, stable hook and listener allocations outlive
+		// registration; the event table is static; connect copies the POD.
+		let connected = unsafe {
+			(pw.pw_stream_add_listener)(
+				stream,
+				&raw mut *attached.hook,
+				&raw const STREAM_EVENTS,
+				(&raw mut *attached.listener).cast(),
+			);
+			(pw.pw_stream_connect)(
+				stream,
+				pipewire::SPA_DIRECTION_INPUT,
+				node,
+				pipewire::PW_STREAM_FLAG_AUTOCONNECT
+					| if pixels {
+						pipewire::PW_STREAM_FLAG_MAP_BUFFERS
+					} else {
+						0
+					},
+				params.as_mut_ptr(),
+				params.len() as u32,
+			)
+		};
+		if connected < 0 {
+			return Err(format!(
+				"PipeWire connect {node}: {}",
+				io::Error::from_raw_os_error(-connected)
+			));
+		}
 	}
-	if cancelled.get() {
-		return Err("PipeWire capture cancelled".to_string());
+	let deadline = Instant::now() + CAPTURE_TIMEOUT;
+	loop {
+		control::check().map_err(|error| error.to_string())?;
+		if pending.get() == 0 {
+			break;
+		}
+		if Instant::now() >= deadline {
+			return Err(format!(
+				"PipeWire delivered no frame for {} of {} stream(s) within {}s",
+				pending.get(),
+				nodes.len(),
+				CAPTURE_TIMEOUT.as_secs()
+			));
+		}
+		// SAFETY: the loop belongs to this thread's live connection.
+		if unsafe { pipewire::iterate(pw_loop, Duration::from_millis(10)) } < 0 {
+			return Err("PipeWire loop failed before producing every frame".to_string());
+		}
 	}
-	collect_frames(std::mem::take(&mut *frames.borrow_mut()))
+	collect_frames(
+		connection
+			.streams
+			.iter_mut()
+			.map(|stream| stream.listener.frame.take())
+			.collect(),
+	)
 }
 
 /// Preserve all-authorized-stream semantics, including missing/error outcomes.
@@ -522,19 +548,14 @@ fn collect_frames(
 		.collect()
 }
 
-/// Grab one frame from a single `PipeWire` node.
-///
-/// `remote` picks the connection: `Some` is a `ScreenCast` `PipeWire` remote
-/// whose consent the user already granted, `None` the default daemon, which a
-/// native compositor screencast feeds without a portal. A native capture must
-/// name the exact window node, because a second monitor would otherwise be
-/// cropped into a frame that belongs to somebody else's screen.
+/// Native casts name one exact window node on the default daemon.
 pub(super) fn grab_pipewire_frame(
+	pw: &'static PipeWire,
 	node: u32,
 	remote: Option<OwnedFd>,
 	formats: Formats,
 ) -> Result<RgbaImage, String> {
-	let mut frames = grab_pipewire_frames(&[node], remote, formats, true)?;
+	let mut frames = grab_pipewire_frames(pw, &[node], remote, formats, true)?;
 	frames
 		.pop()
 		.and_then(|frame| frame.image)
@@ -542,11 +563,8 @@ pub(super) fn grab_pipewire_frame(
 }
 
 /// Capture every monitor the user authorized, closing the session afterwards.
-///
-/// The consent, restore token and denial paths are the portal's: the session is
-/// created, granted, used, and closed exactly once per capture.
-pub(super) fn capture() -> CoreResult<Vec<(RgbaImage, super::PortalGeometry)>> {
-	acquire_portal_streams(true).and_then(|frames| {
+pub(super) fn capture(pw: pipewire::Loaded) -> CoreResult<Vec<(RgbaImage, super::PortalGeometry)>> {
+	acquire_portal_streams(pw, true).and_then(|frames| {
 		frames
 			.into_iter()
 			.map(|(frame, geometry)| {
@@ -559,11 +577,24 @@ pub(super) fn capture() -> CoreResult<Vec<(RgbaImage, super::PortalGeometry)>> {
 	})
 }
 
-fn acquire_portal_streams(pixels: bool) -> CoreResult<Vec<(GrabbedFrame, super::PortalGeometry)>> {
+/// Refuse a missing runtime library before starting any consent/session work.
+pub(super) fn require_pipewire(pw: pipewire::Loaded) -> CoreResult<&'static PipeWire> {
 	control::check()?;
+	pw.map_err(|reason| {
+		DesktopError::capture_failed(format!(
+			"Wayland capture needs PipeWire's client library: {reason}"
+		))
+	})
+}
+
+fn acquire_portal_streams(
+	pw: pipewire::Loaded,
+	pixels: bool,
+) -> CoreResult<Vec<(GrabbedFrame, super::PortalGeometry)>> {
+	let pw = require_pipewire(pw)?;
 	let runtime = super::portal::portal_runtime()?;
 	let session = runtime.block_on(open_screencast())?;
-	let outcome = capture_streams(runtime, session, pixels);
+	let outcome = capture_streams(pw, runtime, session, pixels);
 	control::check()?;
 	outcome.map_err(|err| DesktopError::capture_failed(format!("wayland screencast failed: {err}")))
 }
@@ -601,12 +632,13 @@ fn placeable_monitors(streams: &[MonitorStream]) -> Result<(), String> {
 /// outcome. The session outlives the grab because dropping it first would take
 /// the `PipeWire` remote with it.
 fn capture_streams(
+	pw: &'static PipeWire,
 	runtime: &tokio::runtime::Runtime,
 	session: ScreenCastSession<'_>,
 	pixels: bool,
 ) -> Result<Vec<(GrabbedFrame, super::PortalGeometry)>, String> {
-	let outcome =
-		placeable_monitors(&session.streams).and_then(|()| grab_granted_streams(&session, pixels));
+	let outcome = placeable_monitors(&session.streams)
+		.and_then(|()| grab_granted_streams(pw, &session, pixels));
 	session.close(runtime);
 	outcome
 }
@@ -614,6 +646,7 @@ fn capture_streams(
 /// Read one frame per authorized stream and keep each monitor's logical
 /// position and size next to it.
 fn grab_granted_streams(
+	pw: &'static PipeWire,
 	session: &ScreenCastSession<'_>,
 	pixels: bool,
 ) -> Result<Vec<(GrabbedFrame, super::PortalGeometry)>, String> {
@@ -628,7 +661,7 @@ fn grab_granted_streams(
 		.iter()
 		.map(|stream| stream.node)
 		.collect::<Vec<_>>();
-	let frames = grab_pipewire_frames(&nodes, Some(remote), Formats::Any, pixels)?;
+	let frames = grab_pipewire_frames(pw, &nodes, Some(remote), Formats::Any, pixels)?;
 	pair_granted_streams(&session.streams, frames)
 }
 
@@ -651,27 +684,25 @@ fn pair_granted_streams(
 		.collect())
 }
 
-pub(super) fn geometry() -> CoreResult<Vec<super::PortalGeometry>> {
-	acquire_portal_streams(false)
+pub(super) fn geometry(pw: pipewire::Loaded) -> CoreResult<Vec<super::PortalGeometry>> {
+	acquire_portal_streams(pw, false)
 		.map(|frames| frames.into_iter().map(|(_, geometry)| geometry).collect())
 }
 
 #[cfg(test)]
 mod tests {
-	use pw::spa::param::video::{VideoFormat, VideoInfoRaw};
-
 	use super::*;
 
-	fn negotiated(format: VideoFormat, width: u32, height: u32) -> VideoInfoRaw {
-		let mut info = VideoInfoRaw::new();
-		info.set_format(format);
-		info.set_size(spa::utils::Rectangle { width, height });
-		info
+	fn negotiated(format: PixelFormat, width: u32, height: u32) -> VideoFormat {
+		VideoFormat { format: format as u32, width, height }
 	}
+
+	// `SPA_VIDEO_FORMAT_NV12`: planar data is not a packed RGB layout.
+	const NV12: VideoFormat = VideoFormat { format: 23, width: 2, height: 2 };
 	#[test]
 	fn metadata_never_reads_pixels_and_uses_the_same_limits() {
 		let retained = Cell::new(0);
-		let frame = acquire_frame(&negotiated(VideoFormat::BGRA, 8, 6), false, &retained, || {
+		let frame = acquire_frame(&negotiated(PixelFormat::Bgra, 8, 6), false, &retained, || {
 			panic!("metadata must not access buffer data")
 		})
 		.unwrap();
@@ -681,7 +712,7 @@ mod tests {
 		for (width, height) in [(0, 3), (3, 0), (65_536, 65_536)] {
 			assert!(
 				acquire_frame(
-					&negotiated(VideoFormat::BGRA, width, height),
+					&negotiated(PixelFormat::Bgra, width, height),
 					false,
 					&retained,
 					|| panic!("invalid geometry must not read pixels"),
@@ -690,14 +721,14 @@ mod tests {
 			);
 		}
 		assert!(
-			acquire_frame(&negotiated(VideoFormat::NV12, 2, 2), false, &retained, || {
+			acquire_frame(&NV12, false, &retained, || {
 				panic!("an unsupported format must not read pixels")
 			})
 			.is_err()
 		);
 		retained.set(MAX_FRAME_PIXELS - 1);
 		assert!(
-			acquire_frame(&negotiated(VideoFormat::BGRA, 1, 1), false, &retained, || {
+			acquire_frame(&negotiated(PixelFormat::Bgra, 1, 1), false, &retained, || {
 				panic!("metadata at the limit must not read pixels")
 			})
 			.is_ok()
@@ -705,7 +736,7 @@ mod tests {
 		assert_eq!(retained.get(), MAX_FRAME_PIXELS);
 		retained.set(MAX_FRAME_PIXELS);
 		assert!(
-			acquire_frame(&negotiated(VideoFormat::BGRA, 1, 1), false, &retained, || {
+			acquire_frame(&negotiated(PixelFormat::Bgra, 1, 1), false, &retained, || {
 				panic!("an over-budget stream must not read pixels")
 			})
 			.is_err()
@@ -715,7 +746,7 @@ mod tests {
 	#[test]
 	fn pixel_acquisition_keeps_alpha_and_does_not_charge_failed_frames() {
 		let retained = Cell::new(0);
-		let format = negotiated(VideoFormat::RGBA, 1, 1);
+		let format = negotiated(PixelFormat::Rgba, 1, 1);
 		assert!(acquire_frame(&format, true, &retained, || Err("unmapped".into())).is_err());
 		assert_eq!(retained.get(), 0);
 		let frame =
@@ -739,7 +770,7 @@ mod tests {
 				.into_iter()
 				.map(|(width, height)| {
 					acquire_frame(
-						&negotiated(VideoFormat::BGRA, width, height),
+						&negotiated(PixelFormat::Bgra, width, height),
 						false,
 						&retained,
 						|| panic!("granted metadata must not read pixels"),
@@ -802,7 +833,7 @@ mod tests {
 		rows[stride..stride + 4].copy_from_slice(&[0x21, 0x22, 0x23, 0x24]);
 		rows[stride + 4..stride + 8].copy_from_slice(&[0x2a, 0x2b, 0x2c, 0x2d]);
 		rows[stride + 8..stride + 12].copy_from_slice(&[0x34, 0x35, 0x36, 0x37]);
-		let frame = rgba_from_rows(&negotiated(VideoFormat::BGRx, width, height), &rows, stride)
+		let frame = rgba_from_rows(&negotiated(PixelFormat::Bgrx, width, height), &rows, stride)
 			.expect("a padded BGRx frame converts");
 		assert_eq!(frame.dimensions(), (width, height));
 		// BGRx stores blue first, so the components come out reversed, and the
@@ -819,7 +850,7 @@ mod tests {
 	#[test]
 	fn rgba_keeps_its_alpha_channel() {
 		let rows = [0x0a, 0x0b, 0x0c, 0x00];
-		let frame = rgba_from_rows(&negotiated(VideoFormat::RGBA, 1, 1), &rows, 4)
+		let frame = rgba_from_rows(&negotiated(PixelFormat::Rgba, 1, 1), &rows, 4)
 			.expect("an RGBA frame converts");
 		assert_eq!(frame.get_pixel(0, 0).0, [0x0a, 0x0b, 0x0c, 0x00]);
 	}
@@ -829,7 +860,7 @@ mod tests {
 	#[test]
 	fn rgbx_pad_byte_becomes_opaque() {
 		let rows = [0x0a, 0x0b, 0x0c, 0x00];
-		let frame = rgba_from_rows(&negotiated(VideoFormat::RGBx, 1, 1), &rows, 4)
+		let frame = rgba_from_rows(&negotiated(PixelFormat::Rgbx, 1, 1), &rows, 4)
 			.expect("an RGBx frame converts");
 		assert_eq!(frame.get_pixel(0, 0).0, [0x0a, 0x0b, 0x0c, 255]);
 	}
@@ -839,7 +870,7 @@ mod tests {
 	#[test]
 	fn planar_formats_are_refused() {
 		let rows = [0; 16];
-		assert!(rgba_from_rows(&negotiated(VideoFormat::NV12, 2, 2), &rows, 4).is_err());
+		assert!(rgba_from_rows(&NV12, &rows, 4).is_err());
 	}
 
 	/// A chunk that cannot hold the negotiated rows would be read past its end,
@@ -847,10 +878,10 @@ mod tests {
 	#[test]
 	fn chunks_that_cannot_hold_their_rows_are_refused() {
 		let truncated = [0; 7];
-		assert!(rgba_from_rows(&negotiated(VideoFormat::RGB, 2, 2), &truncated, 8).is_err());
+		assert!(rgba_from_rows(&negotiated(PixelFormat::Rgb, 2, 2), &truncated, 8).is_err());
 
 		let narrow = [0; 8];
-		assert!(rgba_from_rows(&negotiated(VideoFormat::RGBA, 4, 1), &narrow, 8).is_err());
+		assert!(rgba_from_rows(&negotiated(PixelFormat::Rgba, 4, 1), &narrow, 8).is_err());
 	}
 
 	/// An empty negotiation is a compositor that answered without a resolution;
@@ -859,14 +890,14 @@ mod tests {
 	#[test]
 	fn zero_sized_frames_are_refused() {
 		let rows = [0; 16];
-		assert!(rgba_from_rows(&negotiated(VideoFormat::RGBA, 0, 4), &rows, 4).is_err());
-		assert!(rgba_from_rows(&negotiated(VideoFormat::RGBA, 4, 0), &rows, 4).is_err());
+		assert!(rgba_from_rows(&negotiated(PixelFormat::Rgba, 0, 4), &rows, 4).is_err());
+		assert!(rgba_from_rows(&negotiated(PixelFormat::Rgba, 4, 0), &rows, 4).is_err());
 	}
 
 	#[test]
 	fn oversized_frames_are_refused_before_allocating() {
 		let rows = [0; 16];
-		assert!(rgba_from_rows(&negotiated(VideoFormat::RGBA, 65_536, 65_536), &rows, 4).is_err());
+		assert!(rgba_from_rows(&negotiated(PixelFormat::Rgba, 65_536, 65_536), &rows, 4).is_err());
 	}
 
 	/// Two monitors that both fall back to the compositor origin would be
@@ -895,7 +926,7 @@ mod tests {
 		let source = control::CancellationSource::default();
 		let token = source.token();
 		source.cancel();
-		let result = control::with_token_for_test(&token, geometry);
+		let result = control::with_token_for_test(&token, || geometry(Err("not loaded")));
 		assert_eq!(result.unwrap_err().code, token.check().unwrap_err().code);
 	}
 
@@ -903,18 +934,9 @@ mod tests {
 	/// window body from its shadow, so the alpha request offers nothing else.
 	#[test]
 	fn alpha_request_offers_only_formats_with_alpha() {
-		use pw::spa::{
-			pod::{ChoiceValue, Value},
-			utils::{Choice, ChoiceEnum},
-		};
-		let Value::Choice(ChoiceValue::Id(Choice(_, ChoiceEnum::Enum { default, alternatives }))) =
-			video_format_property(Formats::Alpha).value
-		else {
-			panic!("the video format is an enumerated choice");
-		};
-		for id in std::iter::once(default).chain(alternatives) {
-			let format = VideoFormat::from_raw(id.0);
-			let layout = PixelLayout::new(format).expect("an offered format converts");
+		assert_eq!(Formats::Alpha.offered(), &[PixelFormat::Bgra, PixelFormat::Rgba]);
+		for &format in Formats::Alpha.offered() {
+			let layout = PixelLayout::new(format as u32).expect("an offered format converts");
 			assert!(layout.alpha.is_some(), "{format:?} carries no alpha");
 		}
 	}

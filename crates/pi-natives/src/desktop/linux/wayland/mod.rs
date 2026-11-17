@@ -1,15 +1,14 @@
-#[cfg(feature = "wayland-pipewire")]
 mod capture;
 mod geometry;
 mod libei;
 mod niri;
+mod pipewire;
 mod portal;
 mod xkb;
 mod xwayland;
 
 use std::{cell::OnceCell, os::fd::AsRawFd, path::PathBuf};
 
-#[cfg(any(feature = "wayland-pipewire", test))]
 use geometry::PortalGeometry;
 use image::RgbaImage;
 
@@ -20,7 +19,7 @@ use crate::desktop::{
 	error::{CoreResult, DesktopError},
 	frame::FrameGeometry,
 	keys::KeyName,
-	linux::ax::{self, AtSpiAx, AtSpiWindow, resolve_focus},
+	linux::ax::{self, AtSpiAx, AtSpiWindow, TextRoute, resolve_focus},
 	types::{
 		CaptureCaps, DesktopCapabilities, DesktopControlCapabilities, DesktopDisplay, DesktopWindow,
 		DesktopWindowState, DesktopWorkspace, DisplaySelector, Target,
@@ -39,11 +38,8 @@ pub(super) fn compositor_windows() -> Option<Vec<DesktopWindow>> {
 }
 
 pub struct WaylandBackend {
-	#[cfg_attr(
-		not(feature = "wayland-pipewire"),
-		expect(dead_code, reason = "only read by the pipewire capture path")
-	)]
 	display:           DisplaySelector,
+	pipewire:          pipewire::Loaded,
 	ax:                Option<AtSpiAx>,
 	ax_error:          Option<DesktopError>,
 	input:             Option<libei::Libei>,
@@ -110,6 +106,7 @@ impl WaylandBackend {
 		}
 		Self {
 			display,
+			pipewire: pipewire::library(),
 			ax,
 			ax_error,
 			input: None,
@@ -194,10 +191,9 @@ impl Backend for WaylandBackend {
 		DesktopCapabilities {
 			backend: "wayland".to_string(),
 			display_server: Some("wayland".to_string()),
-			// The PipeWire screencast path is compiled in only under the
-			// wayland-pipewire feature; without it capture() hard-errors, so the
-			// capability report must not advertise a capture the binary cannot do.
-			capture: cfg!(feature = "wayland-pipewire"),
+			// Without libpipewire the addon still loads, but capture() fails, so
+			// the report must not advertise it.
+			capture: self.pipewire.is_ok(),
 			input: !input_unavailable,
 			ax: self.ax.is_some(),
 			background_window_input: false,
@@ -209,7 +205,7 @@ impl Backend for WaylandBackend {
 			secure_input_app: None,
 			spaces: false,
 			global_escape: false,
-			capture_permission: if cfg!(feature = "wayland-pipewire") {
+			capture_permission: if self.pipewire.is_ok() {
 				"prompt-or-granted".to_string()
 			} else {
 				"unavailable".to_string()
@@ -241,29 +237,18 @@ impl Backend for WaylandBackend {
 		if !frame.display_bound() {
 			return Ok(());
 		}
-		#[cfg(not(feature = "wayland-pipewire"))]
-		{
-			let _ = frame;
-			Err(DesktopError::invalid_coordinate_frame(
-				"validating Wayland display geometry requires the wayland-pipewire feature",
+		// ScreenCast exposes geometry only when opening a stream. Enumeration can
+		// use the last snapshot, but coordinate delivery needs fresh bounds.
+		let geometry = capture::geometry(self.pipewire);
+		control::check()?;
+		let geometry = geometry.map_err(|error| {
+			DesktopError::invalid_coordinate_frame(format!(
+				"could not refresh Wayland display geometry: {error}"
 			))
-		}
-		#[cfg(feature = "wayland-pipewire")]
-		{
-			// ScreenCast exposes geometry only when opening a stream. Enumeration
-			// can use the last snapshot, but coordinate delivery needs fresh
-			// bounds.
-			let geometry = capture::geometry();
-			control::check()?;
-			let geometry = geometry.map_err(|error| {
-				DesktopError::invalid_coordinate_frame(format!(
-					"could not refresh Wayland display geometry: {error}"
-				))
-			})?;
-			let known = niri::displays().ok().flatten().unwrap_or_default();
-			self.displays = geometry::fresh_layout(&geometry, &known)?;
-			frame.validate_layout(&self.displays)
-		}
+		})?;
+		let known = niri::displays().ok().flatten().unwrap_or_default();
+		self.displays = geometry::fresh_layout(&geometry, &known)?;
+		frame.validate_layout(&self.displays)
 	}
 
 	fn windows(&mut self) -> CoreResult<Vec<DesktopWindow>> {
@@ -325,67 +310,61 @@ impl Backend for WaylandBackend {
 		_caps: &CaptureCaps,
 		selector: Option<&DisplaySelector>,
 	) -> CoreResult<(RgbaImage, FrameGeometry)> {
-		#[cfg(not(feature = "wayland-pipewire"))]
+		if let Target::Window(id) = target
+			&& id.starts_with(niri::ID_PREFIX)
 		{
-			let _ = (target, selector);
-			Err(DesktopError::capture_failed("Wayland capture requires the wayland-pipewire feature"))
+			let (image, window) = niri::capture_window(self.pipewire, id)?;
+			let frame = FrameGeometry::for_compositor_window(&window, image.width(), image.height());
+			return Ok((image, frame));
 		}
-		#[cfg(feature = "wayland-pipewire")]
-		{
-			if let Target::Window(id) = target
-				&& id.starts_with("niri:")
-			{
-				let (image, window) = niri::capture_window(id)?;
-				let frame =
-					FrameGeometry::for_compositor_window(&window, image.width(), image.height());
-				return Ok((image, frame));
-			}
-			// The portal reports the authorized stream geometry. Use niri only
-			// to enrich display names and match known monitors.
-			let known = niri::displays().ok().flatten().unwrap_or_default();
-			let frames = capture::capture()?;
-			self.displays = geometry::metadata(&frames, &known)?;
-			let explicit = target.display_selector();
-			let selected = selector.or(explicit.as_ref()).unwrap_or(&self.display).clone();
-			match target {
-				Target::Desktop | Target::Display(_) => {
-					let (image, displays) = geometry::compose(frames, &selected, &known)?;
-					let frame = FrameGeometry::for_displays(&displays);
-					Ok((image, frame))
-				},
-				Target::Window(id) => {
-					let entry = self
-						.atspi_windows()?
-						.into_iter()
-						.find(|entry| &entry.window.id == id)
-						.ok_or_else(|| {
-							self.missing_window(target).unwrap_or_else(|| {
-								DesktopError::window_not_found(format!("Wayland window {id} not found"))
-							})
-						})?;
-					if !entry.position_known {
-						return Err(DesktopError::capture_failed(format!(
-							"Wayland window {id} has no known screen position; native compositor capture \
-							 is unavailable"
-						)));
+		// The portal reports the authorized stream geometry. Use niri only
+		// to enrich display names and match known monitors.
+		let known = niri::displays().ok().flatten().unwrap_or_default();
+		let frames = capture::capture(self.pipewire)?;
+		self.displays = geometry::metadata(&frames, &known)?;
+		let explicit = target.display_selector();
+		let selected = selector
+			.or(explicit.as_ref())
+			.unwrap_or(&self.display)
+			.clone();
+		match target {
+			Target::Desktop | Target::Display(_) => {
+				let (image, displays) = geometry::compose(frames, &selected, &known)?;
+				let frame = FrameGeometry::for_displays(&displays);
+				Ok((image, frame))
+			},
+			Target::Window(id) => {
+				let entry = self
+					.atspi_windows()?
+					.into_iter()
+					.find(|entry| &entry.window.id == id)
+					.ok_or_else(|| {
+						self.missing_window(target).unwrap_or_else(|| {
+							DesktopError::window_not_found(format!("Wayland window {id} not found"))
+						})
+					})?;
+				if !entry.position_known {
+					return Err(DesktopError::capture_failed(format!(
+						"Wayland window {id} has no known screen position; native compositor capture is \
+						 unavailable"
+					)));
+				}
+				let displays = &self.displays;
+				for ((image, geometry), display) in frames.iter().zip(displays) {
+					if matches!(&selected, DisplaySelector::Id(id) if id != &display.id && id != &display.name)
+					{
+						continue;
 					}
-					let displays = &self.displays;
-					for ((image, geometry), display) in frames.iter().zip(displays) {
-						if matches!(&selected, DisplaySelector::Id(id) if id != &display.id && id != &display.name)
-						{
-							continue;
-						}
-						if let Ok((x, y, width, height)) = geometry.window_crop(&entry) {
-							let cropped = image::imageops::crop_imm(image, x, y, width, height).to_image();
-							let frame = FrameGeometry::for_window(&entry.window, width, height);
-							return Ok((cropped, frame));
-						}
+					if let Ok((x, y, width, height)) = geometry.window_crop(&entry) {
+						let cropped = image::imageops::crop_imm(image, x, y, width, height).to_image();
+						let frame = FrameGeometry::for_window(&entry.window, width, height);
+						return Ok((cropped, frame));
 					}
-					Err(DesktopError::capture_failed(format!(
-						"Wayland window {id} is not fully inside an authorized monitor"
-					)))
-				},
-			}
+				}
+				Err(DesktopError::capture_failed(format!(
+					"Wayland window {id} is not fully inside an authorized monitor"
+				)))
+			},
 		}
 	}
 
@@ -453,24 +432,26 @@ impl Backend for WaylandBackend {
 		super::menus::select(window, path)
 	}
 
-	/// Refuses before anything reaches the element's app. The default focuses
-	/// the element and then sends through its window's keyboard path, which
-	/// Wayland always refuses, so the refused call still moved focus inside
-	/// that app (GNOME announced "… is ready").
+	/// Text goes in through the element's AT-SPI text interface, which needs
+	/// neither focus nor keys. Anything else is refused before anything
+	/// reaches the element's app: the default focuses the element and then
+	/// sends through its window's keyboard path, which Wayland always refuses,
+	/// so the refused call still moved focus inside that app (GNOME announced
+	/// "… is ready").
 	fn element_input(
 		&mut self,
-		_element: &AxHandle,
-		_input: &ElementInput,
+		element: &AxHandle,
+		input: &ElementInput,
 		_mode: DeliveryMode,
 		token: &OperationToken,
 	) -> CoreResult<ElementDelivery> {
 		token.check()?;
-		Err(DesktopError::background_unavailable(
-			"wayland-compositor-focus-only: Wayland cannot programmatically activate the element's \
-			 window, so el.type and el.press(keys) are refused before the element is focused; \
-			 nothing was sent. Use setValue, or click the field where a desktop screenshot shows it \
-			 (AX bounds are window-relative here) and then type with desktop input",
-		))
+		let route = match (input, &self.ax) {
+			(ElementInput::Text(text), Some(ax)) => Some(ax.type_text(element, text)?),
+			(ElementInput::Text(_), None) => Some(TextRoute::Absent),
+			(ElementInput::Chord(_), _) => None,
+		};
+		element_input_outcome(route)
 	}
 
 	fn raise_window(&mut self, id: &str, token: &OperationToken) -> CoreResult<()> {
@@ -505,6 +486,35 @@ impl Backend for WaylandBackend {
 	}
 }
 
+/// What `el.type` gets on Wayland from the element's AT-SPI text `route`, or
+/// `el.press(keys)` when there is none: only inserted text goes in, since keys
+/// need the element's window focused, which Wayland leaves to the user.
+fn element_input_outcome(route: Option<TextRoute>) -> CoreResult<ElementDelivery> {
+	Err(DesktopError::background_unavailable(match route {
+		Some(TextRoute::Inserted) => return Ok(ElementDelivery::Delivered),
+		Some(TextRoute::Declined(why)) => format!(
+			"wayland-compositor-focus-only: Wayland cannot programmatically activate the element's \
+			 window, and its accessibility text route was not used, since {why}, so el.type is \
+			 refused before the element is focused; nothing was sent. Click the field where a \
+			 desktop screenshot shows it (AX bounds are window-relative here) and then type with \
+			 desktop input"
+		),
+		Some(TextRoute::Absent) => "wayland-compositor-focus-only: Wayland cannot programmatically \
+		                            activate the element's window, and the element took no text \
+		                            through its AT-SPI text interface, so el.type is refused before \
+		                            the element is focused; nothing was sent. Use setValue, or \
+		                            click the field where a desktop screenshot shows it (AX bounds \
+		                            are window-relative here) and then type with desktop input"
+			.to_owned(),
+		None => "wayland-compositor-focus-only: Wayland cannot programmatically activate the \
+		         element's window, so el.type and el.press(keys) are refused before the element is \
+		         focused; nothing was sent. Use setValue, or click the field where a desktop \
+		         screenshot shows it (AX bounds are window-relative here) and then type with \
+		         desktop input"
+			.to_owned(),
+	}))
+}
+
 #[cfg(test)]
 mod tests {
 	use std::{
@@ -526,6 +536,7 @@ mod tests {
 	fn backend_without_services() -> WaylandBackend {
 		WaylandBackend {
 			display:           DisplaySelector::All,
+			pipewire:          Err("libpipewire-0.3.so.0 could not be loaded (not installed)"),
 			ax:                None,
 			ax_error:          None,
 			input:             None,
@@ -832,7 +843,6 @@ mod tests {
 	}
 
 	#[test]
-	#[cfg(not(feature = "wayland-pipewire"))]
 	fn display_validation_never_trusts_cached_portal_geometry() {
 		let mut backend = backend_without_services();
 		backend
@@ -906,18 +916,21 @@ mod tests {
 	}
 
 	#[test]
-	#[cfg(not(feature = "wayland-pipewire"))]
-	fn capabilities_report_no_capture_without_pipewire_feature() {
+	fn capabilities_report_no_capture_without_libpipewire() {
 		let mut backend = backend_without_services();
 		let caps = backend.capabilities();
-		// Shipped builds compile without wayland-pipewire, so the capture path is
-		// absent; capabilities() must not advertise capture the binary cannot do.
-		assert!(!caps.capture, "capture must be false when the pipewire feature is off");
+		assert!(!caps.capture);
 		assert_eq!(caps.capture_permission, "unavailable");
 		let err = backend
 			.capture(&Target::Desktop, &CaptureCaps::default(), None)
-			.expect_err("capture must fail without the pipewire feature");
+			.expect_err("capture must fail without libpipewire");
 		assert_eq!(err.code.as_str(), "CaptureFailed");
+		assert!(
+			err.message
+				.contains("libpipewire-0.3.so.0 could not be loaded"),
+			"{}",
+			err.message
+		);
 	}
 
 	fn portal_window(x: i32, y: i32, width: u32, height: u32, position_known: bool) -> AtSpiWindow {
@@ -1005,5 +1018,27 @@ mod tests {
 			.window_crop(&portal_window(0, 0, 1159, 896, false))
 			.expect_err("unknown position must not be cropped");
 		assert_eq!(err.code.as_str(), "CaptureFailed");
+	}
+
+	#[test]
+	fn element_input_goes_in_only_as_inserted_text() {
+		assert!(matches!(
+			element_input_outcome(Some(TextRoute::Inserted)),
+			Ok(ElementDelivery::Delivered)
+		));
+		let Err(declined) =
+			element_input_outcome(Some(TextRoute::Declined("it skips the validator")))
+		else {
+			panic!("a declined route reported delivery");
+		};
+		assert_eq!(declined.code.as_str(), "BackgroundUnavailable");
+		assert!(declined.message.contains("since it skips the validator"), "{declined}");
+		for route in [Some(TextRoute::Absent), None] {
+			let Err(err) = element_input_outcome(route) else {
+				panic!("{route:?} reported delivery");
+			};
+			assert_eq!(err.code.as_str(), "BackgroundUnavailable");
+			assert!(err.message.contains("nothing was sent"), "{err}");
+		}
 	}
 }

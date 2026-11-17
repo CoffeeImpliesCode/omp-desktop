@@ -18,7 +18,7 @@ import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import puppeteer, { type Browser, type Page } from "puppeteer-core";
+import puppeteer, { type Browser, type Page, type Protocol } from "puppeteer-core";
 import { getPuppeteerDir } from "@oh-my-pi/pi-utils";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { findFreeCdpPort } from "@oh-my-pi/pi-coding-agent/tools/browser/attach";
@@ -203,7 +203,7 @@ async function launchRelayFixture(options: FixtureOptions = {}): Promise<RelayFi
 					: route === "/second"
 						? "<title>Second</title><button>Second</button>"
 						: route === "/login"
-							? `<title>Login ${url.searchParams.get("who")}</title><input id="pw" type="password">`
+							? `<title>Login ${url.searchParams.get("who")}</title><form onsubmit="event.preventDefault(); document.title = 'Signed in'"><input id="pw" type="password"><button id="go">Log in</button></form>`
 							: route === "/download"
 								? `<title>Download</title><a id="report" href="/report.csv">Report</a><a id="held" href="/held.csv">Held</a>`
 								: route === "/framed"
@@ -239,7 +239,7 @@ async function launchRelayFixture(options: FixtureOptions = {}): Promise<RelayFi
 			headless: true,
 			pipe: true,
 			userDataDir,
-			enableExtensions: [extension, ...(options.extensions ?? [])],
+			enableExtensions: true,
 			// Software compositing avoids host-GPU stalls during background chrome.debugger captures.
 			args: [
 				"--no-first-run",
@@ -256,6 +256,9 @@ async function launchRelayFixture(options: FixtureOptions = {}): Promise<RelayFi
 			},
 		});
 		browsers.push(browser);
+		// Wait for content-script registration before loading fixture pages.
+		for (const extensionPath of [extension, ...(options.extensions ?? [])])
+			await browser.installExtension(extensionPath);
 		const extensionId = await unpackedExtensionId(extension);
 		if (!extensionId) throw new Error("Missing relay extension directory");
 		// Registration runs in external Chromium, so fake timers cannot advance this readiness poll.
@@ -324,6 +327,78 @@ function chromeTabIdOf(targetId: string): number {
 	const tabId = Number(targetId.slice(targetId.lastIndexOf(".") + 1));
 	if (!Number.isInteger(tabId)) throw new Error(`Managed target ${targetId} carries no Chrome tab id`);
 	return tabId;
+}
+
+const session = {
+	cwd: process.cwd(),
+	hasUI: false,
+	settings: Settings.isolated(),
+	getSessionFile: () => null,
+} as unknown as ToolSession;
+
+/**
+ * A stand-in password manager running `contentScript` on the fixture site, which may draw its `menu.html` and
+ * `notification.html` into the page as chrome-extension:// frames.
+ */
+async function writeStandInVault(contentScript: string): Promise<string> {
+	const vaultDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-vault-"));
+	await fs.writeFile(
+		path.join(vaultDir, "manifest.json"),
+		JSON.stringify({
+			manifest_version: 3,
+			name: "Stand-in vault",
+			version: "1.0",
+			content_scripts: [{ matches: ["http://127.0.0.1/*"], js: ["content.js"] }],
+			web_accessible_resources: [{ resources: ["menu.html", "notification.html"], matches: ["http://127.0.0.1/*"] }],
+		}),
+	);
+	await fs.writeFile(path.join(vaultDir, "menu.html"), "<button>Fill</button>");
+	await fs.writeFile(
+		path.join(vaultDir, "notification.html"),
+		"<title>Vault: save login</title><h3>Save login?</h3><button>Save</button>",
+	);
+	// A page the vault does not expose to sites, so no site can frame it.
+	await fs.writeFile(path.join(vaultDir, "private.html"), "<title>Vault private</title>");
+	await fs.writeFile(path.join(vaultDir, "content.js"), contentScript);
+	return vaultDir;
+}
+
+/** The text a call showed the agent, or the error it failed with. */
+const shown = (result: { displays: Array<{ type: string; text?: string }> }) =>
+	result.displays.map(display => display.text ?? "").join("\n");
+
+/** How often `text` holds `part`. */
+const occurrences = (text: string, part: string) => text.split(part).length - 1;
+
+/**
+ * What the calls on tab `name` showed, starting with what `told` holds so far, until one names `extensionId` and then
+ * one more: the relay reports what it hid while the calls go on, so a later call may carry it. At most 20 more calls.
+ */
+async function untilNamed(name: string, extensionId: string, ...told: string[]): Promise<string[]> {
+	const titleCall = { code: "return await tab.title();", timeoutMs: 10_000, session };
+	for (let call = 0; call < 20 && !told.some(text => text.includes(extensionId)); call++) {
+		told.push(shown(await runInTab(name, titleCall)));
+	}
+	told.push(shown(await runInTab(name, titleCall)));
+	return told;
+}
+
+/** The iframes in `page`, closed shadow roots included, that the relay emptied: they carry its blank `srcdoc`. */
+async function emptiedFrames(page: Page): Promise<number> {
+	const cdp = await page.createCDPSession();
+	try {
+		const { root } = await cdp.send("DOM.getDocument", { depth: -1, pierce: true });
+		let count = 0;
+		const visit = (node: Protocol.DOM.Node) => {
+			if (node.nodeName === "IFRAME" && node.attributes?.some((name, i) => i % 2 === 0 && name === "srcdoc"))
+				count++;
+			for (const child of [...(node.children ?? []), ...(node.shadowRoots ?? [])]) visit(child);
+		};
+		visit(root);
+		return count;
+	} finally {
+		await cdp.detach();
+	}
 }
 
 describe.skipIf(!CHROMIUM_AVAILABLE)("relay tab isolation", () => {
@@ -790,20 +865,7 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay multi-browser placement and cleanup"
 	it("empties a password manager's menu only in the tab omp drives", async () => {
 		// A stand-in password manager: a focused password field opens its inline menu, a chrome-extension:// frame in
 		// a closed shadow root, the way 1Password draws it.
-		const vaultDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-relay-vault-"));
-		await fs.writeFile(
-			path.join(vaultDir, "manifest.json"),
-			JSON.stringify({
-				manifest_version: 3,
-				name: "Stand-in vault",
-				version: "1.0",
-				content_scripts: [{ matches: ["http://127.0.0.1/*"], js: ["content.js"] }],
-				web_accessible_resources: [{ resources: ["menu.html"], matches: ["http://127.0.0.1/*"] }],
-			}),
-		);
-		await fs.writeFile(path.join(vaultDir, "menu.html"), "<button>Fill</button>");
-		await fs.writeFile(
-			path.join(vaultDir, "content.js"),
+		const vaultDir = await writeStandInVault(
 			`document.addEventListener("focusin", event => {
 	if (event.target.type !== "password" || document.querySelector("vault-menu")) return;
 	const host = document.createElement("vault-menu");
@@ -832,13 +894,83 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("relay multi-browser placement and cleanup"
 		try {
 			await acquireTab(name, relay, { target: "Login driven", timeoutMs: 20_000 });
 			// Focusing the field opens the menu, and Chrome detaches omp from the tab during the call.
-			await runInTab(name, fill).catch(() => undefined);
-			expect((await runInTab(name, fill)).returnValue).toBe("secret");
+			const failed = await runInTab(name, fill).then(shown, (error: unknown) => String(error));
+			const filled = await runInTab(name, fill);
+			expect(filled.returnValue).toBe("secret");
+			// A call names what omp hid, once: that call, the next or a later one, as the relay reports it. Chrome can
+			// also drop omp as the menu starts loading and that load then never commit: omp hid nothing, and says nothing.
+			const vaultId = await unpackedExtensionId(vaultDir);
+			if (!vaultId) throw new Error("Missing stand-in vault directory");
+			if ((await emptiedFrames(driven)) > 0) {
+				const told = await untilNamed(name, vaultId, failed, shown(filled));
+				expect(occurrences(told.join("\n"), vaultId)).toBe(1);
+				expect(told.join("\n")).toContain(`"menu.html"`);
+				expect(told.at(-1)).not.toContain(vaultId);
+			} else {
+				expect(`${failed}\n${shown(filled)}\n${shown(await runInTab(name, fill))}`).not.toContain(vaultId);
+			}
 			// The menu opened, and its frame was emptied.
 			expect(await driven.$("vault-menu")).not.toBeNull();
 			expect(menuOpen(driven)).toBeFalse();
 			// Chrome refused the relay the user's tab too, yet its menu there is left alone.
 			expect(menuOpen(user)).toBeTrue();
+		} finally {
+			await releaseTab(name).catch(() => undefined);
+			await releaseBrowser(relay, { kill: false });
+			await fixture.close();
+			await fs.rm(vaultDir, { recursive: true, force: true });
+		}
+	}, 60_000);
+
+	it("says once what it hid when a submit opens a password manager's save card", async () => {
+		const vaultDir = await writeStandInVault(
+			`document.addEventListener("submit", () => {
+	const card = document.createElement("vault-notification");
+	const frame = document.createElement("iframe");
+	card.attachShadow({ mode: "closed" }).append(frame);
+	document.documentElement.append(card);
+	frame.src = chrome.runtime.getURL("notification.html");
+}, true);`,
+		);
+		const fixture = await launchRelayFixture({ extensions: [vaultDir] });
+		const relay = await acquireBrowser({ kind: "relay", cdpUrl: fixture.cdpUrl }, { cwd: process.cwd() });
+		const name = `relay-vault-submit-${process.pid}`;
+		const title = { code: "return await tab.title();", timeoutMs: 10_000, session };
+		try {
+			await acquireTab(name, relay, { url: `${fixture.origin}/login?who=submit`, timeoutMs: 20_000 });
+			const page = (await fixture.browser.pages()).find(page => page.url().includes("who=submit"));
+			if (!page) throw new Error("omp's tab is gone");
+			const vaultId = await unpackedExtensionId(vaultDir);
+			if (!vaultId) throw new Error("Missing stand-in vault directory");
+			// The page adds frames of its own as the card opens, so one sweep empties them with it: one to an extension
+			// that is not installed, one to a vault page no site may load, and one whose `src` carries page text.
+			await page.evaluate(`document.addEventListener("submit", () => {
+	for (const src of ["chrome-extension://${"p".repeat(32)}/decoy.html", "chrome-extension://${vaultId}/private.html", "chrome-extension://${vaultId}/Page text/../notification.html"]) {
+		const frame = document.createElement("iframe");
+		frame.src = src;
+		document.body.append(frame);
+	}
+});`);
+			// The card starts loading as the click submits, so Chrome may drop omp during this call.
+			const submitted = await runInTab(name, { code: "await tab.click('#go');", timeoutMs: 10_000, session }).then(
+				shown,
+				(error: unknown) => String(error),
+			);
+			const after = await runInTab(name, title);
+			expect(after.returnValue).toBe("Signed in");
+			const told = await untilNamed(name, vaultId, submitted, shown(after));
+			// The card's page, once, by the title the vault gave it.
+			expect(occurrences(told.join("\n"), vaultId)).toBe(1);
+			expect(told.join("\n")).toContain(`"notification.html"`);
+			expect(told.join("\n")).toContain(`"Vault: save login"`);
+			expect(told.at(-1)).not.toContain(vaultId);
+			// The page's frames to an extension that is not installed, or to a page the vault does not expose, are emptied
+			// but never reported: they could not have shown that extension's page. A `/../` in a planted `src` still
+			// loads the vault's page; only the URL that loaded is reported.
+			expect(told.join("\n")).not.toContain("decoy.html");
+			expect(told.join("\n")).not.toContain("private.html");
+			expect(told.join("\n")).not.toContain("Page text");
+			expect(page.frames().filter(frame => frame.url().startsWith("chrome-extension://"))).toEqual([]);
 		} finally {
 			await releaseTab(name).catch(() => undefined);
 			await releaseBrowser(relay, { kill: false });

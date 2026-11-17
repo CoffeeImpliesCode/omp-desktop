@@ -12,6 +12,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import type { VcsGitRepo } from "@oh-my-pi/pi-natives";
 import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import { shortenPath } from "@oh-my-pi/pi-tui/render/render-utils";
 import type { Draft, SelectedChange } from "./draft";
 import type { ChangeJournal, JournalAgent } from "./journal";
 import { formatTextPatch } from "./patch";
@@ -92,7 +93,17 @@ function shortSha(sha: string | null): string {
 }
 
 async function patchFor(repo: VcsGitRepo, head: string | null, change: SelectedChange): Promise<string> {
-	if (change.kind === "text") return formatTextPatch(change.path, change.before, change.after);
+	if (change.kind === "text") {
+		if (change.after?.mode === "160000") {
+			const absolute = path.join(repo.info().repoRoot, change.path);
+			const module = vcs.git(absolute);
+			const sameRoot = module && (await fs.realpath(module.info().repoRoot)) === (await fs.realpath(absolute));
+			if (!sameRoot || `Subproject commit ${await module.headSha()}\n` !== change.after.text) {
+				throw new Error(`${change.path}: submodule HEAD changed since the draft; build a new draft.`);
+			}
+		}
+		return formatTextPatch(change.path, change.before, change.after);
+	}
 	return change.added || head === null
 		? repo.diffNoIndex("/dev/null", change.path, true)
 		: repo.diffText({ base: head, files: [change.path], binary: true });
@@ -100,18 +111,37 @@ async function patchFor(repo: VcsGitRepo, head: string | null, change: SelectedC
 
 /**
  * Commit the draft's selection on top of the current HEAD.
- * @throws when nothing is selected; on `amend` when HEAD is not a selective commit of this
- * session; when HEAD moved onto changes that conflict with the selection; or when a hook fails.
+ * @throws when a merge, cherry-pick, revert, rebase, or git am is in progress, or the index has
+ * unresolved conflicts; when nothing is selected;
+ * on `amend` when HEAD is not a selective commit of this session; when HEAD moved onto changes
+ * that conflict with the selection; or when a hook fails.
  */
 export async function commitSelection(
 	draft: Draft,
 	request: CommitRequest,
 	context: { journal: ChangeJournal | null; agent: JournalAgent; signal?: AbortSignal },
 ): Promise<CommitOutcome> {
-	const message = composeMessage(request);
 	const changes = draft.selection();
-	if (changes.length === 0) throw new Error("Nothing selected; use take() first.");
+	if (changes.length === 0) {
+		if (draft.paths.length > 0) throw new Error("Nothing selected; use take() first.");
+		throw new Error(
+			draft.skipped.length > 0
+				? `Nothing to commit: only ${draft.skipped.join(", ")} changed (submodule or nested repository), which selective commits skip.`
+				: `Nothing to commit: ${shortenPath(draft.root)} has no changes against HEAD.`,
+		);
+	}
 	const repo = vcs.requireGit(draft.root);
+	const operation = await repo.operationKind(context.signal);
+	if (operation === "unmerged-index") {
+		throw new Error("The index has unresolved conflicts; resolve them before using commit().");
+	}
+	if (operation) {
+		throw new Error(
+			`A ${operation === "am" ? "git am" : operation} is in progress; finish or abort it before using commit(). Use plain \`git commit\` for commits within that operation.`,
+		);
+	}
+	const gitDir = repo.info().gitDir;
+	const message = composeMessage(request);
 	const patches: Array<{ path: string; patch: string }> = [];
 	for (const change of changes) {
 		const patch = await patchFor(repo, draft.head, change);
@@ -127,7 +157,7 @@ export async function commitSelection(
 		: undefined;
 	const joined = vcs.joinPatches(patches.map(entry => entry.patch));
 	const indexPath = path.join(
-		repo.info().gitDir,
+		gitDir,
 		`omp-commit-${draft.id}-${Math.floor(Math.random() * 46656).toString(36)}.index`,
 	);
 	let sha: string | undefined;
@@ -139,9 +169,9 @@ export async function commitSelection(
 			if (ownCommits && (head === null || !ownCommits.has(head))) {
 				throw new Error(`HEAD ${shortSha(head)} was not made by this session's commit flow; refusing to amend it.`);
 			}
-			// An unborn HEAD starts from an empty index: patches create the missing index file.
+			// Hooks see this index; preserve HEAD's sparse exclusions from the shared index.
 			if (head === null) await fs.rm(indexPath, { force: true });
-			else await repo.readTree(head, indexPath, context.signal);
+			else await repo.readTreeKeepingSparse(head, indexPath, context.signal);
 			try {
 				await repo.applyPatch(joined, { cached: true, indexPath }, context.signal);
 			} catch (error) {
@@ -177,7 +207,7 @@ export async function commitSelection(
 	const indexNotes: string[] = [];
 	// A new repository may have no index file yet. Git reads that as an empty index, but patch
 	// application reads HEAD in its place, so seed it with the root commit's tree instead.
-	const seedIndex = parent === null && !(await Bun.file(path.join(repo.info().gitDir, "index")).exists());
+	const seedIndex = parent === null && !(await Bun.file(path.join(gitDir, "index")).exists());
 	if (seedIndex) await repo.readTree(sha, undefined, context.signal);
 	// One write for every path: each write takes `index.lock`, which a concurrent git (a prompt's
 	// or an editor's `git status`) may hold. Per-path writes only when a path's entry differs.
@@ -197,5 +227,6 @@ export async function commitSelection(
 	}
 	const paths = patches.map(entry => entry.path);
 	await context.journal?.recordCommit({ agent: context.agent.agent, parent: context.agent.parent, sha, paths });
-	return { sha, subject: message.split("\n", 1)[0], paths, parent, indexNotes };
+	const subject = (await repo.commitDetails(sha)).message.split("\n", 1)[0];
+	return { sha, subject, paths, parent, indexNotes };
 }

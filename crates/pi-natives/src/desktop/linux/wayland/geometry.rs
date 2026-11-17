@@ -1,12 +1,11 @@
-#[cfg(any(feature = "wayland-pipewire", test))]
 use image::{RgbaImage, imageops};
 
 use crate::desktop::{
 	error::{CoreResult, DesktopError},
-	types::DesktopDisplay,
+	frame::MAX_COMPOSITE_PIXELS,
+	linux::ax::AtSpiWindow,
+	types::{DesktopDisplay, DisplaySelector},
 };
-#[cfg(any(feature = "wayland-pipewire", test))]
-use crate::desktop::{frame::MAX_COMPOSITE_PIXELS, linux::ax::AtSpiWindow, types::DisplaySelector};
 
 #[cfg(test)]
 mod tests {
@@ -226,7 +225,6 @@ mod tests {
 	}
 }
 
-#[cfg(any(feature = "wayland-pipewire", test))]
 /// Portal logical bounds paired with the native `PipeWire` buffer dimensions.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PortalGeometry {
@@ -238,7 +236,6 @@ pub(super) struct PortalGeometry {
 	pixel_height:   u32,
 }
 
-#[cfg(any(feature = "wayland-pipewire", test))]
 impl PortalGeometry {
 	pub(super) fn new(
 		position: Option<(i32, i32)>,
@@ -368,7 +365,6 @@ pub(super) fn layout(displays: &mut [DesktopDisplay]) -> CoreResult<(u32, u32)> 
 	Ok((width as u32, height as u32))
 }
 
-#[cfg(any(feature = "wayland-pipewire", test))]
 pub(super) fn fresh_layout(
 	geometries: &[PortalGeometry],
 	known: &[DesktopDisplay],
@@ -382,7 +378,6 @@ pub(super) fn fresh_layout(
 	Ok(displays)
 }
 
-#[cfg(any(feature = "wayland-pipewire", test))]
 pub(super) fn metadata(
 	frames: &[(RgbaImage, PortalGeometry)],
 	known: &[DesktopDisplay],
@@ -396,7 +391,6 @@ pub(super) fn metadata(
 	Ok(displays)
 }
 
-#[cfg(any(feature = "wayland-pipewire", test))]
 pub(super) fn compose(
 	mut frames: Vec<(RgbaImage, PortalGeometry)>,
 	selector: &DisplaySelector,

@@ -2,7 +2,7 @@
 
 This fork of [oh-my-pi](https://github.com/can1357/oh-my-pi) improves desktop computer use specifically for **Linux Wayland**.
 
-Upstream base: [v18.22.0](https://github.com/can1357/oh-my-pi/releases/tag/v18.22.0).
+Upstream base: [`2c18786227e2`](https://github.com/can1357/oh-my-pi/commit/2c18786227e2) (after v18.22.0).
 
 ## Linux Wayland improvements
 
@@ -15,7 +15,7 @@ Upstream base: [v18.22.0](https://github.com/can1357/oh-my-pi/releases/tag/v18.2
 - Report window control per backend instead of guessing. `capabilities().windowControl` lists the advertised operations, the coordinate space used for window movement, and whether focusing may warp the pointer. X11 advertises only what the running window manager really supports, and niri does not pretend to have minimize, restore, or idempotent maximize and fullscreen.
 - Read window and workspace state on demand, with unknown flags left absent instead of reported as `false`, and move windows by exact IDs from discovery.
 
-Native capture requires a Linux build with the `wayland-pipewire` feature and system PipeWire libraries.
+Native capture requires system PipeWire libraries, loaded at runtime.
 See the [Linux build guide](LOCAL-PIPEWIRE-BUILD.md).
 Per-window Wayland input remains unavailable, and AX access depends on each application's AT-SPI registration.
 
@@ -383,7 +383,7 @@ Cursor `oauth` · GitHub Copilot `oauth` · GitLab Duo · Devin `oauth` · Kimi 
 
 OpenAI-compatible `/v1/models`. Local instances skip the key.
 
-Ollama `local` · Ollama Cloud · LM Studio `local` · llama.cpp `local` · vLLM `local` · LiteLLM
+Ollama `local` · Ollama Cloud · LM Studio `local` · llama.cpp `local` · vLLM `local` · LiteLLM · Bifrost
 
 ### Custom OpenAI-compatible providers
 
@@ -651,7 +651,7 @@ bun setup
 bun dev
 ```
 
-Build and smoke-test the distributable Nix package with `nix build .#omp`. Wayland screencast support is off by default (linking libpipewire adds ~750 MB of runtime closure); enable it with `omp.override { withWaylandScreencast = true; }`. Release builds link `pi-natives` with fat LTO; `omp.override { withFatLto = false; }` uses thin LTO for much faster local rebuilds. Rust dependencies and the native addon build in separate derivations, so Rust edits reuse compiled dependencies and TypeScript edits reuse the addon. `nix/bun.nix` is generated only when `bun.lock` changes; releases regenerate it automatically. For dependency changes, run:
+Build and smoke-test the distributable Nix package with `nix build .#omp`. Wayland screencast support is off by default (putting libpipewire on the addon's library path adds ~750 MB of runtime closure); enable it with `omp.override { withWaylandScreencast = true; }`. Release builds link `pi-natives` with fat LTO; `omp.override { withFatLto = false; }` uses thin LTO for much faster local rebuilds. Rust dependencies and the native addon build in separate derivations, so Rust edits reuse compiled dependencies and TypeScript edits reuse the addon. `nix/bun.nix` is generated only when `bun.lock` changes; releases regenerate it automatically. For dependency changes, run:
 
 ```sh
 bun run gen:nix

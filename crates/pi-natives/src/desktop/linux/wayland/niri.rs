@@ -31,20 +31,16 @@ use std::{
 	time::Duration,
 };
 
-#[cfg(any(feature = "wayland-pipewire", test))]
+use futures::StreamExt;
 use image::RgbaImage;
 use serde::{Deserialize, de::DeserializeOwned};
 use smallvec::{SmallVec, smallvec};
-#[cfg(feature = "wayland-pipewire")]
-use {
-	futures::StreamExt,
-	tokio::runtime::Runtime,
-	zbus::{
-		Connection, MatchRule, MessageStream, fdo,
-		message::Type as MessageType,
-		names::{BusName, OwnedUniqueName},
-		zvariant::{OwnedObjectPath, Value},
-	},
+use tokio::runtime::Runtime;
+use zbus::{
+	Connection, MatchRule, MessageStream, fdo,
+	message::Type as MessageType,
+	names::{BusName, OwnedUniqueName},
+	zvariant::{OwnedObjectPath, Value},
 };
 
 use crate::desktop::{
@@ -81,7 +77,6 @@ const IPC_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Deadline for session-bus setup, owner validation, record/start and the node
 /// signal.
-#[cfg(feature = "wayland-pipewire")]
 const CAST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Largest edge, in logical or physical pixels, a capture may have.
@@ -549,7 +544,6 @@ impl State {
 	}
 
 	/// A window as a capture target, with the output scale it renders at.
-	#[cfg(any(feature = "wayland-pipewire", test))]
 	fn capture_target(&self, window: &IpcWindow) -> CoreResult<(DesktopWindow, f64)> {
 		let descriptor = self.descriptor(window).ok_or_else(|| {
 			DesktopError::capture_failed(format!(
@@ -1008,15 +1002,18 @@ fn plan(state: &State, action: &ControlAction) -> CoreResult<SmallVec<[serde_jso
 /// The compositor renders the window itself, so the frame is that window's
 /// pixels and not a rectangle of somebody else's monitor, and no consent
 /// dialog, clipboard write or focus change happens on the way.
-#[cfg(feature = "wayland-pipewire")]
-pub(super) fn capture_window(id: &str) -> CoreResult<(RgbaImage, DesktopWindow)> {
+pub(super) fn capture_window(
+	pw: super::pipewire::Loaded,
+	id: &str,
+) -> CoreResult<(RgbaImage, DesktopWindow)> {
+	let pw = super::capture::require_pipewire(pw)?;
 	let window = window_id(id)?;
 	let before = State::fetch()?;
 	let target = before.window(window)?;
 	let (descriptor, scale) = before.capture_target(target)?;
 	let expected = expected_pixels(descriptor.width, descriptor.height, scale)
 		.ok_or_else(|| scale_unknown(target))?;
-	let image = capture_frame(window, id)?;
+	let image = capture_frame(Ok(pw), window, id)?;
 	let after = State::fetch()?;
 	let current = after.descriptor(after.window(window)?).ok_or_else(|| {
 		DesktopError::capture_failed(format!("niri window {id} vanished mid-capture"))
@@ -1132,13 +1129,11 @@ fn physical(logical: u32, scale: f64) -> Option<u32> {
 /// niri sizes that buffer from the window's bounding box placed at a zero
 /// origin, so each edge is rounded up on its own: 957 logical px at 1.25 needs
 /// 1197 px, and a buffer one pixel narrower would drop window pixels.
-#[cfg(any(feature = "wayland-pipewire", test))]
 fn allocated_extent(logical: u32, scale: f64) -> Option<u32> {
 	Some(scaled_extent(logical, scale)?.ceil() as u32)
 }
 
 /// Physical size of a window's capture buffer.
-#[cfg(any(feature = "wayland-pipewire", test))]
 fn expected_pixels(width: u32, height: u32, scale: f64) -> Option<(u32, u32)> {
 	Some((allocated_extent(width, scale)?, allocated_extent(height, scale)?))
 }
@@ -1170,7 +1165,6 @@ fn display(name: &str, output: &IpcOutput, primary: bool) -> Option<DesktopDispl
 	})
 }
 
-#[cfg(any(feature = "wayland-pipewire", test))]
 fn scale_unknown(window: &IpcWindow) -> DesktopError {
 	DesktopError::capture_failed(format!(
 		"niri window {ID_PREFIX}{} is not on an output with a known scale, so its capture size \
@@ -1193,7 +1187,6 @@ fn scale_unknown(window: &IpcWindow) -> DesktopError {
 ///
 /// The result is opaque: premultiplied pixels with alpha forced to 255 are the
 /// window composited over black, the same pixels an alpha-less cast delivers.
-#[cfg(any(feature = "wayland-pipewire", test))]
 fn window_pixels(
 	id: &str,
 	image: RgbaImage,
@@ -1231,7 +1224,6 @@ fn window_pixels(
 }
 
 /// Bounding box `(x, y, width, height)` of the fully opaque pixels.
-#[cfg(any(feature = "wayland-pipewire", test))]
 fn opaque_extent(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
 	let (mut left, mut top, mut right, mut bottom) = (u32::MAX, u32::MAX, 0, 0);
 	for (x, y, pixel) in image.enumerate_pixels() {
@@ -1245,13 +1237,9 @@ fn opaque_extent(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
 	(right > left && bottom > top).then(|| (left, top, right - left, bottom - top))
 }
 
-#[cfg(feature = "wayland-pipewire")]
 const SERVICE: &str = "org.gnome.Mutter.ScreenCast";
-#[cfg(feature = "wayland-pipewire")]
 const SERVICE_PATH: &str = "/org/gnome/Mutter/ScreenCast";
-#[cfg(feature = "wayland-pipewire")]
 const STREAM_INTERFACE: &str = "org.gnome.Mutter.ScreenCast.Stream";
-#[cfg(feature = "wayland-pipewire")]
 const NODE_SIGNAL: &str = "PipeWireStreamAdded";
 
 /// Property dict niri's `RecordWindow` expects.
@@ -1259,10 +1247,8 @@ const NODE_SIGNAL: &str = "PipeWireStreamAdded";
 /// niri rejects a `remote-desktop-session-id`, which is what keeps this a
 /// screen cast with no remote-control grant. The cursor mode is left out so
 /// niri defaults to hidden and no pointer is composited into the frame.
-#[cfg(feature = "wayland-pipewire")]
 type Properties<'a> = HashMap<&'a str, Value<'a>>;
 
-#[cfg(feature = "wayland-pipewire")]
 #[zbus::proxy(
 	default_service = "org.gnome.Mutter.ScreenCast",
 	default_path = "/org/gnome/Mutter/ScreenCast",
@@ -1273,7 +1259,6 @@ trait ScreenCast {
 	fn create_session(&self, properties: Properties<'_>) -> zbus::Result<OwnedObjectPath>;
 }
 
-#[cfg(feature = "wayland-pipewire")]
 #[zbus::proxy(
 	default_service = "org.gnome.Mutter.ScreenCast",
 	interface = "org.gnome.Mutter.ScreenCast.Session",
@@ -1290,7 +1275,6 @@ trait Session {
 /// The proxies are built against the verified unique name rather than the
 /// well-known one, so a name owner that changes between the check and the call
 /// cannot receive the cast.
-#[cfg(feature = "wayland-pipewire")]
 async fn start_window_cast(
 	connection: &Connection,
 	session: &SessionProxy<'_>,
@@ -1335,7 +1319,6 @@ async fn start_window_cast(
 		.map_err(|err| DesktopError::capture_failed(format!("niri {NODE_SIGNAL} body: {err}")))
 }
 
-#[cfg(feature = "wayland-pipewire")]
 async fn create_session(
 	connection: &Connection,
 	owner: &OwnedUniqueName,
@@ -1371,7 +1354,6 @@ async fn create_session(
 /// would stream another program's pixels into a frame labelled with a niri
 /// window id, so both ends must be the same process: `$NIRI_SOCKET`'s peer is
 /// the compositor, and the bus name owner has to be that same process.
-#[cfg(feature = "wayland-pipewire")]
 async fn service_owner(connection: &Connection, compositor: u32) -> CoreResult<OwnedUniqueName> {
 	let bus = fdo::DBusProxy::new(connection).await.map_err(bus_error)?;
 	let service: BusName<'static> = SERVICE
@@ -1393,7 +1375,6 @@ async fn service_owner(connection: &Connection, compositor: u32) -> CoreResult<O
 	Ok(owner)
 }
 
-#[cfg(feature = "wayland-pipewire")]
 fn bus_error(err: zbus::Error) -> DesktopError {
 	DesktopError::capture_failed(format!("niri screen cast session: {err}"))
 }
@@ -1431,8 +1412,7 @@ pub(super) fn compositor_pid() -> CoreResult<u32> {
 ///
 /// The session is closed on every outcome, including the failure paths: a cast
 /// left running keeps a compositor-side stream alive after the caller gave up.
-#[cfg(feature = "wayland-pipewire")]
-fn capture_frame(window: u64, id: &str) -> CoreResult<RgbaImage> {
+fn capture_frame(pw: super::pipewire::Loaded, window: u64, id: &str) -> CoreResult<RgbaImage> {
 	let runtime = super::portal::portal_runtime()?;
 	let compositor = compositor_pid()?;
 	let capture_deadline = std::time::Instant::now() + CAST_TIMEOUT;
@@ -1459,7 +1439,8 @@ fn capture_frame(window: u64, id: &str) -> CoreResult<RgbaImage> {
 		})?
 	});
 	let frame = node.and_then(|node| {
-		super::capture::grab_pipewire_frame(node, None, super::capture::Formats::Alpha)
+		let pw = super::capture::require_pipewire(pw)?;
+		super::capture::grab_pipewire_frame(pw, node, None, super::capture::Formats::Alpha)
 			.map_err(|err| DesktopError::capture_failed(format!("niri window {id} capture: {err}")))
 	});
 	if let Some(session) = session {
@@ -1469,7 +1450,6 @@ fn capture_frame(window: u64, id: &str) -> CoreResult<RgbaImage> {
 }
 
 /// End a cast session, bounded so a wedged compositor cannot hang the worker.
-#[cfg(feature = "wayland-pipewire")]
 fn stop(runtime: &Runtime, session: &SessionProxy<'_>) {
 	let _ = runtime.block_on(async {
 		tokio::time::timeout(crate::desktop::CLOSE_TIMEOUT, session.stop()).await
@@ -1487,7 +1467,6 @@ mod tests {
 
 	use super::*;
 
-	#[cfg(feature = "wayland-pipewire")]
 	mod capture_setup {
 		use std::sync::{
 			Arc,
@@ -1696,9 +1675,10 @@ mod tests {
 				.token()
 				.replying_by(std::time::Instant::now() + reply_budget);
 			let started = std::time::Instant::now();
-			let error =
-				crate::desktop::control::with_token_for_test(&token, || capture_frame(47, "niri:47"))
-					.expect_err("a silent setup cannot produce a frame");
+			let error = crate::desktop::control::with_token_for_test(&token, || {
+				capture_frame(Err("fixture stops during setup"), 47, "niri:47")
+			})
+			.expect_err("a silent setup cannot produce a frame");
 			let elapsed = started.elapsed();
 			let _ = finished.send(());
 			watchdog.join().unwrap();
