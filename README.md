@@ -2,7 +2,7 @@
 
 This fork of [oh-my-pi](https://github.com/can1357/oh-my-pi) improves desktop computer use specifically for **Linux Wayland**.
 
-Upstream base: [`2c18786227e2`](https://github.com/can1357/oh-my-pi/commit/2c18786227e2) (after v18.22.0).
+Upstream base: [`6425ef0e`](https://github.com/can1357/oh-my-pi/commit/6425ef0e) (after v18.22.0).
 
 ## Linux Wayland improvements
 

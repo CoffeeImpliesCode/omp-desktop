@@ -27,7 +27,7 @@
 - Clarified computer control guidance: focus can warp the pointer, `Timeout` can leave applied effects, and screenshot frames expire before native dispatch.
 - Clarified computer AX reference lifetime: the current and immediately previous generations remain valid.
 - Local standalone builds now use the shared coding-agent build and write to `packages/coding-agent/dist/omp`.
-- Updated the desktop fork to upstream commit `2c18786227e2` after 18.22.0 while retaining Linux Wayland desktop controls and portable build instructions.
+- Updated the desktop fork to upstream commit `6425ef0e` after 18.22.0 while retaining Linux Wayland desktop controls and portable build instructions.
 - Browser relay opens now create dedicated background tabs, and screenshots leave the user's foreground tab in place; `target` explicitly borrows an existing tab ([#14060](https://github.com/can1357/oh-my-pi/pull/14060) by [@nnnnoel](https://github.com/nnnnoel)).
 - Automatic computer AX trees now use a 16 KiB UTF-8 budget without splitting rows ([#13692](https://github.com/can1357/oh-my-pi/pull/13692) by [@will-bogusz](https://github.com/will-bogusz)).
 - Increased the `find` tool timeout to five minutes so slower local judge models can finish searches.

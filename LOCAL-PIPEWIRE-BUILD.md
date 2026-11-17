@@ -8,7 +8,7 @@ so an X11 root-window capture cannot replace native Wayland capture.
 
 The build below embeds both native addon variants. The fork keeps every
 authorized monitor stream and exact niri window capture, and integrates upstream
-commit `2c18786227e2` after v18.22.0.
+commit `6425ef0e` after v18.22.0.
 
 ## Why a hand-dropped addon is not enough
 
