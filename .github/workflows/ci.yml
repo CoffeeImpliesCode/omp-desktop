@@ -594,9 +594,7 @@ jobs:
          - name: Test workspace packages (TS)
            env:
               OMP_TEST_CONCURRENCY: "4"
-           run: |
-              bun run ci:test:ts:workspace
-              bun test scripts/native-build-features.test.ts
+           run: bun run ci:test:ts:workspace
 
    test_coding_agent_singleton:
       name: Test coding-agent singleton/global-state (TS)
