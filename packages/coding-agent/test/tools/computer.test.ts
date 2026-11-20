@@ -1,5 +1,6 @@
 import { afterAll, afterEach, describe, expect, it, spyOn, vi } from "bun:test";
 import type { AgentToolContext } from "@oh-my-pi/pi-agent-core";
+import { rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { inspect } from "node:util";
@@ -7,7 +8,14 @@ import { createContext, runInContext } from "node:vm";
 import { scheduler } from "node:timers/promises";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
-import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/preludes";
+import { executeJs } from "@oh-my-pi/pi-coding-agent/eval/js/executor";
+import type {
+	EvalPreludeCell,
+	EvalPreludeContext,
+	EvalPreludeDefinition,
+	HostEvalPreludeDefinition,
+} from "@oh-my-pi/pi-coding-agent/eval/preludes";
+import { DEFAULT_MAX_BYTES } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { disposeAllKernelSessions, executePython } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { computerApproval, createComputerPrelude } from "@oh-my-pi/pi-coding-agent/tools/computer";
@@ -1068,25 +1076,8 @@ function toolSession(): ToolSession {
 	};
 }
 
-/** The identity a prelude sees for the eval cell its calls belong to. */
-type PreludeCell = { readonly signal: AbortSignal };
-
-/** What a prelude adds to a cell once that cell has ended. */
-interface SettleReply {
-	text?: string;
-	images?: Array<{ data: string; mimeType: string }>;
-}
-
-/** A prelude definition carrying the settle hook the host invokes after a cell. */
-type SettlingPrelude = EvalPreludeDefinition & {
-	settleCell?(cell: PreludeCell, outcome: { failed: boolean; output: string }): Promise<SettleReply | undefined>;
-};
-
-/** Host context carrying the cell a prelude call belongs to. */
-type CellAwareContext = Parameters<EvalPreludeDefinition["invoke"]>[1] & { cell?: PreludeCell };
-
 /** Exercise the shipped host approval/call rendering and worker, with only native OS work substituted. */
-function workerPrelude(session: ToolSession, native: NativeDesktopSession): EvalPreludeDefinition {
+function workerPrelude(session: ToolSession, native: NativeDesktopSession): HostEvalPreludeDefinition {
 	const transport = new MemoryTransport();
 	new ComputerWorkerCore(transport, () => native);
 	return createComputerPrelude(session, () => ({
@@ -1114,6 +1105,162 @@ afterAll(async () => {
 });
 
 describe("computer prelude", () => {
+	it("returns the failure name and message in direct computer tool content after partial output", async () => {
+		const session = toolSession();
+		const supervisor = new ComputerSupervisor(
+			session,
+			() => liveWorker(new FakeNativeSession()),
+			undefined,
+			undefined,
+			{ read: () => 0, forget: () => {} },
+		);
+		const tool = createComputerPrelude(session, () => supervisor);
+		try {
+			const result = await tool.invoke(
+				{
+					action: "run",
+					code: `console.log("MARK"); await desktop.screenshot(); const error = new Error("the user changed the target"); error.name = "UserIntervened"; throw error;`,
+				},
+				{ session, toolCallId: "direct-failure" },
+			);
+			expect(result.isError).toBe(true);
+			expect(result.content).toContainEqual({ type: "text", text: expect.stringContaining("MARK") });
+			expect(result.content).toContainEqual(expect.objectContaining({ type: "image" }));
+			expect(result.content).toContainEqual({
+				type: "text",
+				text: "UserIntervened: the user changed the target",
+			});
+		} finally {
+			await supervisor.close();
+		}
+	});
+
+	it("keeps partial failure evidence through JavaScript Eval", async () => {
+		let definitions: readonly EvalPreludeDefinition[] = [];
+		const session: ToolSession = { ...toolSession(), getEvalPreludes: () => definitions };
+		const supervisor = new ComputerSupervisor(
+			session,
+			() => liveWorker(new FakeNativeSession()),
+			undefined,
+			undefined,
+			{ read: () => 0, forget: () => {} },
+		);
+		const prelude = createComputerPrelude(session, () => supervisor);
+		definitions = [prelude];
+		const statuses: unknown[] = [];
+		try {
+			const result = await executeJs(
+				`await computer.run("console.log('MARK'); await desktop.screenshot(); throw new TypeError('stop after act')");`,
+				{
+					session,
+					sessionId: crypto.randomUUID(),
+					cwd: process.cwd(),
+					onStatus: event => {
+						statuses.push(event);
+					},
+				},
+			);
+			expect(result.exitCode).not.toBe(0);
+			expect(result.output).toContain("MARK");
+			expect(result.output).toContain("TypeError: stop after act");
+			// The partial output is logged without the failure line the direct result appends; only the thrown error shows it.
+			expect(result.output.split("TypeError: stop after act")).toHaveLength(2);
+			expect(result.displayOutputs).toContainEqual(expect.objectContaining({ type: "image" }));
+			expect(statuses).toContainEqual(expect.objectContaining({ op: "computer", error: "stop after act" }));
+		} finally {
+			await supervisor.close();
+		}
+	});
+
+	it("keeps partial failure evidence through Python Eval", async () => {
+		let definitions: readonly EvalPreludeDefinition[] = [];
+		const session: ToolSession = { ...toolSession(), getEvalPreludes: () => definitions };
+		const supervisor = new ComputerSupervisor(
+			session,
+			() => liveWorker(new FakeNativeSession()),
+			undefined,
+			undefined,
+			{ read: () => 0, forget: () => {} },
+		);
+		definitions = [createComputerPrelude(session, () => supervisor)];
+		try {
+			const result = await executePython(
+				`await computer.run("console.log('MARK'); await desktop.screenshot(); throw new TypeError('stop after act')")`,
+				{ toolSession: session, sessionId: crypto.randomUUID(), cwd: process.cwd(), kernelMode: "per-call" },
+			);
+			expect(result.exitCode).not.toBe(0);
+			expect(result.output).toContain("MARK");
+			expect(result.output).toContain("RuntimeError: stop after act");
+			expect(result.output.split("RuntimeError: stop after act")).toHaveLength(2);
+			expect(result.output).not.toContain("TypeError: stop after act");
+			expect(result.displayOutputs).toContainEqual(expect.objectContaining({ type: "image" }));
+		} finally {
+			await supervisor.close();
+		}
+	});
+
+	it.each(["js", "py"] as const)("settles desktop input after a failed %s computer run with output", async language => {
+		const native = new EditableWindowSession();
+		native.keyChord = async () => {
+			native.status = "changed before failure";
+		};
+		const id = `computer-failed-cell-${language}-${crypto.randomUUID()}`;
+		const session: ToolSession = {
+			...toolSession(),
+			settings: Settings.isolated({ "computer.enabled": true, "async.enabled": false }),
+			getEvalSessionId: () => id,
+			getEvalPreludes: () => [prelude],
+		};
+		const supervisor = new ComputerSupervisor(session, () => liveWorker(native), undefined, undefined, NO_ESCAPE_STOPS);
+		const prelude = createComputerPrelude(session, () => supervisor);
+		const script = [
+			'await (await desktop.window("42")).press("shift");',
+			'console.log("before failure");',
+			'throw new Error("run stopped");',
+		].join(" ");
+		try {
+			const result = await new EvalTool(session).execute(id, {
+				language,
+				code: `await computer.run(${JSON.stringify(script)})`,
+			});
+			expect(result.isError).toBe(true);
+			const text = result.content
+				.filter(block => block.type === "text")
+				.map(block => block.text)
+				.join("\n");
+			expect(text).toContain("before failure");
+			expect(text).toContain("run stopped");
+			expect(text).toMatch(/statictext \[ref=e\d+\]: "changed before failure"/);
+		} finally {
+			await supervisor.close();
+		}
+	});
+
+	it("caps inline computer output and saves the full text as a local spill", async () => {
+		const raw = "ä".repeat(DEFAULT_MAX_BYTES);
+		const outputPath = path.join(os.tmpdir(), `computer-output-${crypto.randomUUID()}.log`);
+		const allocateOutputArtifact = vi.fn(async () => ({ id: "17", path: outputPath }));
+		const session: ToolSession = { ...toolSession(), allocateOutputArtifact };
+		const prelude = createComputerPrelude(session, () => ({
+			...stubController({}),
+			async run() {
+				return { displays: [{ type: "text", text: raw }], screenshots: [], returnValue: undefined };
+			},
+		}));
+		try {
+			const result = await prelude.invoke({ action: "run", code: "1" }, { session, toolCallId: "spill" });
+			const inline = result.content[0];
+			expect(inline?.type).toBe("text");
+			if (inline?.type !== "text") throw new Error("Expected inline computer output");
+			expect(Buffer.byteLength(inline.text)).toBeLessThanOrEqual(DEFAULT_MAX_BYTES);
+			expect(inline.text).toContain("[raw output: local://17.log]");
+			expect(allocateOutputArtifact).toHaveBeenCalledWith();
+			expect(await Bun.file(outputPath).text()).toBe(raw);
+		} finally {
+			await rm(outputPath, { force: true });
+		}
+	});
+
 	it("validates action shapes and maps explicitly read-only runs to read approval", async () => {
 		const prelude = createComputerPrelude(toolSession(), () => ({
 			async run() {
@@ -2174,7 +2321,7 @@ describe("computer prelude", () => {
 
 	it("settles only cells whose code reached the desktop, and says when a settle fails", async () => {
 		const stub: StubController = { report: 'window "42" after press e3 — current tree:' };
-		const prelude = createComputerPrelude(toolSession(), () => stubController(stub)) as SettlingPrelude;
+		const prelude = createComputerPrelude(toolSession(), () => stubController(stub));
 		const press = {
 			action: "call",
 			chain: [
@@ -2182,9 +2329,9 @@ describe("computer prelude", () => {
 				{ method: "press", args: [] },
 			],
 		};
-		const acting: PreludeCell = { signal: new AbortController().signal };
-		const idle: PreludeCell = { signal: new AbortController().signal };
-		const actingContext: CellAwareContext = { session: toolSession(), toolCallId: "press", cell: acting };
+		const acting: EvalPreludeCell = { signal: new AbortController().signal };
+		const idle: EvalPreludeCell = { signal: new AbortController().signal };
+		const actingContext: EvalPreludeContext = { session: toolSession(), toolCallId: "press", cell: acting };
 		await prelude.invoke(press, actingContext);
 		expect(await prelude.settleCell?.(idle, { failed: false, output: "" })).toBeUndefined();
 		expect(await prelude.settleCell?.(acting, { failed: false, output: "" })).toEqual({
@@ -2194,8 +2341,8 @@ describe("computer prelude", () => {
 		expect(await prelude.settleCell?.(acting, { failed: false, output: "" })).toBeUndefined();
 
 		stub.settleFailure = new Error("computer worker restarted; captures and ax refs were reset");
-		const broken: PreludeCell = { signal: new AbortController().signal };
-		const brokenContext: CellAwareContext = { session: toolSession(), toolCallId: "press-2", cell: broken };
+		const broken: EvalPreludeCell = { signal: new AbortController().signal };
+		const brokenContext: EvalPreludeContext = { session: toolSession(), toolCallId: "press-2", cell: broken };
 		await prelude.invoke(press, brokenContext);
 		expect((await prelude.settleCell?.(broken, { failed: false, output: "" }))?.text).toContain(
 			"No post-input report for this cell (computer worker restarted",
@@ -2214,7 +2361,7 @@ describe("computer prelude", () => {
 					images: [{ type: "image", data: "late frame", mimeType: "image/png" }],
 				};
 			},
-		})) as SettlingPrelude;
+		}));
 		const cell = { signal: turn.signal };
 		await prelude.invoke({ action: "run", code: "return 1" }, { session, toolCallId: "late", cell });
 		expect(await prelude.settleCell?.(cell, { failed: false, output: "already emitted" })).toBeUndefined();
@@ -2467,6 +2614,28 @@ describe("computer worker round trips", () => {
 		);
 		if (!result.ok) throw new Error(result.error.message);
 		expect(native.draggedButtons).toEqual(["middle", "middle", "middle"]);
+	});
+
+	it("keeps partial failure evidence in a worker result", async () => {
+		const transport = new MemoryTransport();
+		new ComputerWorkerCore(transport, () => new FakeNativeSession());
+		const result = await runWorker(
+			transport,
+			"partial-failure",
+			"console.log('MARK'); await desktop.screenshot(); throw new Error('stop after act')",
+		);
+		expect(result.ok).toBe(false);
+		if (result.ok) throw new Error("Expected failed run");
+		expect(result.error.message).toBe("stop after act");
+		expect(result).toMatchObject({
+			output: {
+				displays: expect.arrayContaining([
+					{ type: "text", text: expect.stringContaining("MARK") },
+					expect.objectContaining({ type: "image" }),
+				]),
+				screenshots: [expect.objectContaining({ width: 64, height: 32 })],
+			},
+		});
 	});
 
 	it("lists windows and returns screenshot caption, image, and detail through a fake native session", async () => {
@@ -4827,45 +4996,77 @@ describe("expanded computer APIs", () => {
 		}
 	});
 
-	it("keeps the worker's own error ahead of the stop it reports", async () => {
-		let stops = 0;
-		const partial = "type: 3 of 10 characters were sent before the input was cancelled";
-		const supervisor = new ComputerSupervisor(
-			toolSession(),
-			() => {
-				const handlers = new Set<(message: ComputerWorkerOutbound) => void>();
-				const emit = (message: ComputerWorkerOutbound) => {
-					for (const handler of handlers) handler(message);
-				};
-				return {
-					send: message => {
-						if (message.type === "close") queueMicrotask(() => emit({ type: "closed" }));
-						if (message.type !== "run") return;
-						stops += 1;
-						const error = { name: "ToolError", message: partial, isToolError: true, isAbort: false };
-						queueMicrotask(() => emit({ type: "result", id: message.id, ok: false, error }));
-					},
-					onMessage: handler => {
-						handlers.add(handler);
-						queueMicrotask(() => emit({ type: "ready" }));
-						return () => handlers.delete(handler);
-					},
-					onError: () => () => {},
-					terminate: async () => {},
-				};
-			},
-			{ startMs: 200, closeMs: 200 },
-			undefined,
-			{ read: () => stops, forget: () => {} },
-		);
-		try {
-			await expect(supervisor.run("1", 1_000, snapshot())).rejects.toThrow(
-				`${partial}\n\n${ESCAPE_STOPPED_MESSAGE}`,
+	it.each(["no output", "partial error", "partial abort", "reported stop"])(
+		"keeps the worker's own error ahead of the stop it reports: %s",
+		async mode => {
+			let stops = 0;
+			const partial = "type: 3 of 10 characters were sent before the input was cancelled";
+			const output = {
+				displays: [{ type: "text" as const, text: "MARK" }],
+				screenshots: [],
+				returnValue: undefined,
+			};
+			const supervisor = new ComputerSupervisor(
+				toolSession(),
+				() => {
+					const handlers = new Set<(message: ComputerWorkerOutbound) => void>();
+					const emit = (message: ComputerWorkerOutbound) => {
+						for (const handler of handlers) handler(message);
+					};
+					return {
+						send: message => {
+							if (message.type === "close") queueMicrotask(() => emit({ type: "closed" }));
+							if (message.type !== "run") return;
+							stops += 1;
+							const isAbort = mode === "partial abort";
+							const error = {
+								name: isAbort ? "ToolAbortError" : "ToolError",
+								message: mode === "reported stop" ? ESCAPE_STOPPED_MESSAGE : partial,
+								isToolError: !isAbort,
+								isAbort,
+							};
+							queueMicrotask(() =>
+								emit({
+									type: "result",
+									id: message.id,
+									ok: false,
+									error,
+									...(mode === "no output" ? {} : { output }),
+								}),
+							);
+						},
+						onMessage: handler => {
+							handlers.add(handler);
+							queueMicrotask(() => emit({ type: "ready" }));
+							return () => handlers.delete(handler);
+						},
+						onError: () => () => {},
+						terminate: async () => {},
+					};
+				},
+				{ startMs: 200, closeMs: 200 },
+				undefined,
+				{ read: () => stops, forget: () => {} },
 			);
-		} finally {
-			await supervisor.close();
-		}
-	});
+			try {
+				if (mode === "no output") {
+					await expect(supervisor.run("1", 1_000, snapshot())).rejects.toThrow(
+						`${partial}\n\n${ESCAPE_STOPPED_MESSAGE}`,
+					);
+				} else {
+					const result = await supervisor.run("1", 1_000, snapshot());
+					expect(result.displays).toEqual(output.displays);
+					if (mode === "partial error") expect(result.error?.message).toStartWith(partial);
+					else expect(result.error?.message).toBe(ESCAPE_STOPPED_MESSAGE);
+					expect(result.error?.isAbort).toBe(false);
+					expect(result.error?.name).toBe("ToolError");
+					expect(result.error?.message).toContain(ESCAPE_STOPPED_MESSAGE);
+				}
+			} finally {
+				await supervisor.close();
+			}
+		},
+	);
 
 	it("delivers the user's message and keeps the stop when the native count cannot be read", async () => {
 		let stops = 0;

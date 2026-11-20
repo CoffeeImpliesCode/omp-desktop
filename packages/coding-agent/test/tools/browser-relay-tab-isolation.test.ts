@@ -218,7 +218,7 @@ async function launchRelayFixture(options: FixtureOptions = {}): Promise<RelayFi
 		// A failed test may leave a held download open; release it before stopping Chrome and the server.
 		for (const release of held) release.resolve();
 		try {
-			await Promise.all(browsers.map(browser => closeLaunchedBrowser(browser).catch(() => undefined)));
+			await Promise.all(browsers.map(browser => closeLaunchedBrowser({ browser }).catch(() => undefined)));
 		} finally {
 			server.stop();
 			pages.stop(true);

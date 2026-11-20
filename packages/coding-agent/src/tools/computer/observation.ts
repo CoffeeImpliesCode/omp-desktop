@@ -8,7 +8,7 @@
  * sends; when the cell settles the worker re-reads each window they touched
  * and prints that tree once, marked against the tree the model last received.
  *
- * Tree text is the native `ax()` grammar (`crates/pi-natives/src/desktop/ax.rs`
+ * Tree text is the native `ax()` grammar (`crates/natives/src/desktop/ax.rs`
  * `format_tree`): one node per line, two spaces of indent per depth, then
  * `- role "label" [ref=eN] …`.
  */

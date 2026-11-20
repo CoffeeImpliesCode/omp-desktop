@@ -142,7 +142,7 @@ function cardPreview(preview: NativeToolView["preview"]): TspPreview | undefined
 type ToolDescriber = Pick<ToolRenderer, "describeCall" | "describeResult" | "mergeCallAndResult">;
 
 /** Optional kinds of the host's vocabulary the describe hooks branch on. */
-type NativeHostKinds = Required<Pick<RenderResultContextOptions, "media" | "json" | "shell">>;
+type NativeHostKinds = Required<Pick<RenderResultContextOptions, "media" | "json" | "shell" | "tray">>;
 
 class SafeToolRendererComponent implements Component {
 	#toolName: string;
@@ -1336,6 +1336,7 @@ export class ToolExecutionComponent extends Container {
 			media: cx?.supports("media") === true,
 			json: cx?.supports("json") === true,
 			shell: cx?.supports("shell") === true,
+			tray: cx?.feature("tray") === true,
 		};
 		const presentation = this.#presentation.draw();
 		const key = [
@@ -1355,6 +1356,7 @@ export class ToolExecutionComponent extends Container {
 			host.media,
 			host.json,
 			host.shell,
+			host.tray,
 			getThemeEpoch(),
 			presentation,
 		];
@@ -1379,13 +1381,15 @@ export class ToolExecutionComponent extends Container {
 
 	/**
 	 * The native `collapsed` prop: the transcript's expand state, except that a
-	 * view that asks to be {@link NativeToolView.open} never starts folded, and
+	 * view that asks to be {@link NativeToolView.open} never starts folded, one
+	 * that asks to be {@link NativeToolView.folded} always does, and
 	 * a call streaming its body (edit, write) stays open until it settles, then
 	 * folds like a finished thought. The user's own toggle still wins meanwhile:
 	 * the terminal keeps local collapse state until this prop changes.
 	 */
 	#nativeCollapsed(status: TspCardStatus, view: NativeToolView): boolean {
 		if (view.open) return false;
+		if (view.folded) return true;
 		const live = status === "pending" || status === "running";
 		return !this.#expanded && !(live && streamsBody(this.#toolName));
 	}
@@ -1581,6 +1585,7 @@ export class ToolExecutionComponent extends Container {
 				tone: resultView.tone ?? callView.tone,
 				preview: resultView.preview ?? callView.preview,
 				open: resultView.open ?? callView.open,
+				folded: resultView.folded ?? callView.folded,
 				inline: resultView.inline ?? callView.inline,
 				tools: resultView.tools ?? callView.tools,
 			};

@@ -2514,6 +2514,7 @@ export class ComputerWorkerCore {
 					id: message.id,
 					ok: false,
 					error: this.#withScreenState(errorPayload(failure.error)),
+					output: { displays: output.finish(), screenshots, returnValue: undefined },
 				});
 				return;
 			}
@@ -2527,6 +2528,7 @@ export class ComputerWorkerCore {
 						id: message.id,
 						ok: false,
 						error: errorPayload(nativeError(error)),
+						output: { displays: output.finish(), screenshots, returnValue: undefined },
 					});
 					return;
 				}

@@ -44,7 +44,7 @@ selectors: CSS, or Puppeteer aria/… text/… xpath/… pierce/… label/… pl
   - a Tern window's browser blocks (`tab`: the omp tab holding one), or
   - the relay's Chrome pages (`shown`: the active tab).
   - Pass an entry's `target`; never guess.
-- Chromium screenshots capture owned and borrowed tabs in place, even when hidden. `app.target` does not authorize foreground activation or navigation.
+- Chromium screenshots capture owned and borrowed tabs in place, even when hidden. `target` does not authorize activation or navigation.
 - `viewportOnly`: on-screen elements only (ignored on cmux). `includeAll`: non-interactive nodes too. `text()` and `html()` without a selector read `<body>`.
 - `click`: `button` presses another mouse button (`"right"` opens a context menu); `count` clicks more than once.
 - `<select>` elements: `select(selector, …choices)` or `handle.select(…choices)`, not `fill`. Choices mix strings (exact value, then label), `{label: "full text"}`, `{value: "exact value"}`, or `{index: 0}`; labels match exactly or full option text with whitespace collapsed and trimmed.
@@ -163,7 +163,7 @@ Tern and WebKit tab limits:
 
 Lifetime:
 
-- Closing closes tabs you opened, including omp-created relay tabs, and continues if one close fails; failures and unconfirmed physical closes are logged.
+- Closing releases the managed tab and closes pages omp opened. Close failures are logged and do not stop other closes.
 - `browser.close({ all: true })` releases the tabs you opened, not other agents'.
 - Borrowed relay tabs, CDP-attached pages, and adopted Tern blocks remain open.
 - `kill: true` terminates only applications spawned by this process, never reused browser processes.

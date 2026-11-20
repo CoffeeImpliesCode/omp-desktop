@@ -8,7 +8,7 @@ so an X11 root-window capture cannot replace native Wayland capture.
 
 The build below embeds both native addon variants. The fork keeps every
 authorized monitor stream and exact niri window capture, and integrates upstream
-commit `6425ef0e` after v18.22.0.
+v19.0.1 (`f40f3358`). Native Rust sources now live in `crates/natives`.
 
 ## Why a hand-dropped addon is not enough
 

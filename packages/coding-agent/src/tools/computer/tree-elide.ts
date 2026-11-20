@@ -1,7 +1,7 @@
 /**
  * Structural elision for `win.ax()` accessibility-tree text.
  *
- * The native walk (`format_tree` in `crates/pi-natives/src/desktop/ax.rs`)
+ * The native walk (`format_tree` in `crates/natives/src/desktop/ax.rs`)
  * renders one node per line, pre-order, two spaces of indent per depth:
  *
  * ```

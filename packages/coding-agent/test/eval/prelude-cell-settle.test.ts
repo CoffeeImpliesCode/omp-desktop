@@ -5,7 +5,7 @@ import { getThemeByName } from "@oh-my-pi/pi-tui/theme";
 import { evalToolRenderer } from "@oh-my-pi/pi-tui/tools/eval";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { disposeAllVmContexts } from "@oh-my-pi/pi-coding-agent/eval/js/context-manager";
-import type { EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/preludes";
+import type { EvalPreludeContext, EvalPreludeDefinition } from "@oh-my-pi/pi-coding-agent/eval/preludes";
 import { disposeAllKernelSessions } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
@@ -23,7 +23,7 @@ interface SettleReply {
 }
 
 /** Host context carrying the cell a prelude call belongs to. */
-type CellAwareContext = Parameters<EvalPreludeDefinition["invoke"]>[1] & { cell?: PreludeCell };
+type CellAwareContext = EvalPreludeContext & { cell?: PreludeCell };
 
 /** A prelude definition that may also answer once a cell has ended. */
 type SettlingPrelude = Omit<EvalPreludeDefinition, "invoke"> & {

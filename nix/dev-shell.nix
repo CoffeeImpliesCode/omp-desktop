@@ -67,7 +67,7 @@ pkgs.mkShell (
   }
   // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
     LD_LIBRARY_PATH = lib.makeLibraryPath linuxLibraries;
-    # pi-voice dlopens PulseAudio/ALSA. Local addons must retain these paths
+    # omp-voice dlopens PulseAudio/ALSA. Local addons must retain these paths
     # after leaving the shell, just like nix/package.nix's packaged addon.
     OMP_NATIVE_RUNTIME_LIBRARY_PATH = lib.makeLibraryPath linuxLibraries;
   }

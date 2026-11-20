@@ -59,7 +59,7 @@ if (process.platform === "win32" && (!Bun.which("cmake") || !Bun.which("ninja"))
 }
 
 const repoRoot = path.join(import.meta.dir, "../../..");
-const rustDir = path.join(repoRoot, "crates/pi-natives");
+const rustDir = path.join(repoRoot, "crates/natives");
 const nativeDir = path.join(import.meta.dir, "../native");
 const packageJsonPath = path.join(import.meta.dir, "../package.json");
 
@@ -195,7 +195,7 @@ const canonicalAddonFilename = resolveLocalHostAddon({
 }).filename;
 const canonicalAddonPath = path.join(nativeDir, canonicalAddonFilename);
 
-console.log(`Building pi-natives bindings for ${process.platform}-${process.arch}${variantSuffix} (local)…`);
+console.log(`Building omp-natives bindings for ${process.platform}-${process.arch}${variantSuffix} (local)…`);
 
 await fs.mkdir(nativeDir, { recursive: true });
 await cleanupStaleTemps(nativeDir);
