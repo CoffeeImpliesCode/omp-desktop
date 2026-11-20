@@ -6491,16 +6491,16 @@ mod tests {
 		// TextEdit (pid 7581) shows its Open panel 554, whose input
 		// openAndSavePanelService (pid 7592) takes in its window 556.
 		let window = DesktopWindow {
-			id:      "554".into(),
-			title:   String::new(),
-			app:     "TextEdit".into(),
-			pid:     Some(7581),
+			id:             "554".into(),
+			title:          String::new(),
+			app:            "TextEdit".into(),
+			pid:            Some(7581),
 			position_known: Some(true),
-			x:       100,
-			y:       100,
-			width:   600,
-			height:  400,
-			focused: false,
+			x:              100,
+			y:              100,
+			width:          600,
+			height:         400,
+			focused:        false,
 		};
 		let posted = std::cell::RefCell::new(Vec::new());
 		let post = |_: Posted, pid, event: &CGEvent| {
@@ -6552,16 +6552,16 @@ mod tests {
 		use crate::desktop::error::ErrorCode;
 		let source = source().expect("event source");
 		let window = DesktopWindow {
-			id:      "554".into(),
-			title:   String::new(),
-			app:     "TextEdit".into(),
-			pid:     Some(7581),
+			id:             "554".into(),
+			title:          String::new(),
+			app:            "TextEdit".into(),
+			pid:            Some(7581),
 			position_known: Some(true),
-			x:       100,
-			y:       100,
-			width:   600,
-			height:  400,
-			focused: false,
+			x:              100,
+			y:              100,
+			width:          600,
+			height:         400,
+			focused:        false,
 		};
 		// The user brings the panel's app forward while the primer runs.
 		let front = std::cell::Cell::new(Some(9));
@@ -7266,16 +7266,16 @@ mod tests {
 	#[test]
 	fn shortcut_into_an_application_that_stops_answering_fails() {
 		let window = DesktopWindow {
-			id:      "42".to_string(),
-			title:   "visitor-form.txt".to_string(),
-			app:     "TextEdit".to_string(),
-			pid:     Some(7),
+			id:             "42".to_string(),
+			title:          "visitor-form.txt".to_string(),
+			app:            "TextEdit".to_string(),
+			pid:            Some(7),
 			position_known: Some(true),
-			x:       0,
-			y:       0,
-			width:   300,
-			height:  200,
-			focused: false,
+			x:              0,
+			y:              0,
+			width:          300,
+			height:         200,
+			focused:        false,
 		};
 		let save = [KeyName::Meta, KeyName::Char('s')];
 		let error = confirm_shortcut_answered(&window, &save, || Ok(true))
@@ -7453,16 +7453,16 @@ mod tests {
 	#[test]
 	fn scroll_primer_starts_inside_the_target_window() {
 		let window = DesktopWindow {
-			id:      "42".to_string(),
-			title:   String::new(),
-			app:     String::new(),
-			pid:     Some(7),
+			id:             "42".to_string(),
+			title:          String::new(),
+			app:            String::new(),
+			pid:            Some(7),
 			position_known: Some(true),
-			x:       100,
-			y:       50,
-			width:   300,
-			height:  200,
-			focused: false,
+			x:              100,
+			y:              50,
+			width:          300,
+			height:         200,
+			focused:        false,
 		};
 		let scroll = |x| PointerEvent::Scroll { x, y: 80.0, dx: 0.0, dy: -30.0 };
 		for x in [100.0, 101.0, 249.0, 250.0, 398.0, 399.0] {
@@ -7477,16 +7477,16 @@ mod tests {
 
 	fn background_window(app: &str) -> DesktopWindow {
 		DesktopWindow {
-			id:      "42".to_string(),
-			title:   String::new(),
-			app:     app.to_string(),
-			pid:     Some(7),
+			id:             "42".to_string(),
+			title:          String::new(),
+			app:            app.to_string(),
+			pid:            Some(7),
 			position_known: Some(true),
-			x:       0,
-			y:       0,
-			width:   300,
-			height:  200,
-			focused: false,
+			x:              0,
+			y:              0,
+			width:          300,
+			height:         200,
+			focused:        false,
 		}
 	}
 

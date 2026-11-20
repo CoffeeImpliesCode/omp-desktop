@@ -362,8 +362,11 @@ impl Backend for WaylandBackend {
 					{
 						continue;
 					}
-					let Ok(crop) = geometry.window_crop(&entry) else { continue };
-					// Prefer a complete crop even when an earlier stream contains a part.
+					let Ok(crop) = geometry.window_crop(&entry) else {
+						continue;
+					};
+					// Prefer a complete crop even when an earlier stream contains a
+					// part.
 					if (crop.part.2, crop.part.3) == (entry.window.width, entry.window.height) {
 						best = Some((image, crop));
 						break;

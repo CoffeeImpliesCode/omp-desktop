@@ -1199,42 +1199,51 @@ describe("computer prelude", () => {
 		}
 	});
 
-	it.each(["js", "py"] as const)("settles desktop input after a failed %s computer run with output", async language => {
-		const native = new EditableWindowSession();
-		native.keyChord = async () => {
-			native.status = "changed before failure";
-		};
-		const id = `computer-failed-cell-${language}-${crypto.randomUUID()}`;
-		const session: ToolSession = {
-			...toolSession(),
-			settings: Settings.isolated({ "computer.enabled": true, "async.enabled": false }),
-			getEvalSessionId: () => id,
-			getEvalPreludes: () => [prelude],
-		};
-		const supervisor = new ComputerSupervisor(session, () => liveWorker(native), undefined, undefined, NO_ESCAPE_STOPS);
-		const prelude = createComputerPrelude(session, () => supervisor);
-		const script = [
-			'await (await desktop.window("42")).press("shift");',
-			'console.log("before failure");',
-			'throw new Error("run stopped");',
-		].join(" ");
-		try {
-			const result = await new EvalTool(session).execute(id, {
-				language,
-				code: `await computer.run(${JSON.stringify(script)})`,
-			});
-			expect(result.isError).toBe(true);
-			const text = result.content
-				.filter(block => block.type === "text")
-				.map(block => block.text)
-				.join("\n");
-			expect(text).toContain("before failure");
-			expect(text).toContain("run stopped");
-			expect(text).toMatch(/statictext \[ref=e\d+\]: "changed before failure"/);
-		} finally {
-			await supervisor.close();
-		}
-	});
+	it.each(["js", "py"] as const)(
+		"settles desktop input after a failed %s computer run with output",
+		async language => {
+			const native = new EditableWindowSession();
+			native.keyChord = async () => {
+				native.status = "changed before failure";
+			};
+			const id = `computer-failed-cell-${language}-${crypto.randomUUID()}`;
+			const session: ToolSession = {
+				...toolSession(),
+				settings: Settings.isolated({ "computer.enabled": true, "async.enabled": false }),
+				getEvalSessionId: () => id,
+				getEvalPreludes: () => [prelude],
+			};
+			const supervisor = new ComputerSupervisor(
+				session,
+				() => liveWorker(native),
+				undefined,
+				undefined,
+				NO_ESCAPE_STOPS,
+			);
+			const prelude = createComputerPrelude(session, () => supervisor);
+			const script = [
+				'await (await desktop.window("42")).press("shift");',
+				'console.log("before failure");',
+				'throw new Error("run stopped");',
+			].join(" ");
+			try {
+				const result = await new EvalTool(session).execute(id, {
+					language,
+					code: `await computer.run(${JSON.stringify(script)})`,
+				});
+				expect(result.isError).toBe(true);
+				const text = result.content
+					.filter(block => block.type === "text")
+					.map(block => block.text)
+					.join("\n");
+				expect(text).toContain("before failure");
+				expect(text).toContain("run stopped");
+				expect(text).toMatch(/statictext \[ref=e\d+\]: "changed before failure"/);
+			} finally {
+				await supervisor.close();
+			}
+		},
+	);
 
 	it("caps inline computer output and saves the full text as a local spill", async () => {
 		const raw = "ä".repeat(DEFAULT_MAX_BYTES);
@@ -7441,7 +7450,7 @@ describe("display hold follows the agent turn", () => {
 			async close() {},
 		}));
 		const signal = new AbortController().signal;
-		const cell: PreludeCell = { signal };
+		const cell: EvalPreludeCell = { signal };
 		const context = { session, toolCallId: "computer-turn", signal, cell };
 		const run = () => prelude.invoke({ action: "run", code: "await desktop.windows()" }, context);
 

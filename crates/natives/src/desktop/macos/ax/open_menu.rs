@@ -1604,16 +1604,16 @@ mod tests {
 
 	fn finder_window() -> DesktopWindow {
 		DesktopWindow {
-			id:      "42".to_string(),
-			title:   String::new(),
-			app:     "Finder".to_string(),
-			pid:     Some(7),
+			id:             "42".to_string(),
+			title:          String::new(),
+			app:            "Finder".to_string(),
+			pid:            Some(7),
 			position_known: Some(true),
-			x:       0,
-			y:       0,
-			width:   100,
-			height:  100,
-			focused: false,
+			x:              0,
+			y:              0,
+			width:          100,
+			height:         100,
+			focused:        false,
 		}
 	}
 

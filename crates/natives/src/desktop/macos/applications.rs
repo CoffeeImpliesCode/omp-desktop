@@ -871,16 +871,16 @@ mod tests {
 
 	fn window(id: &str) -> DesktopWindow {
 		DesktopWindow {
-			id:      id.into(),
-			title:   String::new(),
-			app:     "Contacts".into(),
-			pid:     Some(4105),
+			id:             id.into(),
+			title:          String::new(),
+			app:            "Contacts".into(),
+			pid:            Some(4105),
 			position_known: Some(true),
-			x:       0,
-			y:       0,
-			width:   800,
-			height:  600,
-			focused: false,
+			x:              0,
+			y:              0,
+			width:          800,
+			height:         600,
+			focused:        false,
 		}
 	}
 

@@ -909,11 +909,16 @@ impl Worker {
 	fn window_by_id(&mut self, id: &str, target: Option<&Target>) -> CoreResult<DesktopWindow> {
 		let backend = self.backend()?;
 		let windows = backend.windows()?;
-		windows.into_iter().find(|window| window.id == id).ok_or_else(|| {
-			target
-				.and_then(|target| backend.missing_window(target))
-				.unwrap_or_else(|| DesktopError::window_not_found(format!("window '{id}' was not found")))
-		})
+		windows
+			.into_iter()
+			.find(|window| window.id == id)
+			.ok_or_else(|| {
+				target
+					.and_then(|target| backend.missing_window(target))
+					.unwrap_or_else(|| {
+						DesktopError::window_not_found(format!("window '{id}' was not found"))
+					})
+			})
 	}
 
 	/// The frame of `target`'s last capture. On macOS the refusal without one

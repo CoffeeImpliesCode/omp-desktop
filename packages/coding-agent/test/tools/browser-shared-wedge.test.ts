@@ -433,11 +433,13 @@ describe("browser cleanup — timed-out target close in a shared browser", () =>
 		// A release joining the force-kill must not inherit an unbounded CDP wait
 		// (Puppeteer's protocol timeout is 60 s); the supervisor's 5 s close
 		// budget ends it, and the join still reports the tab as released.
-		const joined = await piUtils.withTimeout(
-			releaseTab("logos-b2b", { timeoutMs: 50 }),
-			9_000,
-			"joined release outlived the force-kill close budget",
-		).catch(() => "timed-out" as const);
+		const joined = await piUtils
+			.withTimeout(
+				releaseTab("logos-b2b", { timeoutMs: 50 }),
+				9_000,
+				"joined release outlived the force-kill close budget",
+			)
+			.catch(() => "timed-out" as const);
 		expect(joined).toBe(true);
 
 		await killed;

@@ -451,7 +451,7 @@ describe("stopSharedBrowserIfUnreachable", () => {
 			},
 		});
 		try {
-			const unit = seedLiveUnit(server.port, "g-slow");
+			const unit = seedLiveUnit(server.port!, "g-slow");
 			expect(await stopSharedBrowserIfUnreachable({ projectDir, daemonName: NAME }, { client: stub })).toBe(false);
 			expect(requests).toBe(2);
 			expect(stub.stops).toEqual([]);
@@ -465,7 +465,9 @@ describe("stopSharedBrowserIfUnreachable", () => {
 		seedLiveUnit(9803);
 		const probe = vi.fn(async () => true);
 
-		expect(await stopSharedBrowserIfUnreachable({ projectDir, daemonName: NAME }, { client: stub, probe })).toBe(false);
+		expect(await stopSharedBrowserIfUnreachable({ projectDir, daemonName: NAME }, { client: stub, probe })).toBe(
+			false,
+		);
 		expect(probe).toHaveBeenCalledTimes(1);
 		expect(stub.stops).toEqual([]);
 	});
@@ -480,7 +482,9 @@ describe("stopSharedBrowserIfUnreachable", () => {
 		}
 		const probe = vi.fn(async () => false);
 
-		expect(await stopSharedBrowserIfUnreachable({ projectDir, daemonName: NAME }, { client: stub, probe })).toBe(false);
+		expect(await stopSharedBrowserIfUnreachable({ projectDir, daemonName: NAME }, { client: stub, probe })).toBe(
+			false,
+		);
 		expect(probe).not.toHaveBeenCalled();
 		expect(stub.stops).toEqual([]);
 	});
@@ -491,7 +495,9 @@ describe("stopSharedBrowserIfUnreachable", () => {
 			throw new Error("broken probe");
 		});
 
-		expect(await stopSharedBrowserIfUnreachable({ projectDir, daemonName: NAME }, { client: stub, probe })).toBe(false);
+		expect(await stopSharedBrowserIfUnreachable({ projectDir, daemonName: NAME }, { client: stub, probe })).toBe(
+			false,
+		);
 		expect(probe).toHaveBeenCalledTimes(1);
 		expect(stub.stops).toEqual([]);
 	});
